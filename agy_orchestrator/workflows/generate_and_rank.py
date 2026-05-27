@@ -32,13 +32,15 @@ us measure while still capturing the verifier asymmetry whenever it is sound.
 """
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
 from typing import List, Optional, Tuple
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.pipeline import ParallelSwarm
 from agy_orchestrator.execution.verifier import QualityVerifier
-from agy_orchestrator.workflows.tree_of_thought import _parse_score
+from agy_orchestrator.workflows.tree_of_thought import _parse_score, build_judge_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -128,21 +130,27 @@ class GenerateAndRankWorkflow:
         return best
 
     async def _rank_by_judge(self, candidates: List[str]) -> str:
-        """Score each candidate 1-10 with the LLM ranker; argmax wins (stable)."""
+        """Score each candidate 1-10 with the LLM ranker concurrently; argmax wins."""
         logger.info("GenerateAndRank: ranking %d candidates with the LLM judge...",
                     len(candidates))
+
+        # Clone the ranker per candidate so all scorings run in parallel instead of
+        # serializing N model calls through one mutated instance.
+        async def _score(cand: str) -> int:
+            judge = copy.copy(self.ranker)
+            judge.session_id = None
+            judge.prompt = build_judge_prompt(cand, noun="candidate")
+            return _parse_score(await judge.run_async())
+
+        results = await asyncio.gather(*[_score(c) for c in candidates],
+                                       return_exceptions=True)
+
         scored: List[Tuple[int, int, str]] = []  # (score, -index, text) for stable argmax
-        for idx, cand in enumerate(candidates):
-            self.ranker.prompt = (
-                f"Evaluate the following candidate solution on a scale of 1-10 based on "
-                f"correctness, completeness, and adherence to best practices for the task "
-                f"at hand. Hold it to a high, domain-appropriate quality bar judged against "
-                f"the task's own goals — not a fixed template.\n"
-                f"Penalize heavily (score < 5) for incorrect results, bugs, or identifiers, "
-                f"signatures, or interfaces that must match across components but don't.\n"
-                f"Reply ONLY with the integer score.\n\nCandidate:\n{cand}"
-            )
-            score = _parse_score(await self.ranker.run_async())
+        for idx, (cand, res) in enumerate(zip(candidates, results)):
+            score = 0 if isinstance(res, Exception) else res
+            if isinstance(res, Exception):
+                logger.warning("GenerateAndRank: candidate %d scoring failed (%s); scoring 0.",
+                               idx + 1, res)
             logger.info("GenerateAndRank: candidate %d scored %d.", idx + 1, score)
             scored.append((score, -idx, cand))
 

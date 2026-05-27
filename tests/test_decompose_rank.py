@@ -94,9 +94,19 @@ def test_rank_falls_back_to_judge_when_many_candidates():
     a = _CannedAgent("weak answer")
     b = _CannedAgent("strong answer")
     c = _CannedAgent("middling answer")
-    # Judge scores in candidate order: a->3, b->9, c->5. The argmax (b) wins.
-    judge = _ScriptedCritic(["score: 3", "score: 9", "score: 5"])
-    wf = GenerateAndRankWorkflow([a, b, c], ranker=judge)
+
+    # Candidates are scored in PARALLEL with independent (cloned) rankers, so the
+    # judge scores by the content handed to it, not by call order.
+    class _ContentJudge(_CannedAgent):
+        async def run_async(self, piped_input=None):
+            self.calls += 1
+            if "strong" in self.prompt:
+                return "score: 9"
+            if "middling" in self.prompt:
+                return "score: 5"
+            return "score: 3"
+
+    wf = GenerateAndRankWorkflow([a, b, c], ranker=_ContentJudge())
     out = asyncio.run(wf.execute("do it"))
     assert out == "strong answer"
     assert wf.n_candidates == 3

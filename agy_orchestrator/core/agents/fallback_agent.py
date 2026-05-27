@@ -12,27 +12,14 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Type
 
-from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.agent import AgentInstance, USAGE_MARKERS
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
+from agy_orchestrator.core.agents.grok_agent import GrokAgent
 
 logger = logging.getLogger(__name__)
 
-# Substrings (lowercased) in stderr that strongly indicate a usage/quota wall as
-# opposed to a transient error. Used only for clearer logging — fallback happens
-# on ANY persistent failure regardless.
-USAGE_MARKERS = (
-    "usage limit",
-    "rate limit",
-    "rate_limit",
-    "quota",
-    "out of credits",
-    "insufficient_quota",
-    "too many requests",
-    "429",
-    "plan limit",
-    "exceeded",
-    "balance",
-)
+# Agent classes that support warm-session resume across calls.
+_SESSION_CAPABLE = (ClaudeAgent, GrokAgent)
 
 
 def make_fallback_agent(
@@ -91,11 +78,14 @@ def make_fallback_agent(
             for key, val in cfg.items():
                 if key not in ("model", "effort"):
                     kwargs[key] = val
-            if agent_cls is ClaudeAgent:
+            # Reuse a warm session ONLY for the same provider class that created
+            # it — a claude session id is meaningless to grok (and vice-versa), so
+            # feeding one to the other forces a spurious "no such session" failure.
+            if issubclass(agent_cls, _SESSION_CAPABLE) and agent_cls is getattr(self, "_session_owner", None):
                 sid = getattr(self, "session_id", None)
                 if sid:
                     kwargs["session_id"] = sid
-                if getattr(self, "fork_session", False):
+                if agent_cls is ClaudeAgent and getattr(self, "fork_session", False):
                     kwargs["fork_session"] = True
             return agent_cls(**kwargs)  # type: ignore[arg-type]
 
@@ -129,9 +119,12 @@ def make_fallback_agent(
                     continue
 
                 # Success: propagate session id (for warm-cache reuse) and output.
+                # Tag the owner class so the session is only ever resumed by the
+                # same provider that produced it (see _make_sub).
                 sid = getattr(sub, "session_id", None)
                 if sid:
                     self.session_id = sid
+                    self._session_owner = agent_cls
                 self.stdout = sub.stdout
                 self.stderr = sub.stderr
                 self.returncode = sub.returncode

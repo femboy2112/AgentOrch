@@ -93,11 +93,18 @@ def test_parallel_swarm_tolerates_a_failed_branch():
 
 
 def test_judge_picks_higher_score():
-    branches = [_CannedAgent("low"), _CannedAgent("high")]
-    # Evaluator scores branch 1 -> 3, branch 2 -> 9.
-    evaluator = _ScriptedCritic(["score: 3", "score: 9"])
-    best = asyncio.run(TreeOfThought(branches, evaluator).execute())
-    assert best == "high"
+    branches = [_CannedAgent("alpha"), _CannedAgent("omega")]
+
+    # Branches are scored in PARALLEL with independent (cloned) evaluators, so the
+    # judge must score by the content it is handed, not by call order. Markers are
+    # chosen to not collide with words in the rubric prompt.
+    class _ContentJudge(_CannedAgent):
+        async def run_async(self, piped_input=None):
+            self.calls += 1
+            return "score: 9" if "omega" in self.prompt else "score: 3"
+
+    best = asyncio.run(TreeOfThought(branches, _ContentJudge()).execute())
+    assert best == "omega"
 
 
 def test_vote_selector_majority_and_no_evaluator_call():

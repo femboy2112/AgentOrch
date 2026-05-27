@@ -147,8 +147,6 @@ async def _run_workflow(
 
     raise ValueError(f"unknown mode: {mode}")
 
-    raise ValueError(f"unknown mode: {mode}")
-
 
 def dispatch(
     instruction: str,

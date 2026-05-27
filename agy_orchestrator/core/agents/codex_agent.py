@@ -8,18 +8,10 @@ class CodexAgent(AgentInstance):
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:
-        import asyncio
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "codex", "--usage", model,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await process.communicate()
-            if process.returncode == 0:
-                pass
-        except Exception:
-            pass
+        # Codex exposes no machine-readable remaining-usage value, so report
+        # "full" and let real quota exhaustion be handled by the fallback layer
+        # (a usage wall surfaces as a non-zero exit -> fail over). Spawning
+        # `codex --usage` only to discard its output was pure overhead.
         return 100.0
 
     def filter_stderr(self, stderr: str) -> str:

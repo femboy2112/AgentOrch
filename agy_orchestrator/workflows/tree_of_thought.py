@@ -1,3 +1,4 @@
+import copy
 import logging
 import asyncio
 import re
@@ -5,6 +6,23 @@ from collections import Counter
 from typing import Dict, List, Tuple
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.pipeline import ParallelSwarm
+
+# Shared evaluator rubric used to score one candidate solution 1-10. Kept here so
+# tree_of_thought and generate_and_rank score on identical criteria.
+JUDGE_RUBRIC = (
+    "Evaluate the following {noun} on a scale of 1-10 based on correctness, "
+    "efficiency, and adherence to best practices for the task at hand. "
+    "Hold it to a high, domain-appropriate quality bar judged against the task's own "
+    "goals (correct and robust code, precise and well-structured writing, etc.) — "
+    "not a fixed template.\n"
+    "Penalize heavily (score < 5) for incorrect results, bugs, or identifiers, signatures, "
+    "or interfaces that must match across files or components but don't.\n"
+    "Reply ONLY with the integer score.\n\n{noun_cap}:\n{solution}"
+)
+
+
+def build_judge_prompt(solution: str, noun: str = "solution") -> str:
+    return JUDGE_RUBRIC.format(noun=noun, noun_cap=noun.capitalize(), solution=solution)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +94,12 @@ class TreeOfThought:
         swarm = ParallelSwarm(self.branch_instances)
         outputs = await swarm.execute()
 
+        # Degenerate case (configured with 1 branch, or only one branch survived):
+        # there is nothing to choose between, so skip the evaluator pass entirely.
+        if len(outputs) == 1:
+            logger.info("Only one branch output — returning it without an evaluator pass.")
+            return outputs[0]
+
         if self.selector == "vote":
             return self._select_by_vote(outputs)
         return await self._select_by_judge(outputs)
@@ -100,29 +124,30 @@ class TreeOfThought:
         return outputs[winner_idx]
 
     async def _select_by_judge(self, outputs: List[str]) -> str:
-        logger.info("Evaluating generated branches...")
-        scored_outputs: List[Tuple[int, str]] = []
+        logger.info("Evaluating %d branches concurrently...", len(outputs))
 
-        for idx, out in enumerate(outputs):
-            self.evaluator.prompt = (
-                f"Evaluate the following solution on a scale of 1-10 based on correctness, "
-                f"efficiency, and adherence to best practices for the task at hand. "
-                f"Hold it to a high, domain-appropriate quality bar judged against the task's own "
-                f"goals (correct and robust code, precise and well-structured writing, etc.) — "
-                f"not a fixed template.\n"
-                f"Penalize heavily (score < 5) for incorrect results, bugs, or identifiers, signatures, "
-                f"or interfaces that must match across files or components but don't.\n"
-                f"Reply ONLY with the integer score.\n\nSolution:\n{out}"
-            )
-            score_str = await self.evaluator.run_async()
-            score = _parse_score(score_str)
+        # Score every branch in parallel: clone the evaluator per branch (each gets
+        # its own prompt/session) and run them concurrently, instead of awaiting one
+        # mutated evaluator in a loop (which serialized N model calls on the hot path).
+        async def _score(out: str) -> int:
+            judge = copy.copy(self.evaluator)
+            judge.session_id = None  # independent: don't chain branch scorings
+            judge.prompt = build_judge_prompt(out, noun="solution")
+            return _parse_score(await judge.run_async())
 
-            logger.info(f"Branch {idx+1} evaluated with score: {score}")
-            scored_outputs.append((score, out))
+        results = await asyncio.gather(*[_score(o) for o in outputs],
+                                       return_exceptions=True)
 
-        # Select the branch with the highest score (stable: ties keep branch order).
-        scored_outputs.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_output = scored_outputs[0]
+        scored_outputs: List[Tuple[int, int, str]] = []  # (score, -idx, text) stable argmax
+        for idx, (out, res) in enumerate(zip(outputs, results)):
+            if isinstance(res, Exception):
+                logger.warning("Branch %d evaluation failed (%s); scoring 0.", idx + 1, res)
+                score = 0
+            else:
+                score = res
+            logger.info("Branch %d evaluated with score: %d", idx + 1, score)
+            scored_outputs.append((score, -idx, out))
 
-        logger.info(f"Selected best branch with score {best_score}")
+        best_score, neg_idx, best_output = max(scored_outputs, key=lambda t: (t[0], t[1]))
+        logger.info("Selected best branch (#%d) with score %d", -neg_idx + 1, best_score)
         return best_output

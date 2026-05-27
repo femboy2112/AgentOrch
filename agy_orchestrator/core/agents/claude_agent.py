@@ -8,9 +8,11 @@ from agy_orchestrator.core.agent import AgentInstance
 
 logger = logging.getLogger(__name__)
 
+# Map orchestrator-internal names to claude --model values. "opus"/"sonnet"/
+# "haiku" pass through unchanged — the CLI resolves them to the latest dated model
+# (opus->claude-opus-4-7, sonnet->claude-sonnet-4-6, haiku->claude-haiku-4-5).
 MODEL_ALIASES = {
     "standard": "sonnet",
-    "opus": "default",
 }
 
 
@@ -39,17 +41,9 @@ class ClaudeAgent(AgentInstance):
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:
-        try:
-            process = await _asyncio.create_subprocess_exec(
-                "claude", "--usage", model,
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE
-            )
-            stdout, _ = await process.communicate()
-            if process.returncode == 0:
-                pass
-        except Exception:
-            pass
+        # No machine-readable remaining-usage value is exposed, so report "full"
+        # and let real quota exhaustion be handled by the fallback layer. Spawning
+        # `claude --usage` only to discard its output was pure overhead.
         return 100.0
 
     def _build_base_cmd(self) -> List[str]:
@@ -86,28 +80,26 @@ class ClaudeAgent(AgentInstance):
 
     @staticmethod
     def _extract_session_id(raw_stdout: str) -> Optional[str]:
-        """Pull session_id from the JSON stream output."""
+        """Pull session_id from --output-format json output.
+
+        Parse the whole payload as one JSON value first (it may be a single object
+        or a list of objects) — the previous line-by-line scan failed on a
+        pretty-printed multi-line object, silently dropping the session id and
+        defeating warm-cache reuse. Regex is the genuine last-resort fallback.
+        """
         try:
-            for line in raw_stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                # Output may be a JSON array or a stream of objects
-                blobs = [line]
-                if line.startswith("["):
-                    blobs = json.loads(line)
-                for blob in blobs:
-                    if isinstance(blob, dict) and "session_id" in blob:
-                        return blob["session_id"]
+            payload = json.loads(raw_stdout)
+            blobs = payload if isinstance(payload, list) else [payload]
+            for blob in blobs:
+                if isinstance(blob, dict) and blob.get("session_id"):
+                    return blob["session_id"]
         except Exception:
-            # Fallback: regex scan
-            m = re.search(
-                r'"session_id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
-                raw_stdout
-            )
-            if m:
-                return m.group(1)
-        return None
+            pass
+        m = re.search(
+            r'"session_id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
+            raw_stdout,
+        )
+        return m.group(1) if m else None
 
     @staticmethod
     def _extract_result_text(raw_stdout: str) -> str:
@@ -185,12 +177,16 @@ class ClaudeAgent(AgentInstance):
                         self.stderr[:1000], raw_stdout[:1000]
                     )
 
+                except _asyncio.CancelledError:
+                    raise
+                except RuntimeError:
+                    raise  # timeout: fail fast so the fallback chain advances
                 except Exception as e:
                     logger.warning("Attempt %d/%d exception: %s", attempt, self.max_retries, e)
                     self.stderr = str(e)
 
                 if attempt < self.max_retries:
-                    backoff_time = 2 ** attempt
+                    backoff_time = min(8, 2 ** attempt)
                     logger.info("Retrying in %d seconds...", backoff_time)
                     await _asyncio.sleep(backoff_time)
 

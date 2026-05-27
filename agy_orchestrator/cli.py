@@ -5,6 +5,7 @@ import logging
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
+from agy_orchestrator.core.agents.grok_agent import GrokAgent
 from agy_orchestrator.execution.pipeline import LinearPipeline
 from agy_orchestrator.core.optimizer import UsageAwareAllocator
 from agy_orchestrator.core.profile import UserProfile
@@ -20,6 +21,8 @@ def get_agent_class(agent_name: str):
         return ClaudeAgent
     elif agent_name == "codex":
         return CodexAgent
+    elif agent_name == "grok":
+        return GrokAgent
     return AgyAgent
 
 def create_agent(agent_class, prompt, model, effort=None):
@@ -144,7 +147,7 @@ def main():
     # Adversarial Subcommand
     adv_parser = subparsers.add_parser("adversarial", help="Run Adversarial Review workflow")
     adv_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
-    adv_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex"], default="agy", help="Agent type to use")
+    adv_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex", "grok"], default="agy", help="Agent type to use")
     adv_parser.add_argument("--model", type=str, default="standard", help="Base model to use")
     adv_parser.add_argument("--test-cmd", type=str, help="Optional programmatic test command")
     adv_parser.add_argument("--max-iterations", type=int, default=5, help="Max loops")
@@ -152,14 +155,14 @@ def main():
     # Tree of Thought Subcommand
     tot_parser = subparsers.add_parser("tot", help="Run Tree-of-Thought workflow")
     tot_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
-    tot_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex"], default="agy", help="Agent type to use")
+    tot_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex", "grok"], default="agy", help="Agent type to use")
     tot_parser.add_argument("--model", type=str, default="standard", help="Base model to use")
     tot_parser.add_argument("--branches", type=int, default=3, help="Number of ToT branches")
     
     # Master Subcommand
     master_parser = subparsers.add_parser("master", help="Run Master Orchestrator workflow")
     master_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
-    master_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex"], default="agy", help="Agent type to use")
+    master_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex", "grok"], default="agy", help="Agent type to use")
     master_parser.add_argument("--model", type=str, default="standard", help="Base model to use")
     master_parser.add_argument("--test-cmd", type=str, help="Optional programmatic test command")
     master_parser.add_argument("--branches", type=int, default=3, help="Number of ToT branches per task")
@@ -172,7 +175,7 @@ def main():
     # Chain Subcommand
     chain_parser = subparsers.add_parser("chain", help="Run Linear Pipeline workflow")
     chain_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
-    chain_parser.add_argument("--agents", type=str, nargs="+", choices=["agy", "claude", "codex"], default=["codex"], help="List of agents to chain (default: codex). Standing rule: every run leads with codex so a refreshed codex quota is auto-detected next run.")
+    chain_parser.add_argument("--agents", type=str, nargs="+", choices=["agy", "claude", "codex", "grok"], default=["codex"], help="List of agents to chain (default: codex). Standing rule: every run leads with codex so a refreshed codex quota is auto-detected next run.")
     chain_parser.add_argument("--model", type=str, default="standard", help="Base model to use")
     # Standing rule: fallback ON by default (codex->agy->claude->codex, cycling) so codex-primary
     # runs survive usage exhaustion; pass --no-fallback for a plain refinement pipeline.

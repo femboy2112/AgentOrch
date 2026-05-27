@@ -167,6 +167,7 @@ class GrokAgent(AgentInstance):
                         stdout=_asyncio.subprocess.PIPE,
                         stderr=_asyncio.subprocess.PIPE,
                     )
+                    self._current_process = process
                     comm = process.communicate()
                     try:
                         if self.timeout and self.timeout > 0:
@@ -198,12 +199,19 @@ class GrokAgent(AgentInstance):
 
                     logger.warning("grok attempt %d/%d failed (code %d):\n%s",
                                    attempt, self.max_retries, self.returncode, self.stderr[:1000])
+                except _asyncio.CancelledError:
+                    await self._kill_current()
+                    raise
+                except RuntimeError:
+                    raise  # timeout: fail fast so the fallback chain advances
                 except Exception as e:
                     logger.warning("grok attempt %d/%d exception: %s", attempt, self.max_retries, e)
                     self.stderr = str(e)
+                finally:
+                    self._current_process = None
 
                 if attempt < self.max_retries:
-                    await _asyncio.sleep(2 ** attempt)
+                    await _asyncio.sleep(min(8, 2 ** attempt))
 
             raise RuntimeError(f"GrokAgent failed after {self.max_retries} attempts: {self.stderr}")
         finally:
