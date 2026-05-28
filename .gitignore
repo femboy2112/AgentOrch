@@ -22,6 +22,13 @@ runs/
 /mod_*.py
 /pipeline.py
 
+# Dashboard server.log + ad-hoc stub scripts that workers spawn during dispatch
+# smoke-tests (caught these mid-build; harmless but noisy in git status).
+/server.log
+/stub_dispatch.py
+# Stray `=<version>` files from misparsed `pip install foo>=X.Y` invocations.
+/=[0-9]*
+
 # Worker-CLI residue (agy drops a symlink into ~/.gemini)
 .antigravitycli/
 .tlica_state/

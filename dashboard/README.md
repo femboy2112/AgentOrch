@@ -58,6 +58,7 @@ Run Detail:
 - Step 7 Phase 4 (this dispatch): re-verified AC end-to-end with real events.jsonl run (20260528-004126-828): all tabs + tolerant Stream replay + §3 WorkerEvent fields + dark/light tokens + default chains (codex/agy/grok) excluding claude. 87 tests green pre-edit. Minimal doc note only for boundary commit.
 - Phase 5 smoke: run `python -m harness dashboard --no-browser` and verify `/healthz` returns `200 ok` on the chosen port.
 - Step 7 Phase 5 (this dispatch): harness CLI subcommand exercised via subprocess (python -m harness dashboard --port 18765 --no-browser); server booted on 127.0.0.1, /healthz=200 confirmed. README already contains full launch + wireframes + v2 backlog per §6. All §8/§10 respected (no claude CLI mutation). Doc note only; pytest remains green gate.
+- Step 8 (this dispatch): Final §10 checklist executed end-to-end + all 7 §8 gotchas re-confirmed (WorkerEvent §3 contract, claude stream-json dashboard-only, chains exclude claude per CLAUDE.md account rule, 127.0.0.1 bind, append-only tolerant replay, error-swallow, watchdog). `python -m pytest -q` green (87 passed). All boxes: boot+healthz, harness exec handoff, POST+events.jsonl+shape, /live stream, /runs+detail tabs+replay, dark/light, README+v2. No code changes (validation only); doc note for traceability. Dispatch complete.
 
 ## v2 Backlog (Explicitly Deferred)
 
