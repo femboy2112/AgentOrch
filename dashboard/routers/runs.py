@@ -30,6 +30,11 @@ def _preview_from_prompt(path: Path) -> str:
 
 def _started_at(run_id: str) -> Optional[float]:
     try:
+        # run_ids use truncated micros (e.g. -123); pad to 6 digits for %f
+        if run_id.count("-") == 2:
+            prefix, micros = run_id.rsplit("-", 1)
+            micros = (micros + "000000")[:6]
+            run_id = f"{prefix}-{micros}"
         stamp = dt.datetime.strptime(run_id, "%Y%m%d-%H%M%S-%f")
         return stamp.timestamp()
     except Exception:

@@ -2,7 +2,7 @@ import { getBudget, getRuns, postDispatch } from '../api.js';
 import { subscribe } from '../sse.js';
 import { StreamRenderer } from '../components/stream.js';
 
-const WORKERS = ['codex', 'agy', 'grok', 'claude'];
+const WORKERS = ['codex', 'agy', 'grok'];
 
 function csvToList(raw) {
     return raw
@@ -66,7 +66,7 @@ export function renderDispatch(container) {
         const target = document.getElementById('d-last3');
         target.textContent = '';
         try {
-            const resp = await getRuns(3);
+            const resp = await getRuns({ limit: 3 });
             if (!resp.runs || resp.runs.length === 0) {
                 target.textContent = 'No previous dispatches yet.';
                 return;

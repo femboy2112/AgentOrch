@@ -1,5 +1,7 @@
 import { renderDispatch } from './pages/dispatch.js';
 import { renderLive } from './pages/live.js';
+import { renderRuns } from './pages/runs.js';
+import { renderRunDetail } from './pages/run_detail.js';
 
 export function initRouter() {
     window.addEventListener('hashchange', handleRoute);
@@ -13,11 +15,25 @@ function handleRoute() {
 
     if (hash === '#/dispatch') {
         renderDispatch(app);
-    } else if (hash === '#/live') {
-        renderLive(app);
-    } else if (hash === '#/runs' || hash.startsWith('#/runs/')) {
-        app.innerHTML = '<h2>Runs (Phase 4)</h2>';
-    } else {
-        window.location.hash = '#/dispatch';
+        return;
     }
+    if (hash === '#/live') {
+        renderLive(app);
+        return;
+    }
+    if (hash === '#/runs') {
+        renderRuns(app);
+        return;
+    }
+    if (hash.startsWith('#/runs/')) {
+        const runId = decodeURIComponent(hash.slice('#/runs/'.length));
+        if (!runId) {
+            window.location.hash = '#/runs';
+            return;
+        }
+        renderRunDetail(app, runId);
+        return;
+    }
+
+    window.location.hash = '#/dispatch';
 }
