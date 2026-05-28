@@ -250,4 +250,26 @@ class VoteWorkflow:
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_path, dst_path)
 
+            # Remove files that no longer exist in the winner workspace.
+            for dst_path in dst.rglob("*"):
+                if not dst_path.is_file():
+                    continue
+                rel = dst_path.relative_to(dst)
+                top = rel.parts[0]
+                if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
+                    continue
+                if (src / rel).exists():
+                    continue
+                try:
+                    dst_path.unlink()
+                except OSError:
+                    continue
+                parent = dst_path.parent
+                while parent != dst:
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
+
         await asyncio.to_thread(_do_apply)
