@@ -31,6 +31,12 @@ export async function renderLive(container) {
     const focusRunId = sessionStorage.getItem('dashboard:last_run_id');
     const expandAll = runs.length === 1;
 
+    // Build every card synchronously (no awaits) so the DOM is fully
+    // rendered before any network call fires. The previous sequential
+    // `await getBudget(...)` inside the loop blocked SSE subscription
+    // for runs N+1..K behind runs 1..N — visibly slow with multiple
+    // active runs.
+    const wires = [];
     for (const run of runs) {
         const card = document.createElement('section');
         card.className = 'card';
@@ -70,18 +76,17 @@ export async function renderLive(container) {
         });
 
         const renderer = new StreamRenderer(streamHost);
+        wires.push({ run, renderer, tokensEl, budgetEl });
+    }
+
+    // Now fire every budget fetch in parallel; whichever resolves first
+    // updates its budget cell. None blocks any other run's SSE subscription.
+    for (const { run, renderer, tokensEl, budgetEl } of wires) {
         let outTokens = 0;
         let maxBytes = 0;
-
-        try {
-            const b = await getBudget(run.mode, (run.generator || []).join(','), (run.critic || []).join(','));
-            if (b && b.rows) {
-                maxBytes = b.rows.reduce((sum, row) => sum + Number(row.max_output_bytes || 0), 0);
-            }
-        } catch (_err) {
-            maxBytes = 0;
-        }
-
+        // Start the SSE subscription immediately — don't wait on the
+        // (slow, parallelizable) budget fetch. Budget cell updates
+        // independently when its fetch resolves.
         subscribe(
             run.run_id,
             (e) => {
@@ -103,5 +108,13 @@ export async function renderLive(container) {
                 console.error('SSE error', err);
             }
         );
+        // Budget is a soft signal; failures don't affect the stream.
+        getBudget(run.mode, (run.generator || []).join(','), (run.critic || []).join(','))
+            .then((b) => {
+                if (b && b.rows) {
+                    maxBytes = b.rows.reduce((sum, row) => sum + Number(row.max_output_bytes || 0), 0);
+                }
+            })
+            .catch(() => {});
     }
 }
