@@ -17,6 +17,7 @@ from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import (
     DEFAULT_MAX_BYTES,
     DEFAULT_STALL_SECONDS,
+    DEFAULT_STALL_SECONDS_BY_WORKER,
 )
 from harness import roles
 
@@ -32,9 +33,11 @@ def _isolate_calibration(monkeypatch):
 def test_single_agent_path_arms_safe_defaults(monkeypatch):
     monkeypatch.delenv("AGY_WATCHDOG", raising=False)
     agent = roles.build_role_agent(["codex"], fallback=False)
-    # With no calibration data on disk, safe defaults apply (never false-trip).
+    # With no calibration data on disk, the per-worker default applies (codex
+    # gets a longer stall ceiling because of its in-CLI network-retry quiet
+    # windows; unknown workers fall back to DEFAULT_STALL_SECONDS).
     assert agent.max_output_bytes == DEFAULT_MAX_BYTES
-    assert agent.stall_seconds == DEFAULT_STALL_SECONDS
+    assert agent.stall_seconds == DEFAULT_STALL_SECONDS_BY_WORKER["codex"]
 
 
 def test_agy_watchdog_off_skips_arming(monkeypatch):
@@ -55,9 +58,9 @@ def test_fallback_path_arms_each_sub_via_hook(monkeypatch):
     assert isinstance(sub_codex, AgentInstance)
     assert isinstance(sub_agy, AgentInstance)
     assert sub_codex.max_output_bytes == DEFAULT_MAX_BYTES
-    assert sub_codex.stall_seconds == DEFAULT_STALL_SECONDS
+    assert sub_codex.stall_seconds == DEFAULT_STALL_SECONDS_BY_WORKER["codex"]
     assert sub_agy.max_output_bytes == DEFAULT_MAX_BYTES
-    assert sub_agy.stall_seconds == DEFAULT_STALL_SECONDS
+    assert sub_agy.stall_seconds == DEFAULT_STALL_SECONDS_BY_WORKER["agy"]
 
 
 def test_env_var_override_is_respected(monkeypatch):
@@ -76,6 +79,7 @@ def test_grok_with_na_effort_does_not_crash():
     treats 'n/a' as no effort key — must not raise or break the lookup."""
     agent = roles.build_role_agent(["grok"], fallback=False)
     assert agent.max_output_bytes == DEFAULT_MAX_BYTES
+    assert agent.stall_seconds == DEFAULT_STALL_SECONDS_BY_WORKER["grok"]
 
 
 def test_post_construct_hook_swallows_exceptions(monkeypatch):

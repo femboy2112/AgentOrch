@@ -203,3 +203,28 @@ to `model_sweep` / `token_efficiency` for medians; pass `--sequential` to
   (`last_wall_ms`, `last_out_bytes`, `_watchdog_reason`) into ledger rows
   at the dispatch boundary so the calibration table self-updates from real
   dispatch traffic, not just from `calibrate.py` runs.
+
+### Watchdog signal/noise fix (post-dashboard dispatch, 2026-05-28)
+
+Observing the dashboard build's repeated stall trips (always agy critic at
+180s → fallback to grok → grok recovers) plus the operator's note about
+codex's network-retry windows prompted two related changes:
+
+1. **Stderr now counts as progress** in the streaming watchdog. Previously
+   `last_progress` was reset only by stdout bytes — but every worker writes
+   its visible work to stderr (codex `exec` lines + `apply_patch` traces,
+   claude/agy/grok status, network-retry messages) and reserves stdout for
+   the final reply. A codex run reasoning silently on stdout while busy on
+   stderr was being killed as "stalled". After the fix, any output on either
+   stream resets the clock; the byte budget (which catches the haiku
+   verbosity tax) still counts stdout only.
+2. **Per-worker stall defaults**: `DEFAULT_STALL_SECONDS_BY_WORKER` now
+   holds codex=600s, agy=600s, grok=600s, claude=180s. The global default
+   moved from 180s → 300s for unknown workers. Codex was the immediate
+   motivator: its in-CLI network-retry can leave it silent on both streams
+   for several minutes before reconnecting; cheaper to let it ride than to
+   roll the fallback chain forward and lose accumulated session context.
+
+Both fixes are conservative: the watchdog still kills genuinely-hung workers
+(see `test_watchdog_still_kills_truly_silent_worker`), and the hard
+wall-timeout (`AGY_TIMEOUT`, default 2400s) is unchanged.

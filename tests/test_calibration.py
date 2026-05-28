@@ -11,16 +11,34 @@ from agy_orchestrator.core.calibration import (
     BYTES_PER_TOKEN,
     DEFAULT_MAX_BYTES,
     DEFAULT_STALL_SECONDS,
+    DEFAULT_STALL_SECONDS_BY_WORKER,
     CalibrationTable,
 )
 
 
 def test_empty_table_returns_safe_defaults():
+    """No calibration data ⇒ codex gets its per-worker default (not the global
+    floor), unknown workers fall back to DEFAULT_STALL_SECONDS."""
     t = CalibrationTable()
     max_bytes, stall = t.budget_for("codex", "gpt-5.4-mini", "low")
     assert max_bytes == DEFAULT_MAX_BYTES
-    assert stall == DEFAULT_STALL_SECONDS
+    assert stall == DEFAULT_STALL_SECONDS_BY_WORKER["codex"]
     assert not t.has_data_for("codex", "gpt-5.4-mini", "low")
+
+
+def test_per_worker_stall_defaults_diverge_from_global():
+    """Known workers get tuned ceilings; unknown workers fall back to the
+    global default. Regression guard for the bump we made after observing
+    codex's normal network-retry windows trip the old 180s ceiling."""
+    t = CalibrationTable()
+    _, codex_stall = t.budget_for("codex", "gpt-5.5", "high")
+    _, claude_stall = t.budget_for("claude", "sonnet", "low")
+    _, mystery_stall = t.budget_for("mystery", "x", None)
+    assert codex_stall == DEFAULT_STALL_SECONDS_BY_WORKER["codex"]
+    assert claude_stall == DEFAULT_STALL_SECONDS_BY_WORKER["claude"]
+    assert mystery_stall == DEFAULT_STALL_SECONDS
+    # codex's default must be ≥ the global default — that's the whole point.
+    assert codex_stall >= DEFAULT_STALL_SECONDS
 
 
 def test_ingest_skips_failing_rows():
@@ -59,6 +77,7 @@ def test_budget_tightens_with_enough_passing_rows():
 def test_load_missing_file_returns_empty_table(tmp_path):
     t = CalibrationTable.load(tmp_path / "nonexistent.jsonl")
     assert isinstance(t, CalibrationTable)
+    # "any" is not in the per-worker table → global default applies.
     max_bytes, stall = t.budget_for("any", "any", None)
     assert (max_bytes, stall) == (DEFAULT_MAX_BYTES, DEFAULT_STALL_SECONDS)
 

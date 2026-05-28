@@ -200,8 +200,15 @@ class AgentInstance(ABC):
                 except Exception:
                     pass
 
-        # Mutable state shared with the watchdog: byte tally + last-progress timestamp.
+        # Mutable state shared with the watchdog: byte tally on stdout (for the
+        # verbose-runaway budget), and a single last-progress timestamp that
+        # advances on output from EITHER stream. Stderr is where workers do
+        # most of their visible work (codex exec lines + apply_patch traces,
+        # claude/agy/grok status, network-retry messages); treating its silence
+        # as "stalled" was a false-positive farm — codex's normal recovery from
+        # network blips looks like a stall under stdout-only progress tracking.
         out_total = [0]
+        any_output = [False]
         last_progress = [time.monotonic()]
 
         async def _drain(reader, chunks, echo: bool, count: bool, stream: str) -> None:
@@ -212,9 +219,15 @@ class AgentInstance(ABC):
                 if not line:
                     break
                 chunks.append(line)
+                # Either stream resets the stall clock — the watchdog cares
+                # about "is the worker doing anything", not "is stdout flowing".
+                last_progress[0] = time.monotonic()
+                any_output[0] = True
                 if count:
+                    # Byte budget tallies stdout only: runaway-verbose tax
+                    # (e.g. claude:haiku spitting 4528 tokens on calc3) lands
+                    # on stdout. Stderr volume is normal worker chatter.
                     out_total[0] += len(line)
-                    last_progress[0] = time.monotonic()
                 if echo:
                     sys.stderr.buffer.write(line)
                     sys.stderr.buffer.flush()
@@ -246,10 +259,11 @@ class AgentInstance(ABC):
                         pass
                     return
                 if stall_seconds > 0 and (time.monotonic() - last_progress[0]) > stall_seconds:
-                    # Only trip stall if NOTHING has been produced yet — a long-running
-                    # build that's emitting periodically is fine even past a single
-                    # stall window. The hard wall-timeout still catches true hangs.
-                    if out_total[0] == 0:
+                    # Only trip stall if NOTHING has been produced on EITHER stream
+                    # yet. A worker that emitted, then went silent for one stall
+                    # window, may be reasoning between bursts — the hard wall-timeout
+                    # (AGY_TIMEOUT, default 2400s) still catches genuine hangs.
+                    if not any_output[0]:
                         self._watchdog_reason = WATCHDOG_STALLED
                         logger.warning("watchdog: STALLED trip — no output for %.0fs; killing",
                                        stall_seconds)

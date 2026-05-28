@@ -43,7 +43,22 @@ BYTES_PER_TOKEN = 4
 # Conservative defaults when the table has no data for a config. Picked to NOT
 # false-positive on any successful run measured this session.
 DEFAULT_MAX_BYTES = 200_000        # ~50k tokens — far above any observed success
-DEFAULT_STALL_SECONDS = 180.0      # 3 min of no progress = stalled
+DEFAULT_STALL_SECONDS = 300.0      # 5 min of no progress on EITHER stream = stalled
+
+# Per-worker stall ceilings (cold-start, no calibration data). codex has the
+# longest legitimate quiet windows because of its in-CLI network-retry logic
+# (an upstream API hiccup can leave it silent for several minutes before the
+# CLI's own retry logic reconnects); agy/grok also reason in long bursts.
+# claude's normal CLI path (--output-format json) is silent until the end of
+# the call but the call itself is short, so a tighter ceiling is safe there.
+# Override per call via AGY_STALL_SECONDS env var or by writing to the agent's
+# stall_seconds attribute directly.
+DEFAULT_STALL_SECONDS_BY_WORKER = {
+    "codex": 600.0,
+    "agy":   600.0,
+    "grok":  600.0,
+    "claude": 180.0,
+}
 
 # Path the calibrate sweep writes to; sweep results in /tmp by default.
 DEFAULT_CALIBRATION_PATH = Path(
@@ -101,13 +116,16 @@ class CalibrationTable:
     def budget_for(self, worker: str, model: str,
                    effort: Optional[str]) -> tuple[int, float]:
         """Return (max_output_bytes, stall_seconds) for a (worker, model, effort)."""
+        # Per-worker default ceiling; falls back to the global default for unknown
+        # workers. Empirical: codex's network-retry can leave it silent ~5 min.
+        default_stall = DEFAULT_STALL_SECONDS_BY_WORKER.get(worker, DEFAULT_STALL_SECONDS)
         rows = self._success.get((worker, model, effort), [])
         if len(rows) < 3:
-            return (DEFAULT_MAX_BYTES, DEFAULT_STALL_SECONDS)
+            return (DEFAULT_MAX_BYTES, default_stall)
         token_samples = [r[0] for r in rows if r[0] > 0]
         wall_samples = [r[1] for r in rows if r[1] > 0]
         max_bytes = DEFAULT_MAX_BYTES
-        stall_seconds = DEFAULT_STALL_SECONDS
+        stall_seconds = default_stall
         # statistics.quantiles needs >=2 samples; for tiny n we still want some
         # tightening, so use the simple max-with-multiplier fallback.
         if len(token_samples) >= 2:
