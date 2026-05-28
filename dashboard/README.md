@@ -55,6 +55,7 @@ Run Detail:
 - Phase 3 smoke: run `python -m dashboard --no-browser` on `127.0.0.1:8765`, open `http://127.0.0.1:8765/#/dispatch`, submit a stub `direct` dispatch (`codex,agy,grok`), and verify ordered `WorkerEvent` updates in both Dispatch embedded stream and `#/live`.
 - Phase 4 smoke: open `#/runs`, apply filters/search, load more, then open `#/runs/<id>` and exercise all tabs (`Stream`, `Prompt`, `Stdout`, `Stderr`, `Diff`, `Quality`), confirming Stream replay from `runs/<id>/events.jsonl`.
 - Step 7 Phase 4 verification: pytest -q (87 passed); TestClient simulation of run creation + /api/runs + /api/runs/{id} + all 5 artifact tabs (Stream via parseEventsNdjson+StreamRenderer, others pre) exercised successfully; theme toggle (dark default + html.light via localStorage + tokens) wired in index.html/app.js/tokens.css; runs+run_detail JS present and router-linked. All §6 Phase 4 AC + §8 gotchas (WorkerEvent.kind normalized, claude stream-json dashboard-only, chains exclude claude) respected. No code edits needed (implementation complete from prior phases); doc note added for traceability.
+- Step 7 Phase 4 (this dispatch): re-verified AC end-to-end with real events.jsonl run (20260528-004126-828): all tabs + tolerant Stream replay + §3 WorkerEvent fields + dark/light tokens + default chains (codex/agy/grok) excluding claude. 87 tests green pre-edit. Minimal doc note only for boundary commit.
 - Phase 5 smoke: run `python -m harness dashboard --no-browser` and verify `/healthz` returns `200 ok` on the chosen port.
 
 ## v2 Backlog (Explicitly Deferred)
