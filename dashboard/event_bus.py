@@ -131,18 +131,19 @@ class EventBus:
             except Exception:
                 floor = -1
         out: List[dict] = []
-        for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
-            if idx <= floor:
-                continue
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(event, dict):
-                out.append(event)
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for idx, raw in enumerate(f):
+                if idx <= floor:
+                    continue
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(event, dict):
+                    out.append(event)
         return out
 
     @staticmethod

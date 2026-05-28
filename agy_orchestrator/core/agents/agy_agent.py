@@ -117,9 +117,6 @@ class AgyAgent(AgentInstance):
         return parse_agy_stdout(raw_stdout)
 
     def _postprocess(self, raw_stdout: str) -> str:
-        text = raw_stdout.strip()
-        if text:
-            self._emit_event({"kind": "message", "text": text, "data": {}})
         return raw_stdout
 
     # --- model pinning via settings.json (see module docstring) ----------------
