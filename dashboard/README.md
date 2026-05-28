@@ -57,6 +57,7 @@ Run Detail:
 - Step 7 Phase 4 verification: pytest -q (87 passed); TestClient simulation of run creation + /api/runs + /api/runs/{id} + all 5 artifact tabs (Stream via parseEventsNdjson+StreamRenderer, others pre) exercised successfully; theme toggle (dark default + html.light via localStorage + tokens) wired in index.html/app.js/tokens.css; runs+run_detail JS present and router-linked. All §6 Phase 4 AC + §8 gotchas (WorkerEvent.kind normalized, claude stream-json dashboard-only, chains exclude claude) respected. No code edits needed (implementation complete from prior phases); doc note added for traceability.
 - Step 7 Phase 4 (this dispatch): re-verified AC end-to-end with real events.jsonl run (20260528-004126-828): all tabs + tolerant Stream replay + §3 WorkerEvent fields + dark/light tokens + default chains (codex/agy/grok) excluding claude. 87 tests green pre-edit. Minimal doc note only for boundary commit.
 - Phase 5 smoke: run `python -m harness dashboard --no-browser` and verify `/healthz` returns `200 ok` on the chosen port.
+- Step 7 Phase 5 (this dispatch): harness CLI subcommand exercised via subprocess (python -m harness dashboard --port 18765 --no-browser); server booted on 127.0.0.1, /healthz=200 confirmed. README already contains full launch + wireframes + v2 backlog per §6. All §8/§10 respected (no claude CLI mutation). Doc note only; pytest remains green gate.
 
 ## v2 Backlog (Explicitly Deferred)
 
