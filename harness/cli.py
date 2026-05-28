@@ -134,7 +134,7 @@ def main(argv=None) -> int:
 
     do = sub.add_parser("do", help="Dispatch one coding instruction to a worker")
     do.add_argument("instruction", type=str, help="The instruction for the worker")
-    do.add_argument("--mode", choices=["direct", "adversarial", "feedback", "cascade", "master", "pat"],
+    do.add_argument("--mode", choices=["direct", "adversarial", "feedback", "cascade", "master", "pat", "vote"],
                     default="adversarial",
                     help="Workflow shape. direct=one shot; adversarial=generate+critic loop "
                          "(default); feedback=generate+run-tests+repair loop (needs --test-cmd); "
@@ -142,7 +142,10 @@ def main(argv=None) -> int:
                          "on verifier failure (needs --test-cmd); "
                          "master=plan+ToT+adversarial for whole features; "
                          "pat=Plan-after-Trial: direct attempt first, escalate to master only on "
-                         "verifier failure (needs --test-cmd; ~40% cost savings on easy tasks).")
+                         "verifier failure (needs --test-cmd; ~40% cost savings on easy tasks); "
+                         "vote=K parallel candidates in isolated workspaces, verifier picks the "
+                         "winner (needs --test-cmd; K=--branches; heterogeneous when chain has "
+                         "multiple providers).")
     do.add_argument("--context", type=str, default=None,
                     help="Extra context appended to the instruction")
     do.add_argument("--generator", type=str, default=None,
