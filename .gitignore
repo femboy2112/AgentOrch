@@ -33,6 +33,23 @@ runs/
 .antigravitycli/
 .tlica_state/
 
+# Worker / agent config dirs — never commit these. They commonly hold session
+# tokens, auth state, API keys, or symlinks into the user's home-dir secret
+# stores. Blanket-block by directory pattern so a new tool dropping its
+# config here can't silently leak. Add specific files back via !pattern if
+# ever needed.
+.claude/
+.grok/
+.codex/
+.agy/
+.anthropic/
+.openai/
+.xai/
+.gemini/
+*.token
+*credentials*
+*secret*
+
 # Editors / OS
 .idea/
 .vscode/
