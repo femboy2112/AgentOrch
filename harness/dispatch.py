@@ -457,6 +457,30 @@ async def dispatch_async(
     )
     logger.info("Dispatch %s | confidence=%s (%s)", run_id, quality["confidence"], quality["note"])
 
+    after = take_snapshot(work_dir)
+    diff = diff_snapshots(before, after)
+
+    (run_dir / "stdout.log").write_text(output, encoding="utf-8")
+    (run_dir / "changed-files.diff").write_text(
+        diff.unified or "(no file changes detected)\n", encoding="utf-8"
+    )
+
+    stage_used = getattr(workflow, "stage_used", None) if workflow else None
+    n_candidates = getattr(workflow, "n_candidates", None) if workflow else None
+    n_passed = getattr(workflow, "n_passed", None) if workflow else None
+    winner_index = getattr(workflow, "winner_index", None) if workflow else None
+    if stage_used == -1:
+        stage_used = None
+    if winner_index == -1:
+        winner_index = None
+
+    # TODO: Wire the final VerifierResult up from workflows so this can
+    # differentiate timeout vs returncode failures for non-verified runs.
+    if quality.get("confidence") == "verified":
+        verifier_failure_kind = None
+    else:
+        verifier_failure_kind = None
+
     # Close the calibration loop: every verified dispatch contributes one
     # observation to the live ledger that CalibrationTable.load() reads on
     # next process start. Only verified runs count — matching the offline
@@ -471,15 +495,17 @@ async def dispatch_async(
             ok=True,
             out_bytes=out_bytes_value,
             wall_ms=wall_ms_value,
+            mode=mode,
+            stage_used=stage_used,
+            n_candidates=n_candidates,
+            n_passed=n_passed,
+            winner_index=winner_index,
+            verifier_delta=quality.get("verifier_delta"),
+            verifier_failure_kind=verifier_failure_kind,
+            diff_files_added=len(diff.added),
+            diff_files_modified=len(diff.modified),
+            diff_files_deleted=len(diff.deleted),
         )
-
-    after = take_snapshot(work_dir)
-    diff = diff_snapshots(before, after)
-
-    (run_dir / "stdout.log").write_text(output, encoding="utf-8")
-    (run_dir / "changed-files.diff").write_text(
-        diff.unified or "(no file changes detected)\n", encoding="utf-8"
-    )
 
     result = DispatchResult(
         run_id=run_id,
