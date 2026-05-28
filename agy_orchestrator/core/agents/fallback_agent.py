@@ -12,7 +12,11 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Type
 
-from agy_orchestrator.core.agent import USAGE_MARKERS, AgentInstance
+from agy_orchestrator.core.agent import (
+    USAGE_MARKERS,
+    WATCHDOG_MARKER,
+    AgentInstance,
+)
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
 
@@ -22,10 +26,20 @@ logger = logging.getLogger(__name__)
 _SESSION_CAPABLE = (ClaudeAgent, GrokAgent)
 
 
+def _watchdog_reason_in(stderr: str) -> Optional[str]:
+    """Extract a watchdog trip reason from a failed sub's stderr, or None."""
+    if not stderr or WATCHDOG_MARKER not in stderr:
+        return None
+    # Markers look like '[watchdog:verbose]' or '[watchdog:stalled]'. Pull the slug.
+    head = stderr.split(WATCHDOG_MARKER, 1)[1]
+    return head.split("]", 1)[0].strip() or None
+
+
 def make_fallback_agent(
     chain: List[Type[AgentInstance]],
     cycles: int = 3,
     configs: Optional[Dict[Type[AgentInstance], Dict[str, object]]] = None,
+    watchdog_rules: Optional[Dict[str, List[Type[AgentInstance]]]] = None,
 ) -> Type[AgentInstance]:
     """Return an AgentInstance subclass that tries ``chain`` in order per call.
 
@@ -41,6 +55,19 @@ def make_fallback_agent(
     reviewer falling back to ``codex``, which must NOT receive "pro" as its
     model. Keys absent from ``configs`` fall back to ``self.model`` /
     ``self.effort`` (the prior behavior, so existing callers are unaffected).
+
+    ``watchdog_rules`` optionally maps a watchdog trip reason
+    (``"verbose"`` / ``"stalled"``) to an ordered list of agent classes to try
+    NEXT when a sub fails with that reason. Use it to route a rambling cheap
+    model to a terse one, or an empty/stalled run to a stronger model:
+
+        watchdog_rules={
+            "verbose": [CodexAgent],    # haiku rambled -> hand to a terse coder
+            "stalled": [ClaudeAgent],   # cheap froze -> escalate
+        }
+
+    Rules apply ONCE per trip and re-enter the normal sequence afterwards, so a
+    bad chain order can't get stuck in an infinite rules-table ping-pong.
     """
 
     if not chain:
@@ -52,6 +79,9 @@ def make_fallback_agent(
         _chain: List[Type[AgentInstance]] = list(chain)
         _cycles: int = cycles
         _configs: Dict[Type[AgentInstance], Dict[str, object]] = dict(configs or {})
+        _watchdog_rules: Dict[str, List[Type[AgentInstance]]] = {
+            reason: list(targets) for reason, targets in (watchdog_rules or {}).items()
+        }
 
         @classmethod
         async def get_available_models(cls) -> List[str]:
@@ -92,9 +122,14 @@ def make_fallback_agent(
         async def run_async(self, piped_input: Optional[str] = None) -> str:
             last_error: Optional[Exception] = None
             # Repeat the chain ``_cycles`` times: codex -> agy -> claude -> (repeat).
-            sequence = list(self._chain) * self._cycles
-            total = len(sequence)
-            for index, agent_cls in enumerate(sequence):
+            # ``pending`` is a mutable view we can splice rule-based targets into the
+            # front of when a watchdog trips, so the next attempt picks them up.
+            pending: List[Type[AgentInstance]] = list(self._chain) * self._cycles
+            total = len(pending)
+            attempts = 0
+            while pending:
+                agent_cls = pending.pop(0)
+                attempts += 1
                 label = agent_cls.__name__
                 try:
                     sub = self._make_sub(agent_cls)
@@ -103,18 +138,32 @@ def make_fallback_agent(
                     last_error = exc
                     continue
 
-                logger.info("[Fallback] provider %d/%d: %s", index + 1, total, label)
+                logger.info("[Fallback] provider %d/%d: %s", attempts, total, label)
                 try:
                     result = await sub.run_async(piped_input)
                 except Exception as exc:
-                    stderr = (getattr(sub, "stderr", "") or "").lower()
-                    looked_like_usage = any(marker in stderr for marker in USAGE_MARKERS)
-                    logger.warning(
-                        "[Fallback] %s failed%s: %s",
-                        label,
-                        " (usage/quota wall)" if looked_like_usage else "",
-                        exc,
-                    )
+                    stderr = getattr(sub, "stderr", "") or ""
+                    stderr_lc = stderr.lower()
+                    looked_like_usage = any(marker in stderr_lc for marker in USAGE_MARKERS)
+                    reason = _watchdog_reason_in(stderr)
+                    if reason and reason in self._watchdog_rules:
+                        targets = self._watchdog_rules[reason]
+                        # Splice rule-based re-route targets to the FRONT of pending,
+                        # then continue. The targets pre-empt the normal sequence once;
+                        # the normal sequence still runs afterwards if they too fail.
+                        pending[0:0] = list(targets)
+                        logger.warning(
+                            "[Fallback] %s tripped watchdog:%s — re-routing to %s",
+                            label, reason, [c.__name__ for c in targets],
+                        )
+                    else:
+                        logger.warning(
+                            "[Fallback] %s failed%s%s: %s",
+                            label,
+                            " (usage/quota wall)" if looked_like_usage else "",
+                            f" (watchdog:{reason})" if reason else "",
+                            exc,
+                        )
                     last_error = exc
                     continue
 
@@ -128,13 +177,14 @@ def make_fallback_agent(
                 self.stdout = sub.stdout
                 self.stderr = sub.stderr
                 self.returncode = sub.returncode
-                if index > 0:
+                if attempts > 1:
                     logger.info("[Fallback] recovered via %s", label)
                 return result
 
             raise RuntimeError(
-                f"All {total} fallback attempts exhausted "
-                f"({len(self._chain)} providers x {self._cycles} cycles); last error: {last_error}"
+                f"All {attempts} fallback attempts exhausted "
+                f"({len(self._chain)} providers x {self._cycles} cycles, "
+                f"plus rule-based re-routes); last error: {last_error}"
             )
 
     FallbackAgent.__name__ = "FallbackAgent[" + "->".join(c.__name__ for c in chain) + "]"

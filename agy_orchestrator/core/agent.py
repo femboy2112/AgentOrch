@@ -3,10 +3,17 @@ import logging
 import os
 import random
 import sys
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Watchdog trip reasons exposed via AgentInstance._watchdog_reason after run_async
+# returns or raises. FallbackAgent reads these to choose rule-based re-route targets.
+WATCHDOG_VERBOSE = "verbose"   # output bytes > per-config budget (rambling/looping)
+WATCHDOG_STALLED = "stalled"   # no output for > stall_seconds and nothing produced
+WATCHDOG_MARKER = "[watchdog:"  # carried in self.stderr for downstream pattern matching
 
 # Substrings (lowercased) in stderr that indicate a usage/quota wall rather than
 # a transient error. Such a failure will NOT clear within a few seconds, so the
@@ -54,6 +61,21 @@ class AgentInstance(ABC):
         # the fallback chain can roll to the next provider. 0/unset disables.
         # Override per run with AGY_TIMEOUT (seconds).
         self.timeout = float(os.environ.get("AGY_TIMEOUT", "2400") or 0)
+
+        # Streaming watchdog budgets (opt-in; 0/unset disables that signal).
+        # max_output_bytes: kill if the child has emitted more than this on stdout.
+        # stall_seconds: kill if no output has been observed for this many seconds.
+        # Per-call callers can also set self.max_output_bytes / self.stall_seconds
+        # directly (e.g. orchestration picks per-config budgets from a CalibrationTable).
+        self.max_output_bytes = int(os.environ.get("AGY_MAX_OUTPUT_BYTES", "0") or 0)
+        self.stall_seconds = float(os.environ.get("AGY_STALL_SECONDS", "0") or 0)
+        # Set by the watchdog when it trips so callers (and FallbackAgent) can
+        # distinguish a runaway from a normal failure. Cleared at each run start.
+        self._watchdog_reason: Optional[str] = None
+        # Telemetry recorded for every completed call (wall_ms always; out_bytes
+        # only when streaming). Sinks (ledger, calibration) read these.
+        self.last_wall_ms: Optional[float] = None
+        self.last_out_bytes: Optional[int] = None
 
     @classmethod
     @abstractmethod
@@ -110,8 +132,9 @@ class AgentInstance(ABC):
         """Release any per-call resources (e.g. a temp prompt file). No-op by default."""
         pass
 
-    @staticmethod
-    async def _stream_communicate(process, stdin_bytes: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+    async def _stream_communicate(self, process, stdin_bytes: Optional[bytes] = None,
+                                  *, max_output_bytes: int = 0,
+                                  stall_seconds: float = 0) -> Tuple[bytes, bytes]:
         """Drain stdout+stderr concurrently, echoing stderr live to our stderr.
 
         Returns the full (stdout_bytes, stderr_bytes) so callers behave exactly
@@ -119,6 +142,12 @@ class AgentInstance(ABC):
         child's stderr is mirrored to our own stderr line-by-line as it arrives,
         which makes a long build's progress tailable instead of buffered. Feeds
         ``stdin_bytes`` (if any) concurrently so stdin-delivered prompts also stream.
+
+        When ``max_output_bytes`` or ``stall_seconds`` is set, a streaming watchdog
+        kills the child if the corresponding budget is exceeded and records the
+        trip reason on ``self._watchdog_reason`` so the caller can distinguish a
+        runaway from a hard failure. The watchdog is conservative — defaults are
+        disabled, thresholds are intended to come from a per-config CalibrationTable.
         """
 
         async def _feed() -> None:
@@ -135,7 +164,11 @@ class AgentInstance(ABC):
                 except Exception:
                     pass
 
-        async def _drain(reader, chunks, echo: bool) -> None:
+        # Mutable state shared with the watchdog: byte tally + last-progress timestamp.
+        out_total = [0]
+        last_progress = [time.monotonic()]
+
+        async def _drain(reader, chunks, echo: bool, count: bool) -> None:
             if reader is None:
                 return
             while True:
@@ -143,18 +176,53 @@ class AgentInstance(ABC):
                 if not line:
                     break
                 chunks.append(line)
+                if count:
+                    out_total[0] += len(line)
+                    last_progress[0] = time.monotonic()
                 if echo:
                     sys.stderr.buffer.write(line)
                     sys.stderr.buffer.flush()
+
+        async def _watchdog() -> None:
+            # Poll every 2s; cheap relative to subprocess scheduling, fine-grained
+            # enough that a runaway emitting 10KB/s trips within one tick of budget.
+            if max_output_bytes <= 0 and stall_seconds <= 0:
+                return
+            while process.returncode is None:
+                await asyncio.sleep(2.0)
+                if max_output_bytes > 0 and out_total[0] > max_output_bytes:
+                    self._watchdog_reason = WATCHDOG_VERBOSE
+                    logger.warning("watchdog: VERBOSE trip — %d bytes > budget %d; killing",
+                                   out_total[0], max_output_bytes)
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    return
+                if stall_seconds > 0 and (time.monotonic() - last_progress[0]) > stall_seconds:
+                    # Only trip stall if NOTHING has been produced yet — a long-running
+                    # build that's emitting periodically is fine even past a single
+                    # stall window. The hard wall-timeout still catches true hangs.
+                    if out_total[0] == 0:
+                        self._watchdog_reason = WATCHDOG_STALLED
+                        logger.warning("watchdog: STALLED trip — no output for %.0fs; killing",
+                                       stall_seconds)
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        return
 
         out_chunks: List[bytes] = []
         err_chunks: List[bytes] = []
         await asyncio.gather(
             _feed(),
-            _drain(process.stdout, out_chunks, echo=False),
-            _drain(process.stderr, err_chunks, echo=True),
+            _drain(process.stdout, out_chunks, echo=False, count=True),
+            _drain(process.stderr, err_chunks, echo=True, count=False),
+            _watchdog(),
         )
         await process.wait()
+        self.last_out_bytes = out_total[0]
         return b"".join(out_chunks), b"".join(err_chunks)
 
     async def _kill_current(self) -> None:
@@ -185,9 +253,16 @@ class AgentInstance(ABC):
         cmd = self.build_command(piped_input)
         stdin_bytes = self._stdin_bytes(piped_input)
         logger.info("Executing agent command: %s", cmd[0] if cmd else "?")
+        # Force streaming mode when any watchdog budget is set — the watchdog
+        # needs line-by-line visibility to count bytes and detect stalls. Stays
+        # opt-in: with no budgets set, behaviour is identical to the prior path.
+        watchdog_armed = self.max_output_bytes > 0 or self.stall_seconds > 0
+        stream_mode = bool(os.environ.get("AGY_STREAM")) or watchdog_armed
 
         try:
             for attempt in range(1, self.max_retries + 1):
+                self._watchdog_reason = None
+                attempt_start = time.monotonic()
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *cmd,
@@ -200,10 +275,14 @@ class AgentInstance(ABC):
                     # Live mode: drain both pipes line-by-line, echoing the child's
                     # stderr as it arrives (tailable progress) while accumulating
                     # the full streams. (codex writes work to stderr live; claude
-                    # --output-format json emits only at the end.) Stream mode does
-                    # not support stdin, so agents that feed stdin use communicate().
-                    if os.environ.get("AGY_STREAM"):
-                        comm = self._stream_communicate(process, stdin_bytes)
+                    # --output-format json emits only at the end.) The watchdog
+                    # rides this path and trips on per-config budgets.
+                    if stream_mode:
+                        comm = self._stream_communicate(
+                            process, stdin_bytes,
+                            max_output_bytes=self.max_output_bytes,
+                            stall_seconds=self.stall_seconds,
+                        )
                     else:
                         comm = process.communicate(input=stdin_bytes)
 
@@ -223,6 +302,15 @@ class AgentInstance(ABC):
                     self.stderr = self.filter_stderr(stderr_bytes.decode())
                     self.returncode = process.returncode
                     self._current_process = None
+                    self.last_wall_ms = (time.monotonic() - attempt_start) * 1000
+
+                    # Watchdog trip: the child was killed mid-flight. Surface the
+                    # reason in stderr so FallbackAgent (and human readers) can
+                    # see it; raise fast so the chain can re-route on the rule.
+                    if self._watchdog_reason:
+                        marker = f"{WATCHDOG_MARKER}{self._watchdog_reason}]"
+                        self.stderr = f"{marker} {self.stderr}".strip()
+                        raise RuntimeError(self.stderr)
 
                     if self.returncode == 0:
                         self.stdout = self._postprocess(raw_stdout)
