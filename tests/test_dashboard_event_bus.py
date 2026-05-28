@@ -27,6 +27,8 @@ def test_event_bus_publish_subscribe_close_replay():
     assert len(got) == 2
     assert [e["kind"] for e in got] == ["reasoning", "message"]
     assert [e["_event_id"] for e in got] == [0, 1]
+    for event in got:
+        assert {"ts", "run_id", "worker", "model", "effort", "branch", "kind", "text", "data"}.issubset(event)
 
     replay = asyncio.run(_collect(bus, "r1", last_event_id="0"))
     assert len(replay) == 1
@@ -44,6 +46,32 @@ def test_event_bus_jsonl_replay_tolerates_partial_tail(tmp_path: Path):
     replay = EventBus.replay_jsonl(path, last_event_id="0")
     assert len(replay) == 1
     assert replay[0]["_event_id"] == 1
+
+
+def test_event_bus_unknown_kind_falls_back_to_stderr():
+    bus = EventBus()
+    pub = bus.publisher_for("r-unknown", worker="codex", model="gpt-5", effort="high")
+    pub({"kind": "not_a_kind", "text": "x", "data": {"k": 1}})
+    bus.close("r-unknown")
+    got = asyncio.run(_collect(bus, "r-unknown"))
+    assert len(got) == 1
+    assert got[0]["kind"] == "stderr"
+    assert got[0]["text"] == "x"
+    assert got[0]["data"] == {"k": 1}
+
+
+def test_event_bus_jsonl_replay_filters_by_event_id_not_line_index(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        json.dumps({"_event_id": 10, "kind": "reasoning"}) + "\n"
+        + '{"bad-json":'
+        + "\n"
+        + json.dumps({"_event_id": 11, "kind": "message"}) + "\n",
+        encoding="utf-8",
+    )
+    replay = EventBus.replay_jsonl(path, last_event_id="10")
+    assert len(replay) == 1
+    assert replay[0]["_event_id"] == 11
 
 
 def test_event_bus_late_subscriber_gets_replay_plus_live_without_duplicates():

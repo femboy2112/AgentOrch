@@ -7,6 +7,18 @@ from pathlib import Path
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
 
+_WORKER_EVENT_KINDS = {
+    "lifecycle",
+    "reasoning",
+    "message",
+    "tool_call",
+    "tool_result",
+    "usage",
+    "stderr",
+    "watchdog",
+}
+
+
 class EventBus:
     """Per-run-id queues with sink fanout and replay support."""
 
@@ -45,14 +57,15 @@ class EventBus:
             payload["model"] = payload.get("model") or model or "n/a"
             payload["effort"] = payload.get("effort") or effort or "n/a"
             payload["branch"] = payload.get("branch", branch)
-            payload["kind"] = payload.get("kind") or "stderr"
+            kind = str(payload.get("kind") or "stderr")
+            payload["kind"] = kind if kind in _WORKER_EVENT_KINDS else "stderr"
             payload["text"] = payload.get("text", "")
-            if payload.get("data") is None or "data" not in payload:
+            if payload.get("data") is None or "data" not in payload or not isinstance(payload.get("data"), dict):
                 payload["data"] = {}
 
             event_id = int(payload.get("_event_id", self._next_ids[run_id]))
             payload["_event_id"] = event_id
-            self._next_ids[run_id] = event_id + 1
+            self._next_ids[run_id] = max(self._next_ids[run_id], event_id + 1)
             self.queues[run_id].append(payload)
 
             for sink in list(self.sinks.get(run_id, [])):
@@ -135,8 +148,6 @@ class EventBus:
         out: List[dict] = []
         with path.open("r", encoding="utf-8", errors="replace") as f:
             for idx, raw in enumerate(f):
-                if idx <= floor:
-                    continue
                 line = raw.strip()
                 if not line:
                     continue
@@ -145,12 +156,22 @@ class EventBus:
                 except Exception:
                     continue
                 if isinstance(event, dict):
+                    event_id = event.get("_event_id")
+                    if not isinstance(event_id, int):
+                        event_id = idx
+                    if event_id <= floor:
+                        continue
                     out.append(event)
         return out
 
     @staticmethod
     def replay_events(events_path: Path, *, after_id: int = -1) -> List[tuple[int, dict]]:
         out: List[tuple[int, dict]] = []
-        for idx, event in enumerate(EventBus.replay_jsonl(events_path, last_event_id=str(after_id))):
-            out.append((after_id + 1 + idx, event))
+        for idx, event in enumerate(EventBus.replay_jsonl(events_path)):
+            event_id = event.get("_event_id")
+            if not isinstance(event_id, int):
+                event_id = idx
+            if event_id <= after_id:
+                continue
+            out.append((event_id, event))
         return out
