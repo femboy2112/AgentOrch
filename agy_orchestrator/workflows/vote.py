@@ -201,19 +201,19 @@ class VoteWorkflow:
             )
             return None, False, f"{type(exc).__name__}: {exc}"
         try:
-            ok, err = await self.verifier.verify(working_directory=str(ws.path))
+            result = await self.verifier.verify(working_directory=str(ws.path))
         except Exception as exc:
             logger.warning(
                 "Vote candidate %d (%s) verifier raised: %s",
                 idx, type(gen).__name__, exc,
             )
             return output, False, f"verifier-raised: {exc}"
-        if not ok:
+        if not result.ok:
             logger.info(
                 "Vote candidate %d (%s) failed verifier: %s",
-                idx, type(gen).__name__, (err or "")[:160],
+                idx, type(gen).__name__, (result.message or "")[:160],
             )
-        return output, bool(ok), err
+        return output, bool(result.ok), result.message
 
     async def _apply_workspace(self, src: Path, dst: Path) -> None:
         """Mirror the winner's contents over the operator's actual work_dir.

@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 import pytest
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.execution.verifier import VerifierResult
 from agy_orchestrator.workflows.vote import VoteWorkflow
 
 # --- test helpers --- #
@@ -95,7 +96,7 @@ class _ScriptedVerifier:
         self._verdicts = marker_to_outcome
         self.calls: List[str] = []
 
-    async def verify(self, working_directory: str) -> Tuple[bool, str]:
+    async def verify(self, working_directory: str) -> VerifierResult:
         self.calls.append(working_directory)
         # Look for any marker file in working_directory whose content
         # matches one of the verdicts.
@@ -108,8 +109,20 @@ class _ScriptedVerifier:
                 continue
             for marker, verdict in self._verdicts.items():
                 if marker in content:
-                    return verdict, f"matched {marker}"
-        return False, "no marker found"
+                    return VerifierResult(
+                        ok=verdict,
+                        message=f"matched {marker}",
+                        returncode=0 if verdict else 1,
+                        cmd="stub",
+                        duration_ms=0,
+                    )
+        return VerifierResult(
+            ok=False,
+            message="no marker found",
+            returncode=1,
+            cmd="stub",
+            duration_ms=0,
+        )
 
 
 # --- core happy-path --- #

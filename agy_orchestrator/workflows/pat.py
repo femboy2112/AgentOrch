@@ -86,10 +86,10 @@ class PatWorkflow:
         direct_output = await self.direct_generator.run_async()
         self.iterations_used = 1
 
-        success, error_msg = await self.verifier.verify(
+        stage1_result = await self.verifier.verify(
             working_directory=self.working_directory,
         )
-        if success:
+        if stage1_result.ok:
             logger.info("PaT Stage 1 passed verifier — skipping master mode.")
             self.verified = True
             self.approved = True
@@ -105,7 +105,7 @@ class PatWorkflow:
             f"## Prior direct attempt (failed verifier)\n"
             f"{direct_output}\n\n"
             f"## Verifier error\n"
-            f"{error_msg}\n\n"
+            f"{stage1_result.message}\n\n"
             f"Plan and execute the work needed to make the verifier pass. "
             f"Treat the prior attempt as one data point; you may reuse or "
             f"discard any of it."
@@ -120,8 +120,8 @@ class PatWorkflow:
         # to re-running the verifier one more time on the master output to
         # get a clean signal for the run ledger.
         if not inner_verified:
-            final_ok, _ = await self.verifier.verify(working_directory=self.working_directory)
-            self.verified = final_ok
+            final_result = await self.verifier.verify(working_directory=self.working_directory)
+            self.verified = final_result.ok
         else:
             self.verified = True
         self.approved = self.verified or inner_approved
