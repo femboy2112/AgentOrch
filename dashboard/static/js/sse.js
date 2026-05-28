@@ -1,44 +1,86 @@
+const MIN_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 10000;
+
 export class SSEClient {
-    constructor(url) {
-        this.url = url;
+    constructor(path, eventName = 'worker_event') {
+        this.path = path;
+        this.eventName = eventName;
         this.es = null;
         this.lastEventId = null;
         this.onEvent = null;
         this.onDone = null;
         this.onError = null;
         this.reconnectTimer = null;
+        this.closed = false;
+        this.attempt = 0;
     }
 
     subscribe(onEvent, onDone, onError) {
         this.onEvent = onEvent;
         this.onDone = onDone;
         this.onError = onError;
+        this.closed = false;
+        this.attempt = 0;
         this._connect();
         return () => this.cancel();
     }
 
-    _connect() {
-        let url = this.url;
-        if (this.lastEventId !== null) {
-            url += (url.includes('?') ? '&' : '?') + `Last-Event-ID=${encodeURIComponent(this.lastEventId)}`;
+    _buildUrl() {
+        if (this.lastEventId === null || this.lastEventId === undefined) {
+            return this.path;
         }
+        const joiner = this.path.includes('?') ? '&' : '?';
+        return `${this.path}${joiner}after_id=${encodeURIComponent(String(this.lastEventId))}`;
+    }
+
+    _scheduleReconnect() {
+        if (this.closed) {
+            return;
+        }
+        const delay = Math.min(MIN_BACKOFF_MS * (2 ** this.attempt), MAX_BACKOFF_MS);
+        this.attempt += 1;
+        this.reconnectTimer = setTimeout(() => this._connect(), delay);
+    }
+
+    _connect() {
+        if (this.closed) {
+            return;
+        }
+        const url = this._buildUrl();
         this.es = new EventSource(url);
-        this.es.addEventListener('worker_event', (e) => {
-            this.lastEventId = e.lastEventId;
-            if (this.onEvent) this.onEvent(JSON.parse(e.data));
+        this.es.addEventListener(this.eventName, (e) => {
+            const raw = e.lastEventId;
+            if (raw !== undefined && raw !== null && raw !== '') {
+                const parsed = Number(raw);
+                if (Number.isFinite(parsed)) {
+                    this.lastEventId = parsed;
+                }
+            }
+            this.attempt = 0;
+            if (this.onEvent) {
+                this.onEvent(JSON.parse(e.data));
+            }
         });
         this.es.addEventListener('done', (e) => {
             this.cancel();
-            if (this.onDone) this.onDone(JSON.parse(e.data));
+            if (this.onDone) {
+                this.onDone(JSON.parse(e.data));
+            }
         });
         this.es.onerror = (e) => {
-            this.es.close();
-            if (this.onError) this.onError(e);
-            this.reconnectTimer = setTimeout(() => this._connect(), 2000);
+            if (this.es) {
+                this.es.close();
+                this.es = null;
+            }
+            if (this.onError) {
+                this.onError(e);
+            }
+            this._scheduleReconnect();
         };
     }
 
     cancel() {
+        this.closed = true;
         if (this.es) {
             this.es.close();
             this.es = null;
@@ -48,4 +90,9 @@ export class SSEClient {
             this.reconnectTimer = null;
         }
     }
+}
+
+export function subscribe(runId, onEvent, onDone, onError) {
+    const client = new SSEClient(`/api/sse/${runId}`);
+    return client.subscribe(onEvent, onDone, onError);
 }

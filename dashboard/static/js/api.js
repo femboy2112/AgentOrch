@@ -17,6 +17,16 @@ export async function getLive() {
     return res.json();
 }
 
+export async function getRuns(limit = 3) {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    const res = await fetch(`/api/runs?${params.toString()}`);
+    if (!res.ok) {
+        throw new Error('Runs fetch failed');
+    }
+    return res.json();
+}
+
 export async function getBudget(mode, gen, critic) {
     const params = new URLSearchParams();
     if (mode) params.set('mode', mode);

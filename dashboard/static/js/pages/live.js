@@ -1,42 +1,106 @@
-import { getLive } from '../api.js';
-import { SSEClient } from '../sse.js';
+import { getBudget, getLive } from '../api.js';
+import { subscribe } from '../sse.js';
 import { StreamRenderer } from '../components/stream.js';
+
+function elapsed(startedAt) {
+    const age = Math.max(0, Date.now() / 1000 - Number(startedAt || 0));
+    const m = Math.floor(age / 60);
+    const s = Math.floor(age % 60);
+    return `${m}m ${s}s`;
+}
 
 export async function renderLive(container) {
     container.innerHTML = `<h2>Live Runs</h2><div id="live-list">Loading...</div>`;
-    
-    try {
-        const res = await getLive();
-        const list = document.getElementById('live-list');
-        list.innerHTML = '';
-        if (!res.running || res.running.length === 0) {
-            list.innerHTML = '<p>No running dispatches.</p>';
-            return;
-        }
-        res.running.forEach(run => {
-            const card = document.createElement('div');
-            card.className = 'card';
-            
-            card.innerHTML = `
-                <h3>Run: ${run.run_id}</h3>
-                <p style="color: var(--fg-1); margin-top: 0;">Mode: ${run.mode} | Generator: ${run.generator?.join(',') || 'N/A'}</p>
-                <div id="live-stream-${run.run_id}"></div>
-            `;
-            list.appendChild(card);
 
-            const renderer = new StreamRenderer(document.getElementById(`live-stream-${run.run_id}`));
-            const sse = new SSEClient(`/api/sse/${run.run_id}`);
-            sse.subscribe(
-                (e) => renderer.appendEvent(e),
-                (e) => {
-                    const p = document.createElement('p');
-                    p.textContent = `[done]`;
-                    renderer.container.appendChild(p);
-                },
-                (e) => console.error('SSE Error', e)
-            );
-        });
-    } catch (err) {
+    let runs;
+    try {
+        const resp = await getLive();
+        runs = resp.running || [];
+    } catch (_err) {
         container.innerHTML += `<p style="color:var(--bad)">Failed to load live runs.</p>`;
+        return;
+    }
+
+    const list = document.getElementById('live-list');
+    if (runs.length === 0) {
+        list.innerHTML = '<p>No running dispatches.</p>';
+        return;
+    }
+    list.innerHTML = '';
+
+    const focusRunId = sessionStorage.getItem('dashboard:last_run_id');
+    const expandAll = runs.length === 1;
+
+    for (const run of runs) {
+        const card = document.createElement('section');
+        card.className = 'card';
+
+        const details = document.createElement('details');
+        details.open = expandAll || run.run_id === focusRunId;
+
+        const summary = document.createElement('summary');
+        summary.className = 'live-summary';
+        summary.innerHTML = `
+            <strong>${run.run_id}</strong>
+            <span class="live-meta">mode=${run.mode} gen=${(run.generator || []).join(',')}</span>
+            <span id="elapsed-${run.run_id}" class="live-meta">${elapsed(run.started_at)}</span>
+            <span id="tokens-${run.run_id}" class="live-meta">tokens=0</span>
+            <span id="budget-${run.run_id}" class="live-meta">budget=0%</span>
+        `;
+        details.appendChild(summary);
+
+        const streamHost = document.createElement('div');
+        streamHost.id = `live-stream-${run.run_id}`;
+        details.appendChild(streamHost);
+        card.appendChild(details);
+        list.appendChild(card);
+
+        const elapsedEl = summary.querySelector(`#elapsed-${run.run_id}`);
+        const tokensEl = summary.querySelector(`#tokens-${run.run_id}`);
+        const budgetEl = summary.querySelector(`#budget-${run.run_id}`);
+
+        const timer = setInterval(() => {
+            elapsedEl.textContent = elapsed(run.started_at);
+        }, 1000);
+        details.addEventListener('toggle', () => {
+            if (!document.body.contains(details)) {
+                clearInterval(timer);
+            }
+        });
+
+        const renderer = new StreamRenderer(streamHost);
+        let outTokens = 0;
+        let maxBytes = 0;
+
+        try {
+            const b = await getBudget(run.mode, (run.generator || []).join(','), (run.critic || []).join(','));
+            if (b && b.rows) {
+                maxBytes = b.rows.reduce((sum, row) => sum + Number(row.max_output_bytes || 0), 0);
+            }
+        } catch (_err) {
+            maxBytes = 0;
+        }
+
+        subscribe(
+            run.run_id,
+            (e) => {
+                renderer.appendEvent(e);
+                if (e.kind === 'usage') {
+                    outTokens += Number(e.data?.out_tokens || 0);
+                    tokensEl.textContent = `tokens=${outTokens}`;
+                    if (maxBytes > 0) {
+                        const approxOutBytes = outTokens * 4;
+                        const pct = Math.min(999, Math.round((approxOutBytes / maxBytes) * 100));
+                        budgetEl.textContent = `budget=${pct}%`;
+                    }
+                }
+            },
+            () => {
+                budgetEl.textContent = `${budgetEl.textContent} done`;
+            },
+            (err) => {
+                console.error('SSE error', err);
+            }
+        );
     }
 }
