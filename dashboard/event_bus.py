@@ -19,6 +19,58 @@ _WORKER_EVENT_KINDS = {
 }
 
 
+def _to_float(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_branch(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value))
+    except Exception:
+        return None
+
+
+def _normalize_worker_event(
+    payload: dict,
+    *,
+    run_id: str,
+    worker: str,
+    model: Optional[str],
+    effort: Optional[str],
+    branch: Optional[int],
+) -> dict:
+    kind = str(payload.get("kind") or "stderr")
+    kind = kind if kind in _WORKER_EVENT_KINDS else "stderr"
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+
+    resolved_branch = _to_branch(payload.get("branch"))
+    if resolved_branch is None:
+        resolved_branch = _to_branch(branch)
+
+    return {
+        "ts": _to_float(payload.get("ts"), time.time()),
+        "run_id": run_id,
+        "worker": str(payload.get("worker") or worker),
+        "model": str(payload.get("model") or model or "n/a"),
+        "effort": str(payload.get("effort") or effort or "n/a"),
+        "branch": resolved_branch,
+        "kind": kind,
+        "text": str(payload.get("text", "")),
+        "data": data,
+    }
+
+
 class EventBus:
     """Per-run-id queues with sink fanout and replay support."""
 
@@ -62,32 +114,23 @@ class EventBus:
         def _publish(event: dict) -> None:
             if run_id in self.closed:
                 return
-            
-            payload = dict(event or {})
-            kind = str(payload.get("kind") or "stderr")
-            kind = kind if kind in _WORKER_EVENT_KINDS else "stderr"
-            data = payload.get("data", {})
-            if not isinstance(data, dict):
-                data = {}
 
-            clean_event = {
-                "ts": float(payload.get("ts") or time.time()),
-                "run_id": run_id,
-                "worker": payload.get("worker") or worker,
-                "model": payload.get("model") or model or "n/a",
-                "effort": payload.get("effort") or effort or "n/a",
-                "branch": payload.get("branch", branch),
-                "kind": kind,
-                "text": payload.get("text", ""),
-                "data": data,
-            }
+            payload = dict(event or {})
+            clean_event = _normalize_worker_event(
+                payload,
+                run_id=run_id,
+                worker=worker,
+                model=model,
+                effort=effort,
+                branch=branch,
+            )
 
             event_id = int(payload.get("_event_id", self._next_ids[run_id]))
-            
+
             # Internal _event_id is needed for queues but stripped before yielding/sinking
             internal_event = dict(clean_event)
             internal_event["_event_id"] = event_id
-            
+
             self._next_ids[run_id] = max(self._next_ids[run_id], event_id + 1)
             self.queues[run_id].append(internal_event)
 
@@ -187,7 +230,14 @@ class EventBus:
                         event_id = idx
                     if event_id <= floor:
                         continue
-                    clean = {k: v for k, v in raw_event.items() if k != "_event_id"}
+                    clean = _normalize_worker_event(
+                        raw_event,
+                        run_id=str(raw_event.get("run_id") or "unknown"),
+                        worker=str(raw_event.get("worker") or "unknown"),
+                        model=raw_event.get("model") if isinstance(raw_event.get("model"), str) else None,
+                        effort=raw_event.get("effort") if isinstance(raw_event.get("effort"), str) else None,
+                        branch=_to_branch(raw_event.get("branch")),
+                    )
                     out.append(clean)
         return out
 
@@ -216,6 +266,13 @@ class EventBus:
                     event_id = idx
                 if event_id <= after_id:
                     continue
-                clean = {k: v for k, v in raw_event.items() if k != "_event_id"}
+                clean = _normalize_worker_event(
+                    raw_event,
+                    run_id=str(raw_event.get("run_id") or "unknown"),
+                    worker=str(raw_event.get("worker") or "unknown"),
+                    model=raw_event.get("model") if isinstance(raw_event.get("model"), str) else None,
+                    effort=raw_event.get("effort") if isinstance(raw_event.get("effort"), str) else None,
+                    branch=_to_branch(raw_event.get("branch")),
+                )
                 out.append((event_id, clean))
         return out

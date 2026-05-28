@@ -61,6 +61,28 @@ def test_event_bus_unknown_kind_falls_back_to_stderr():
     assert got[0]["data"] == {"k": 1}
 
 
+def test_event_bus_normalizes_worker_event_field_types():
+    bus = EventBus()
+    pub = bus.publisher_for("r-types", worker="codex", model="gpt-5", effort="high")
+    pub(
+        {
+            "kind": "reasoning",
+            "ts": "1700000000.5",
+            "branch": "2",
+            "text": 123,
+            "data": "not-a-dict",
+        }
+    )
+    bus.close("r-types")
+    got = asyncio.run(_collect(bus, "r-types"))
+    assert len(got) == 1
+    event = got[0]
+    assert isinstance(event["ts"], float)
+    assert event["branch"] == 2
+    assert event["text"] == "123"
+    assert event["data"] == {}
+
+
 def test_event_bus_jsonl_replay_filters_by_event_id_not_line_index(tmp_path: Path):
     path = tmp_path / "events.jsonl"
     path.write_text(
@@ -74,6 +96,21 @@ def test_event_bus_jsonl_replay_filters_by_event_id_not_line_index(tmp_path: Pat
     assert len(replay) == 1
     assert "_event_id" not in replay[0]
     assert replay[0]["kind"] == "message"
+
+
+def test_event_bus_jsonl_replay_normalizes_shape(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        json.dumps({"kind": "message", "text": 17, "branch": "3", "data": [], "_event_id": 1}) + "\n",
+        encoding="utf-8",
+    )
+    replay = EventBus.replay_jsonl(path)
+    assert len(replay) == 1
+    row = replay[0]
+    assert {"ts", "run_id", "worker", "model", "effort", "branch", "kind", "text", "data"} == set(row)
+    assert row["branch"] == 3
+    assert row["text"] == "17"
+    assert row["data"] == {}
 
 
 def test_event_bus_late_subscriber_gets_replay_plus_live_without_duplicates():
