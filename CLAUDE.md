@@ -56,6 +56,24 @@ chain (e.g. `--generator codex,agy`).
 Caveat: the diff is a before/after snapshot of the whole tree, so don't create
 unrelated files **during** a running dispatch or they'll show up in its diff.
 
+## Account-sharing rule (avoid usage-wall cascades)
+
+**Don't run the orchestrator's worker on the same provider+account as the agent
+that's calling it, unless you have to.** A claude-coding session driving the
+harness to dispatch claude workers shares one Claude API pool: when the workers
+exhaust it, the dispatcher exhausts at the same instant and the whole stack
+goes down together. Same logic for sibling orchestrators that target a shared
+pool — coordinate model choice across them.
+
+Concretely, when picking generator/critic for a dispatch:
+- If the operator's driving agent is `claude`, prefer `codex`/`agy`/`grok` workers.
+- If you must reuse the same provider (e.g. only claude is configured), keep
+  the worker on a **different model tier** so usage walls are independent — and
+  rely on the `--fallback` chain (default on) to roll over when one walls.
+- The `_artifact_research_orchestration.md` dossier discusses this under
+  "compute-optimal allocation"; the practical version is: shared pool = shared
+  failure mode.
+
 ## Layout
 
 ```

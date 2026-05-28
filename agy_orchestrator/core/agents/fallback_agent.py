@@ -10,7 +10,7 @@ a long autonomous build resilient to one provider exhausting its usage mid-run.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Type
+from typing import Callable, Dict, List, Optional, Type
 
 from agy_orchestrator.core.agent import (
     USAGE_MARKERS,
@@ -21,6 +21,12 @@ from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
 
 logger = logging.getLogger(__name__)
+
+# A post-construct hook receives each newly-built sub-agent (and its class) so
+# the caller can configure it before run_async — e.g. arm the streaming watchdog
+# with per-provider budgets from a CalibrationTable. Kept generic so FallbackAgent
+# stays unaware of calibration; the harness owns the policy.
+PostConstructHook = Callable[[AgentInstance, Type[AgentInstance]], None]
 
 # Agent classes that support warm-session resume across calls.
 _SESSION_CAPABLE = (ClaudeAgent, GrokAgent)
@@ -40,6 +46,7 @@ def make_fallback_agent(
     cycles: int = 3,
     configs: Optional[Dict[Type[AgentInstance], Dict[str, object]]] = None,
     watchdog_rules: Optional[Dict[str, List[Type[AgentInstance]]]] = None,
+    post_construct_hook: Optional[PostConstructHook] = None,
 ) -> Type[AgentInstance]:
     """Return an AgentInstance subclass that tries ``chain`` in order per call.
 
@@ -82,6 +89,7 @@ def make_fallback_agent(
         _watchdog_rules: Dict[str, List[Type[AgentInstance]]] = {
             reason: list(targets) for reason, targets in (watchdog_rules or {}).items()
         }
+        _post_construct_hook: Optional[PostConstructHook] = post_construct_hook
 
         @classmethod
         async def get_available_models(cls) -> List[str]:
@@ -117,7 +125,16 @@ def make_fallback_agent(
                     kwargs["session_id"] = sid
                 if agent_cls is ClaudeAgent and getattr(self, "fork_session", False):
                     kwargs["fork_session"] = True
-            return agent_cls(**kwargs)  # type: ignore[arg-type]
+            sub = agent_cls(**kwargs)  # type: ignore[arg-type]
+            # Optional caller-supplied hook (e.g. harness watchdog arming) runs
+            # AFTER construction so it sees the final sub with its config applied.
+            hook = type(self)._post_construct_hook
+            if hook is not None:
+                try:
+                    hook(sub, agent_cls)
+                except Exception as exc:  # never let a bad hook block a real call
+                    logger.warning("[Fallback] post_construct_hook raised: %s", exc)
+            return sub
 
         async def run_async(self, piped_input: Optional[str] = None) -> str:
             last_error: Optional[Exception] = None
