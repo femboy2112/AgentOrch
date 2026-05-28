@@ -47,11 +47,13 @@ class _SimAgent(AgentInstance):
 
     def __init__(self, *args, write_filename: str = "result.txt",
                  write_content: str = "default-content",
+                 delete_paths: Optional[List[str]] = None,
                  should_raise: bool = False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.write_filename = write_filename
         self.write_content = write_content
+        self.delete_paths = delete_paths or []
         self.should_raise = should_raise
         self.cwd_at_run: Optional[str] = None
 
@@ -74,6 +76,11 @@ class _SimAgent(AgentInstance):
         target = Path(self.cwd or ".") / self.write_filename
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(self.write_content)
+        for rel in self.delete_paths:
+            try:
+                (Path(self.cwd or ".") / rel).unlink()
+            except OSError:
+                pass
         return f"wrote {self.write_filename} with {self.write_content}"
 
 
@@ -270,3 +277,25 @@ def test_apply_skips_identical_files(tmp_path):
     assert (base / "target.txt").read_text() == "win-after"
     # Untouched file's mtime stayed the same (no spurious copy2 over identical content).
     assert keepme.stat().st_mtime_ns == pristine_mtime
+
+
+def test_winner_deletion_propagates_to_base(tmp_path):
+    """Winner deletes obsolete.py; apply step should mirror that deletion."""
+    base = tmp_path / "base"
+    _git_init(base, {"keep.txt": "keep", "obsolete.py": "obsolete"})
+
+    gens = [
+        _SimAgent(
+            prompt="p",
+            write_filename="cand.txt",
+            write_content="win-marker",
+            delete_paths=["obsolete.py"],
+        )
+    ]
+    verifier = _ScriptedVerifier({"win-marker": True})
+    wf = VoteWorkflow(generators=gens, verifier=verifier, working_directory=str(base))
+    _run(wf.execute("p"))
+
+    assert not (base / "obsolete.py").exists()
+    assert (base / "keep.txt").read_text() == "keep"
+    assert (base / "cand.txt").read_text() == "win-marker"
