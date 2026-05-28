@@ -29,7 +29,7 @@ import os
 from collections import defaultdict
 from pathlib import Path
 from statistics import quantiles
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,17 @@ DEFAULT_CALIBRATION_PATH = Path(
     os.environ.get("AGY_CALIBRATION_JSONL", "/tmp/agentorch_research/calibrate.jsonl")
 )
 
+# Live ledger — appended after every verified dispatch by harness/dispatch.py.
+# CalibrationTable.load() reads it alongside the offline sweep so per-config
+# budgets continuously refine from real traffic. The contextual-bandit
+# routing literature (arxiv 2510.07429, 2508.21141) backs this closing-the-
+# loop pattern over static-only routing: online feedback over deployment
+# trajectories outperforms offline-only calibration by ~12% on
+# accuracy-cost frontiers. Disable via AGY_LIVE_LEDGER=off.
+DEFAULT_LIVE_LEDGER_PATH = Path(
+    os.environ.get("AGY_LIVE_LEDGER_JSONL", "/tmp/agentorch_research/live_ledger.jsonl")
+)
+
 
 class CalibrationTable:
     """Per-config (max_output_bytes, stall_seconds) lookup, derived from prior runs.
@@ -95,22 +106,41 @@ class CalibrationTable:
         return used
 
     @classmethod
-    def load(cls, path: Optional[Path] = None) -> "CalibrationTable":
-        """Build a table from a JSONL file. Missing file returns an empty table."""
+    def load(
+        cls,
+        path: Optional[Path] = None,
+        *,
+        live_path: Optional[Path] = None,
+    ) -> "CalibrationTable":
+        """Build a table from the offline sweep + the live dispatch ledger.
+
+        Missing files return an empty (or partial) table — never errors. The
+        live ledger is what makes this a *closing-the-loop* router: every
+        verified dispatch contributes a real observation, so budgets refine
+        from production traffic rather than only the calibrate.py snapshot."""
         table = cls()
-        path = Path(path or DEFAULT_CALIBRATION_PATH)
-        if not path.exists():
-            logger.debug("calibration: no file at %s; using defaults", path)
-            return table
-        try:
-            with open(path) as f:
-                rows = [json.loads(line) for line in f if line.strip()]
-        except Exception as exc:
-            logger.warning("calibration: failed to read %s: %s", path, exc)
-            return table
-        used = table.ingest(rows)
-        logger.info("calibration: loaded %d/%d passing rows from %s",
-                    used, len(rows), path)
+        sources: List[Tuple[str, Path]] = []
+        offline_path = Path(path or DEFAULT_CALIBRATION_PATH)
+        sources.append(("offline", offline_path))
+        # Live ledger reads default unless the caller opted out by passing
+        # an explicit live_path=Path('/dev/null') or env var disables.
+        if live_path is not None:
+            sources.append(("live", Path(live_path)))
+        elif os.environ.get("AGY_LIVE_LEDGER", "").lower() != "off":
+            sources.append(("live", DEFAULT_LIVE_LEDGER_PATH))
+        for label, p in sources:
+            if not p.exists():
+                logger.debug("calibration: no %s file at %s", label, p)
+                continue
+            try:
+                with open(p) as f:
+                    rows = [json.loads(line) for line in f if line.strip()]
+            except Exception as exc:
+                logger.warning("calibration: failed to read %s %s: %s", label, p, exc)
+                continue
+            used = table.ingest(rows)
+            logger.info("calibration: loaded %d/%d passing %s rows from %s",
+                        used, len(rows), label, p)
         return table
 
     def budget_for(self, worker: str, model: str,
@@ -142,3 +172,50 @@ class CalibrationTable:
 
     def has_data_for(self, worker: str, model: str, effort: Optional[str]) -> bool:
         return len(self._success.get((worker, model, effort), [])) >= 3
+
+
+def append_live_row(
+    worker: str,
+    model: str,
+    effort: Optional[str],
+    *,
+    ok: bool,
+    out_bytes: Optional[int] = None,
+    wall_ms: Optional[float] = None,
+    path: Optional[Path] = None,
+) -> None:
+    """Append one dispatch's observation to the live ledger JSONL.
+
+    Called from harness/dispatch.py after every verified run. Schema matches
+    what CalibrationTable.ingest() consumes — ``ok`` gates whether the row
+    contributes (matching the offline sweep), and out_bytes is converted to
+    out_tokens via the same BYTES_PER_TOKEN rate the table uses.
+
+    No-op when ``AGY_LIVE_LEDGER=off`` — defense in depth on top of the
+    same env-var check in load(). Also no-op on rows missing both telemetry
+    fields (nothing useful to record).
+
+    Failures are swallowed: a disk error MUST NOT crash a successful
+    dispatch — the worst case is a missed observation, not a regression
+    in the operator's run.
+    """
+    if os.environ.get("AGY_LIVE_LEDGER", "").lower() == "off":
+        return
+    if out_bytes is None and wall_ms is None:
+        return
+    row = {
+        "worker": worker,
+        "model": model,
+        "effort": effort,
+        "ok": bool(ok),
+        "out_tokens": (int(out_bytes) // BYTES_PER_TOKEN) if out_bytes is not None else None,
+        "wall_ms": float(wall_ms) if wall_ms is not None else None,
+    }
+    target = Path(path or DEFAULT_LIVE_LEDGER_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception as exc:
+        logger.warning("calibration: failed to append live ledger row to %s: %s",
+                       target, exc)

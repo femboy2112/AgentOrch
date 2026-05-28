@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.calibration import append_live_row
 from agy_orchestrator.execution.ledger import build_ledger
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.adversarial import AdversarialReview
@@ -27,6 +28,7 @@ from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
 from agy_orchestrator.workflows.pat import PatWorkflow
 from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
+from agy_orchestrator.workflows.vote import VoteWorkflow
 from dashboard.event_bus import EventBus
 from harness import roles
 from harness.snapshot import diff_snapshots, take_snapshot
@@ -168,6 +170,34 @@ async def _run_workflow(
         )
         return await wf.execute(prompt), wf
 
+    if mode == "vote":
+        # K-parallel candidates in isolated workspaces; verifier picks the
+        # winner. K = `branches` (reusing the existing CLI knob). Each
+        # candidate rotates through the generator_chain so K=3 with the
+        # default chain (codex,agy,grok) produces one candidate per
+        # provider — the heterogeneity gain (arxiv 2602.03794).
+        if verifier is None:
+            raise ValueError("vote mode requires --test-cmd (the verifier gate)")
+        k = max(1, branches)
+        vote_generators: List[AgentInstance] = []
+        for i in range(k):
+            token = generator_chain[i % len(generator_chain)]
+            # Each slot is its own single-worker agent (no fallback chain
+            # inside a slot — diversity comes from different slots, not
+            # from fallback within one slot).
+            slot_agent = roles.build_role_agent(
+                [token], prompt=prompt, fallback=False, cycles=cycles,
+                codex_config=codex_config,
+                post_construct_hook=post_construct_hook,
+            )
+            vote_generators.append(slot_agent)
+        wf = VoteWorkflow(
+            generators=vote_generators,
+            verifier=verifier,
+            working_directory=working_directory,
+        )
+        return await wf.execute(prompt), wf
+
     if mode == "pat":
         # Plan-after-Trial: direct generator attempt gated by verifier;
         # on failure, escalate to master mode. Verifier is mandatory.
@@ -253,6 +283,14 @@ async def dispatch_async(
 
     gen_desc = roles.describe_chain(generator_chain, fallback)
     crit_desc = roles.describe_chain(critic_chain, fallback) if mode == "adversarial" else None
+
+    # Cross-family verifier guard: warn (don't block) when the critic chain
+    # leads with the same provider family as the generator. Only meaningful
+    # for adversarial mode — other modes don't use a separate critic chain.
+    if mode == "adversarial":
+        family_warning = roles.check_chains_cross_family(generator_chain, critic_chain)
+        if family_warning:
+            logger.warning(family_warning)
 
     def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
         model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
@@ -346,6 +384,41 @@ async def dispatch_async(
         produced_output=bool(output and output.strip()),
     )
     logger.info("Dispatch %s | confidence=%s (%s)", run_id, quality["confidence"], quality["note"])
+
+    # Close the calibration loop: every verified dispatch contributes one
+    # observation to the live ledger that CalibrationTable.load() reads on
+    # next process start. Only verified runs count — matching the offline
+    # sweep's gate, so a critic-approved-but-tests-failed run doesn't
+    # pollute the routing baselines. We use the lead generator worker as
+    # the key; multi-stage modes (cascade, pat, master) inherit it.
+    if quality.get("confidence") == "verified":
+        lead_token = generator_chain[0]
+        lead_cfg = roles.AGENT_DEFAULTS.get(lead_token, {})
+        effort_val = lead_cfg.get("effort")
+        effort = str(effort_val) if effort_val not in (None, "n/a") else None
+        # workflow may not surface wall_ms/out_bytes if the agent ran via
+        # the non-streaming path; this is best-effort and falls open.
+        wall_ms_value: Optional[float] = (duration * 1000.0) if duration else None
+        out_bytes_value: Optional[int] = None
+        # Prefer per-agent telemetry when the workflow exposes it.
+        if workflow is not None:
+            agent_for_telemetry = (
+                getattr(workflow, "direct_generator", None)
+                or getattr(workflow, "generator", None)
+            )
+            if agent_for_telemetry is not None:
+                out_bytes_value = getattr(agent_for_telemetry, "last_out_bytes", None)
+                agent_wall = getattr(agent_for_telemetry, "last_wall_ms", None)
+                if agent_wall is not None:
+                    wall_ms_value = float(agent_wall)
+        append_live_row(
+            worker=lead_token,
+            model=str(lead_cfg.get("model", "") or ""),
+            effort=effort,
+            ok=True,
+            out_bytes=out_bytes_value,
+            wall_ms=wall_ms_value,
+        )
 
     after = take_snapshot(work_dir)
     diff = diff_snapshots(before, after)

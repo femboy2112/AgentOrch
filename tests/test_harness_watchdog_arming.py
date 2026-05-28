@@ -23,8 +23,15 @@ from harness import roles
 
 
 @pytest.fixture(autouse=True)
-def _isolate_calibration(monkeypatch):
-    """Each test sees a fresh CalibrationTable (no stale data leaking in)."""
+def _isolate_calibration(monkeypatch, tmp_path):
+    """Each test sees a fresh CalibrationTable with NO data — both the
+    offline calibrate.jsonl and the live ledger are pointed at non-existent
+    tmp paths. Necessary because the table is a process-wide singleton and
+    its default file paths are module-level constants captured at import
+    time, so an env-var change here would be too late."""
+    from agy_orchestrator.core import calibration as cal_mod
+    monkeypatch.setattr(cal_mod, "DEFAULT_CALIBRATION_PATH", tmp_path / "calibrate.jsonl")
+    monkeypatch.setattr(cal_mod, "DEFAULT_LIVE_LEDGER_PATH", tmp_path / "live_ledger.jsonl")
     roles._reset_calibration()
     yield
     roles._reset_calibration()
