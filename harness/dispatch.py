@@ -93,6 +93,7 @@ async def _run_workflow(
     verifier: Optional[QualityVerifier],
     codex_config: Optional[List[str]],
     post_construct_hook: Optional[roles.RolePostConstructHook] = None,
+    working_directory: str = ".",
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
@@ -115,7 +116,8 @@ async def _run_workflow(
             codex_config=codex_config,
             post_construct_hook=post_construct_hook,
         )
-        wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations)
+        wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations,
+                               working_directory=working_directory)
         return await wf.execute(prompt), wf
 
     if mode == "feedback":
@@ -128,7 +130,8 @@ async def _run_workflow(
             codex_config=codex_config,
             post_construct_hook=post_construct_hook,
         )
-        wf = TestFeedbackWorkflow(gen, verifier, max_iterations=max_iterations)
+        wf = TestFeedbackWorkflow(gen, verifier, max_iterations=max_iterations,
+                                  working_directory=working_directory)
         return await wf.execute(prompt), wf
 
     if mode == "cascade":
@@ -143,7 +146,8 @@ async def _run_workflow(
                                    post_construct_hook=post_construct_hook)
             for token in generator_chain
         ]
-        wf = CascadeWorkflow(stages, verifier, max_iterations_per_stage=max_iterations)
+        wf = CascadeWorkflow(stages, verifier, max_iterations_per_stage=max_iterations,
+                             working_directory=working_directory)
         return await wf.execute(prompt), wf
 
     if mode == "master":
@@ -159,6 +163,7 @@ async def _run_workflow(
             max_iterations=max_iterations,
             verifier=verifier,
             agent_class=agent_class,
+            working_directory=working_directory,
         )
         return await wf.execute(prompt), wf
 
@@ -282,6 +287,7 @@ async def dispatch_async(
             fallback=fallback, cycles=cycles, max_iterations=max_iterations,
             branches=branches, verifier=verifier, codex_config=codex_config,
             post_construct_hook=_post_construct_hook,
+            working_directory=str(work_dir),
         )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False

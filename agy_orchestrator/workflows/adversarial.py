@@ -42,7 +42,8 @@ class AdversarialReview:
         critic_instance: AgentInstance,
         verifier: Optional[QualityVerifier] = None,
         max_iterations: int = 5,
-        diff_only: bool = False
+        diff_only: bool = False,
+        working_directory: str = ".",
     ):
         self.generator = generator_instance
         self.critic = critic_instance
@@ -51,6 +52,12 @@ class AdversarialReview:
         # When True, the revise prompt tells the generator to touch ONLY what the
         # critique named — stops a weak model rewriting good parts into bad.
         self.diff_only = diff_only
+        # Where the verifier should run the test_cmd. Must match where the
+        # workers wrote their files; the harness threads `out_dir` to here so a
+        # cross-repo dispatch (caller's `out_dir != PROJECT_ROOT`) doesn't lie
+        # with `make check` in the wrong tree. Default "." preserves the prior
+        # behaviour exactly for in-repo runs.
+        self.working_directory = working_directory
         # Quality signals, populated by execute() for the run ledger (task #9).
         self.iterations_used = 0
         self.approved = False
@@ -74,7 +81,7 @@ class AdversarialReview:
             # LLM critic, which can only talk a weak model into REGRESSING output
             # that already passes ("Small LMs Need Strong Verifiers", 2404.17140).
             if self.verifier:
-                success, error_msg = await self.verifier.verify(working_directory=".")
+                success, error_msg = await self.verifier.verify(working_directory=self.working_directory)
                 if success:
                     logger.info("Programmatic verification passed — accepting (no critic pass needed).")
                     self.verified = True

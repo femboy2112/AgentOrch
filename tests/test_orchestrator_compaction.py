@@ -35,7 +35,8 @@ class _StubToT:
 
 
 class _StubAdv:
-    def __init__(self, generator_instance=None, critic_instance=None, verifier=None, max_iterations=1):
+    def __init__(self, generator_instance=None, critic_instance=None, verifier=None,
+                 max_iterations=1, working_directory="."):
         pass
 
     async def execute(self, prompt) -> str:

@@ -28,6 +28,7 @@ class MasterWorkflow:
         compaction_interval: int = 6,
         max_context_chars: int = 12000,
         selector: str = "judge",
+        working_directory: str = ".",
     ):
         self.model = model
         self.effort = effort
@@ -35,6 +36,10 @@ class MasterWorkflow:
         self.max_iterations = max_iterations
         self.verifier = verifier
         self.agent_class = agent_class
+        # Where the verifier should run the test_cmd. Threaded into every
+        # AdversarialReview the master spawns so cross-repo dispatches
+        # (caller's `out_dir != PROJECT_ROOT`) verify in the right tree.
+        self.working_directory = working_directory
         # ToT selection: "judge" (an evaluator scores each branch — right for the
         # diverse code outputs here) or "vote" (free, but rarely clusters for code).
         self.selector = selector
@@ -240,7 +245,8 @@ class MasterWorkflow:
                 generator_instance=adv_generator,
                 critic_instance=adv_critic,
                 verifier=self.verifier,
-                max_iterations=self.max_iterations
+                max_iterations=self.max_iterations,
+                working_directory=self.working_directory,
             )
 
             final_step_output = await adv.execute(adv_prompt)

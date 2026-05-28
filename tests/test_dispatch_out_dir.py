@@ -164,3 +164,45 @@ def test_out_dir_expands_user(tmp_path, monkeypatch):
         "noop", mode="direct", generator_chain=["codex"], out_dir="~/sub",
     )
     assert _StubAgent.constructed[-1].cwd == str((tmp_path / "sub").resolve())
+
+
+def test_verifier_runs_in_out_dir_not_project_root(tmp_path, monkeypatch):
+    """Critical regression: the verifier (test_cmd) must run in out_dir, not
+    in AgentOrch's PROJECT_ROOT. The W3 dispatch caught this — `make check`
+    ran in AgentOrch (no `check` target) and failed every iteration even
+    though agi2's Makefile would have passed.
+
+    We construct an adversarial-mode dispatch with a test_cmd of `pwd`,
+    then assert the verifier's STDOUT (which we can pluck by injecting a
+    capturing verifier) reports the out_dir path."""
+    monkeypatch.setattr(dispatch_mod, "RUNS_DIR", tmp_path / "runs")
+    target = tmp_path / "other-repo"
+    target.mkdir()
+
+    seen_cwds: list[str] = []
+
+    class _CapturingVerifier:
+        timeout = 5.0
+        def __init__(self, test_commands=None, timeout=None):
+            self.test_commands = test_commands or []
+        async def verify(self, working_directory: str):
+            seen_cwds.append(working_directory)
+            return True, "ok"
+
+    # Force adversarial mode to use our capturing verifier.
+    from agy_orchestrator.execution import verifier as verifier_mod
+    monkeypatch.setattr(verifier_mod, "QualityVerifier", _CapturingVerifier)
+    # The verifier is built inside dispatch_async from test_cmd; we need the
+    # constructor to return our stub. Patch where it's imported from.
+    monkeypatch.setattr(dispatch_mod, "QualityVerifier", _CapturingVerifier)
+
+    dispatch_mod.dispatch(
+        "noop", mode="adversarial",
+        generator_chain=["codex"], critic_chain=["agy"],
+        out_dir=target, test_cmd="true", max_iterations=1,
+    )
+    assert seen_cwds, "verifier was never invoked"
+    # Every verifier call must target out_dir, not '.'/PROJECT_ROOT.
+    assert all(cwd == str(target.resolve()) for cwd in seen_cwds), (
+        f"verifier ran in wrong directories: {seen_cwds}"
+    )
