@@ -19,11 +19,18 @@ class CodexAgent(AgentInstance):
         filtered = [l for l in lines if "network" not in l.lower() and "timeout" not in l.lower()]
         return "\n".join(filtered)
 
-    def build_command(self, piped_input: Optional[str] = None) -> List[str]:
+    def _full_prompt(self, piped_input: Optional[str] = None) -> str:
         full_prompt = self.prompt
         if piped_input:
             full_prompt += f"\n\n[Context]:\n{piped_input}"
-            
+        return full_prompt
+
+    def _stdin_bytes(self, piped_input: Optional[str] = None) -> bytes:
+        # Deliver the prompt on stdin (codex exec reads it when '-' is the prompt
+        # arg) so large diff-feedback prompts can't hit MAX_ARG_STRLEN (128 KiB).
+        return self._full_prompt(piped_input).encode()
+
+    def build_command(self, piped_input: Optional[str] = None) -> List[str]:
         cmd = [
             "codex",
             "exec",
@@ -46,6 +53,7 @@ class CodexAgent(AgentInstance):
 
         for k, v in self.additional_flags.items():
             cmd.extend([f"--{k}", str(v)])
-            
-        cmd.append(full_prompt)
+
+        # '-' tells codex exec to read the prompt from stdin (see _stdin_bytes).
+        cmd.append("-")
         return cmd

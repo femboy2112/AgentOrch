@@ -1,4 +1,3 @@
-import asyncio as _asyncio
 import json
 import logging
 import os
@@ -96,10 +95,36 @@ class GrokAgent(AgentInstance):
         return cmd
 
     def build_command(self, piped_input: Optional[str] = None) -> List[str]:
-        # Prompt is delivered via a temp file in run_async; satisfy the ABC by
-        # pointing --prompt-file at the (yet-unwritten) path is not possible
-        # here, so this is only used by callers that don't write the file.
-        return self._build_cmd("/dev/stdin")
+        # Deliver the prompt via a temp file (--prompt-file) so large diff-feedback
+        # prompts can't hit MAX_ARG_STRLEN. The file is removed in _cleanup().
+        full_prompt = self._full_prompt(piped_input)
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".grok-prompt.txt", delete=False, encoding="utf-8"
+        )
+        tmp.write(full_prompt)
+        tmp.close()
+        self._tmp_prompt_path = tmp.name
+        logger.info("grok prompt -> %s (%d bytes, session=%s, model=%s)",
+                    tmp.name, len(full_prompt), self.session_id or "new", self.model)
+        return self._build_cmd(tmp.name)
+
+    def _cleanup(self) -> None:
+        path = getattr(self, "_tmp_prompt_path", None)
+        if path:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+            self._tmp_prompt_path = None
+
+    def _postprocess(self, raw_stdout: str) -> str:
+        """Capture the resumable session id, then return the unwrapped text."""
+        sid = self._extract_session_id(raw_stdout)
+        if sid:
+            if not self.session_id:
+                logger.info("grok session established: %s", sid)
+            self.session_id = sid
+        return self._extract_text(raw_stdout)
 
     def _full_prompt(self, piped_input: Optional[str]) -> str:
         full = self.prompt
@@ -145,77 +170,3 @@ class GrokAgent(AgentInstance):
         m = re.search(r'"sessionId"\s*:\s*"([^"]+)"', raw_stdout)
         return m.group(1) if m else None
 
-    async def run_async(self, piped_input: Optional[str] = None) -> str:
-        full_prompt = self._full_prompt(piped_input)
-
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".grok-prompt.txt", delete=False, encoding="utf-8"
-        )
-        try:
-            tmp.write(full_prompt)
-            tmp.close()
-            cmd = self._build_cmd(tmp.name)
-
-            logger.info("Executing grok (prompt=%d bytes, session=%s, model=%s)",
-                        len(full_prompt), self.session_id or "new", self.model)
-
-            for attempt in range(1, self.max_retries + 1):
-                process = None
-                try:
-                    process = await _asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=_asyncio.subprocess.PIPE,
-                        stderr=_asyncio.subprocess.PIPE,
-                    )
-                    self._current_process = process
-                    comm = process.communicate()
-                    try:
-                        if self.timeout and self.timeout > 0:
-                            stdout_bytes, stderr_bytes = await _asyncio.wait_for(comm, self.timeout)
-                        else:
-                            stdout_bytes, stderr_bytes = await comm
-                    except _asyncio.TimeoutError:
-                        logger.error("grok subprocess exceeded %.0fs; killing and failing over.", self.timeout)
-                        try:
-                            process.kill()
-                            await process.wait()
-                        except Exception:
-                            pass
-                        self.stderr = f"timed out after {self.timeout:.0f}s"
-                        raise RuntimeError(self.stderr)
-
-                    raw_stdout = stdout_bytes.decode()
-                    self.stderr = self.filter_stderr(stderr_bytes.decode())
-                    self.returncode = process.returncode
-
-                    if self.returncode == 0:
-                        sid = self._extract_session_id(raw_stdout)
-                        if sid:
-                            if not self.session_id:
-                                logger.info("grok session established: %s", sid)
-                            self.session_id = sid
-                        self.stdout = self._extract_text(raw_stdout)
-                        return self.stdout
-
-                    logger.warning("grok attempt %d/%d failed (code %d):\n%s",
-                                   attempt, self.max_retries, self.returncode, self.stderr[:1000])
-                except _asyncio.CancelledError:
-                    await self._kill_current()
-                    raise
-                except RuntimeError:
-                    raise  # timeout: fail fast so the fallback chain advances
-                except Exception as e:
-                    logger.warning("grok attempt %d/%d exception: %s", attempt, self.max_retries, e)
-                    self.stderr = str(e)
-                finally:
-                    self._current_process = None
-
-                if attempt < self.max_retries:
-                    await _asyncio.sleep(min(8, 2 ** attempt))
-
-            raise RuntimeError(f"GrokAgent failed after {self.max_retries} attempts: {self.stderr}")
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass

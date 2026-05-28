@@ -86,15 +86,54 @@ class AgentInstance(ABC):
         """
         return stderr
 
+    # --- template-method hooks (override per agent) ----------------------------
+    # These let every agent share the one hardened run loop below (retry/timeout/
+    # backoff/kill/cancel) while customizing only how the prompt is delivered and
+    # how the raw stdout is interpreted.
+
+    def _stdin_bytes(self, piped_input: Optional[str] = None) -> Optional[bytes]:
+        """Bytes to feed the child on stdin, or None to pass nothing on stdin.
+
+        Default: None (prompt is carried in argv / a file by build_command).
+        Override (e.g. ClaudeAgent) to deliver the prompt via stdin and dodge
+        ARG_MAX limits on large prompts."""
+        return None
+
+    def _postprocess(self, raw_stdout: str) -> str:
+        """Transform decoded stdout into the final result string.
+
+        Default: return it unchanged. Override (claude/grok) to unwrap a JSON
+        envelope and capture a resumable session id for warm-cache reuse."""
+        return raw_stdout
+
+    def _cleanup(self) -> None:
+        """Release any per-call resources (e.g. a temp prompt file). No-op by default."""
+        pass
+
     @staticmethod
-    async def _stream_communicate(process) -> Tuple[bytes, bytes]:
+    async def _stream_communicate(process, stdin_bytes: Optional[bytes] = None) -> Tuple[bytes, bytes]:
         """Drain stdout+stderr concurrently, echoing stderr live to our stderr.
 
         Returns the full (stdout_bytes, stderr_bytes) so callers behave exactly
         as with ``process.communicate()`` — the only difference is that the
         child's stderr is mirrored to our own stderr line-by-line as it arrives,
-        which makes a long build's progress tailable instead of buffered.
+        which makes a long build's progress tailable instead of buffered. Feeds
+        ``stdin_bytes`` (if any) concurrently so stdin-delivered prompts also stream.
         """
+
+        async def _feed() -> None:
+            if stdin_bytes is None or process.stdin is None:
+                return
+            try:
+                process.stdin.write(stdin_bytes)
+                await process.stdin.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
 
         async def _drain(reader, chunks, echo: bool) -> None:
             if reader is None:
@@ -111,6 +150,7 @@ class AgentInstance(ABC):
         out_chunks: List[bytes] = []
         err_chunks: List[bytes] = []
         await asyncio.gather(
+            _feed(),
             _drain(process.stdout, out_chunks, echo=False),
             _drain(process.stderr, err_chunks, echo=True),
         )
@@ -143,6 +183,7 @@ class AgentInstance(ABC):
         exception, or cancellation) so no orphaned worker CLI leaks.
         """
         cmd = self.build_command(piped_input)
+        stdin_bytes = self._stdin_bytes(piped_input)
         logger.info("Executing agent command: %s", cmd[0] if cmd else "?")
 
         try:
@@ -150,6 +191,7 @@ class AgentInstance(ABC):
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *cmd,
+                        stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -158,9 +200,12 @@ class AgentInstance(ABC):
                     # Live mode: drain both pipes line-by-line, echoing the child's
                     # stderr as it arrives (tailable progress) while accumulating
                     # the full streams. (codex writes work to stderr live; claude
-                    # --output-format json emits only at the end.)
-                    comm = (self._stream_communicate(process)
-                            if os.environ.get("AGY_STREAM") else process.communicate())
+                    # --output-format json emits only at the end.) Stream mode does
+                    # not support stdin, so agents that feed stdin use communicate().
+                    if os.environ.get("AGY_STREAM"):
+                        comm = self._stream_communicate(process, stdin_bytes)
+                    else:
+                        comm = process.communicate(input=stdin_bytes)
 
                     try:
                         if self.timeout and self.timeout > 0:
@@ -174,12 +219,13 @@ class AgentInstance(ABC):
                         self.stderr = f"timed out after {self.timeout:.0f}s"
                         raise RuntimeError(self.stderr)  # fail fast, no retry
 
-                    self.stdout = stdout_bytes.decode()
+                    raw_stdout = stdout_bytes.decode()
                     self.stderr = self.filter_stderr(stderr_bytes.decode())
                     self.returncode = process.returncode
                     self._current_process = None
 
                     if self.returncode == 0:
+                        self.stdout = self._postprocess(raw_stdout)
                         return self.stdout
 
                     logger.warning("Attempt %d/%d failed with code %s:\n%s",
@@ -207,6 +253,7 @@ class AgentInstance(ABC):
             raise RuntimeError(f"AgentInstance failed after {self.max_retries} attempts: {self.stderr}")
         finally:
             await self._kill_current()
+            self._cleanup()
 
     def run(self, piped_input: Optional[str] = None) -> str:
         """Synchronous wrapper for run_async."""

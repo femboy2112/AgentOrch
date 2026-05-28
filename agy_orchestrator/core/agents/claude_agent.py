@@ -1,4 +1,3 @@
-import asyncio as _asyncio
 import json
 import logging
 import re
@@ -115,87 +114,15 @@ class ClaudeAgent(AgentInstance):
             pass
         return raw_stdout
 
-    async def run_async(self, piped_input: Optional[str] = None) -> str:
-        """Execute via stdin, parse JSON output, track session_id for reuse."""
-        cmd = self._build_base_cmd()
-        full_prompt = self._build_full_prompt(piped_input)
-        stdin_data = full_prompt.encode()
+    def _stdin_bytes(self, piped_input: Optional[str] = None) -> bytes:
+        """Deliver the prompt via stdin (dodges ARG_MAX on large diff-feedback)."""
+        return self._build_full_prompt(piped_input).encode()
 
-        logger.info(
-            "Executing agent command (stdin=%d bytes, session=%s, fork=%s)",
-            len(stdin_data), self.session_id or "new", self.fork_session
-        )
-
-        self._current_process = None
-        try:
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    process = await _asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdin=_asyncio.subprocess.PIPE,
-                        stdout=_asyncio.subprocess.PIPE,
-                        stderr=_asyncio.subprocess.PIPE
-                    )
-                    self._current_process = process
-                    try:
-                        comm = process.communicate(input=stdin_data)
-                        if self.timeout and self.timeout > 0:
-                            stdout_bytes, stderr_bytes = await _asyncio.wait_for(comm, self.timeout)
-                        else:
-                            stdout_bytes, stderr_bytes = await comm
-                    except _asyncio.TimeoutError:
-                        logger.error("claude subprocess exceeded %.0fs; killing and failing over.", self.timeout)
-                        try:
-                            process.kill()
-                            await process.wait()
-                        except Exception:
-                            pass
-                        self.stderr = f"timed out after {self.timeout:.0f}s"
-                        raise RuntimeError(self.stderr)
-                    finally:
-                        self._current_process = None
-
-                    raw_stdout = stdout_bytes.decode()
-                    raw_stderr = stderr_bytes.decode()
-                    self.stderr = self.filter_stderr(raw_stderr)
-                    self.returncode = process.returncode
-
-                    if self.returncode == 0:
-                        # Capture session ID for caller to reuse
-                        sid = self._extract_session_id(raw_stdout)
-                        if sid:
-                            if not self.session_id:
-                                logger.info("New session established: %s", sid)
-                            self.session_id = sid
-
-                        self.stdout = self._extract_result_text(raw_stdout)
-                        return self.stdout
-
-                    logger.warning(
-                        "Attempt %d/%d failed (code %d):\nSTDERR: %s\nSTDOUT: %s",
-                        attempt, self.max_retries, self.returncode,
-                        self.stderr[:1000], raw_stdout[:1000]
-                    )
-
-                except _asyncio.CancelledError:
-                    raise
-                except RuntimeError:
-                    raise  # timeout: fail fast so the fallback chain advances
-                except Exception as e:
-                    logger.warning("Attempt %d/%d exception: %s", attempt, self.max_retries, e)
-                    self.stderr = str(e)
-
-                if attempt < self.max_retries:
-                    backoff_time = min(8, 2 ** attempt)
-                    logger.info("Retrying in %d seconds...", backoff_time)
-                    await _asyncio.sleep(backoff_time)
-
-            logger.error("All %d attempts failed.", self.max_retries)
-            raise RuntimeError(f"AgentInstance failed after {self.max_retries} attempts: {self.stderr}")
-        finally:
-            if self._current_process:
-                try:
-                    self._current_process.kill()
-                except Exception:
-                    pass
-                self._current_process = None
+    def _postprocess(self, raw_stdout: str) -> str:
+        """Capture the resumable session id, then return the JSON result text."""
+        sid = self._extract_session_id(raw_stdout)
+        if sid:
+            if not self.session_id:
+                logger.info("New session established: %s", sid)
+            self.session_id = sid
+        return self._extract_result_text(raw_stdout)
