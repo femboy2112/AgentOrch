@@ -4,7 +4,6 @@ from typing import List
 
 from dashboard.adapters.base import AdapterCtx, load_json_line
 
-
 _REASONING_TYPES = {
     "reasoning",
     "item.reasoning",

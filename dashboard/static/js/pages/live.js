@@ -40,8 +40,9 @@ export async function renderLive(container) {
 
         const summary = document.createElement('summary');
         summary.className = 'live-summary';
+        const sourceLabel = run.source === 'cli' ? '<span class="source-cli">CLI</span>' : '';
         summary.innerHTML = `
-            <strong>${run.run_id}</strong>
+            ${sourceLabel}<strong>${run.run_id}</strong>
             <span class="live-meta">mode=${run.mode} gen=${(run.generator || []).join(',')}</span>
             <span id="elapsed-${run.run_id}" class="live-meta">${elapsed(run.started_at)}</span>
             <span id="tokens-${run.run_id}" class="live-meta">tokens=0</span>
