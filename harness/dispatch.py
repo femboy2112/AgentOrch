@@ -323,6 +323,10 @@ async def dispatch_async(
         family_warning = roles.check_chains_cross_family(generator_chain, critic_chain)
         if family_warning:
             logger.warning(family_warning)
+    if mode in ("vote", "tot"):
+        agy_warning = roles.check_agy_parallelism_warning(mode, generator_chain, branches)
+        if agy_warning:
+            logger.warning(agy_warning)
 
     def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
         model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
