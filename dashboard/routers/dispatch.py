@@ -32,7 +32,8 @@ async def _run_dispatch(request: Request, run_id: str, payload: DispatchRequest)
     state = request.app.state.dashboard
     done_payload: dict = {"run_id": run_id, "success": False, "error": "dispatch aborted"}
     try:
-        result = await dispatch_mod.dispatch_async(
+        result = await asyncio.to_thread(
+            dispatch_mod.dispatch,
             payload.instruction,
             run_id=run_id,
             mode=payload.mode,

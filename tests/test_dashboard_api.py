@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from dataclasses import asdict
@@ -48,7 +47,7 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(dispatch_mod, "RUNS_DIR", runs_dir)
 
-    async def fake_dispatch_async(
+    def fake_dispatch(
         instruction: str,
         *,
         run_id: str | None = None,
@@ -84,7 +83,7 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
         )
 
         pub({"kind": "reasoning", "text": "thinking", "data": {}})
-        await asyncio.sleep(0.01)
+        time.sleep(0.01)
         pub({"kind": "message", "text": "done", "data": {}})
         dispatch_mod.EVENT_BUS.close(run_id)
         dispatch_mod.EVENT_BUS.sinks.pop(run_id, None)
@@ -111,7 +110,7 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
         (run_dir / "meta.json").write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
         return result
 
-    monkeypatch.setattr(dispatch_mod, "dispatch_async", fake_dispatch_async)
+    monkeypatch.setattr(dispatch_mod, "dispatch", fake_dispatch)
 
     app = create_app()
     client = TestClient(app)
