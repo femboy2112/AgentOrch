@@ -1,153 +1,151 @@
-# agy_orchestrator
+# AgentOrch
 
-An advanced multi-agent CLI orchestrator. It wraps the `agy`, `claude`, and `codex`
-command-line agents behind a common interface and composes them into higher-order
-workflows that are **usage-aware**, **gracefully failing**, and **verbose** so a long
-autonomous run is fully tappable.
+Dispatch coding work to multiple LLM CLIs, gate it with real verification, and get a reviewable diff-backed run record every time.
 
-This is the merged, upgraded orchestrator: it takes the best functionality and
-bugfixes from two prior lineages and combines them into one self-contained package.
+## What is this?
+AgentOrch is a cloud-only multi-LLM orchestrator you run from your own
+workstation. It dispatches implementation work to existing worker CLIs
+(`codex`, `claude`, `agy`, `grok`) instead of introducing another hosted agent
+service.
 
-## What's in the merge
+The core pattern is simple: send a concrete instruction, choose a workflow,
+run workers, and gate outcomes with a programmatic verifier when available.
+Depending on mode, this can be a one-shot pass, a generator/critic loop,
+a test-feedback repair loop, or a multi-step planner pipeline.
 
-Every robustness feature from both source trees, reconciled into one:
+Every dispatch is captured under `runs/<timestamp>/` with prompt, logs,
+metadata, and a disk snapshot diff (`changed-files.diff`). You can review
+what changed and why before accepting the result.
 
-- **Cross-provider fallback with cycling** (`core/agents/fallback_agent.py`) — wrap a
-  chain of providers; on a usage/quota wall the next provider is tried, and the whole
-  chain is *cycled* (default 3×) so a provider whose quota has recovered gets retried.
-  Usage-wall markers in stderr are detected for clearer logging.
-- **Process cleanup on cancel** (`core/agents/claude_agent.py`) — the live child
-  process is tracked and killed in a `finally`, so a cancelled/aborted run never
-  leaves an orphaned agent CLI behind.
-- **Live stderr streaming** (`core/agent.py`) — set `AGY_STREAM=1` to mirror a child's
-  stderr line-by-line as it arrives, making a long build tailable instead of buffered.
-- **Effort mapping** (`core/agents/codex_agent.py`) — `--effort max` maps to codex's
-  `xhigh` reasoning effort.
-- **Checkpoint + resume** (`workflows/master.py`) — the master workflow persists progress
-  atomically and resumes in place from the next step after a crash.
-- **Session compaction** (`workflows/master.py`) — over a long chained run the context
-  is condensed to a bounded digest and the session reset every N steps (or when context
-  exceeds a char budget), keeping token cost flat. Falls back to a recent-tail truncation
-  if the compaction call itself fails.
-- **Usage-aware allocation** (`core/optimizer.py`) — effort/model auto-downgrade when a
-  provider's remaining usage runs low; effort baseline derives from the subscription plan.
+AgentOrch is complementary to your primary coding environment. You still define
+requirements and decide what to merge; AgentOrch handles dispatching,
+orchestration, verification loops, and run bookkeeping in a repeatable way.
 
-## Install
+## Why use it?
+- Compose multiple worker CLIs through seven workflow modes (`direct`,
+  `adversarial`, `feedback`, `cascade`, `master`, `pat`, `vote`) depending on
+  task size, quality bar, and cost constraints.
+- Gate outputs with a programmatic verifier (`--test-cmd`) in the modes that
+  require hard pass/fail signals, instead of relying on LLM self-evaluation.
+- Capture each run with artifacts (`prompt.txt`, `stdout.log`, `stderr.log`,
+  `events.jsonl`, `changed-files.diff`, `meta.json`) so review is reproducible.
+- Monitor long-running work from a local dashboard (`python -m harness dashboard`)
+  with streaming per-worker events.
+- Protect dispatch stability with per-worker watchdog budgets backed by a
+  calibration table and an append-only live ledger of verified runs.
+- Use provider chains and fallback (`--generator`, `--critic`, `--fallback`) so
+  a usage wall on one provider does not automatically terminate the run.
+- Target other repositories safely with `--out-dir`, so workers write into the
+  intended project while AgentOrch keeps its own orchestration artifacts local.
+
+In practice, this means you can delegate mechanical or high-volume edits,
+preserve your own context for review and design decisions, and still keep a
+strict acceptance gate based on real commands rather than model confidence.
+
+## Quick start
+```bash
+# 1) clone
+git clone https://github.com/femboy2112/AgentOrch.git
+cd AgentOrch
+
+# 2) install (editable)
+pip install -e .
+
+# optional dev deps
+# pip install -e ".[dev]"
+
+# 3) run a trivial dispatch in this repo
+python -m harness do "add a short comment to docs/notes.txt" \
+  --mode direct \
+  --out-dir .
+```
+
+See [Workflows](#workflows) below to pick the right mode for your task.
+
+If you are invoking AgentOrch from another repository, point `--out-dir` at
+that repository path so workers write there instead of in AgentOrch.
+
+Typical follow-up commands:
 
 ```bash
-pip install -e .          # or: pip install -e ".[dev]" for the test deps
+# list recent dispatches
+python -m harness runs
+
+# inspect one run's diff and metadata
+python -m harness show <run_id>
+
+# launch the local operator dashboard (127.0.0.1:8765 by default)
+python -m harness dashboard
 ```
 
-Requires the underlying agent CLIs (`agy`, `claude`, `codex`) on `PATH` for live runs.
+Each run directory includes:
 
-## Usage
+- `prompt.txt` — exact worker prompt used for the dispatch.
+- `stdout.log` — final workflow output stream.
+- `stderr.log` — detailed workflow/runtime logging.
+- `events.jsonl` — structured per-worker event stream.
+- `changed-files.diff` — snapshot diff of on-disk changes.
+- `meta.json` — mode, quality signals, timing, and file-change metadata.
 
-```bash
-# Run as a module (no install needed)
-python -m agy_orchestrator <command> ...
-# or via the console script after install
-agy-orchestrator <command> ...
+## Workflows
+| Mode | What it does | When to use |
+|---|---|---|
+| `direct` | One generator pass, no critic loop, no verifier gate by default. | Small, precise edits you already scoped. |
+| `adversarial` | Generator + critic refinement loop; optional verifier can short-circuit on pass. | You want stronger quality without a mandatory test gate. |
+| `feedback` | Generator -> verifier -> repair loop using real test/build/lint errors (**requires `--test-cmd`**). | A programmatic test is the source of truth and you want iterative repair. |
+| `cascade` | Cheap-first generator stages; each stage uses test-feedback and escalates only on verifier failure (**requires `--test-cmd`**). | Task difficulty is unknown and you want cost-aware escalation. |
+| `master` | Planner + tree-of-thought + adversarial refinement for multi-step builds; optional verifier. | Whole features or long multi-step work with broad context. |
+| `pat` | Plan-after-Trial: try direct first, escalate to master only if verifier fails (**requires `--test-cmd`**). | General default when many tasks are easy but you want a robust fallback path. |
+| `vote` | K parallel candidates in isolated workspaces; verifier picks and applies a winner (**requires `--test-cmd`**). | You want candidate diversity and verifier-selected best result. |
+
+Verifier requirement summary:
+
+- `--test-cmd` required: `feedback`, `cascade`, `pat`, `vote`
+- `--test-cmd` optional: `adversarial`, `master`
+- `--test-cmd` not required for baseline behavior: `direct`
+
+## Architecture
+```text
+agy_orchestrator/            # Multi-agent engine and workflow implementations
+  core/                      # Worker adapters, fallback wrappers, usage/cost controls
+  execution/                 # Verifier, ledgers, pipelines, and workspace execution primitives
+  interaction/               # Decision-handling components for workflow interaction points
+  workflows/                 # Mode implementations (adversarial, test-feedback, cascade, master, pat, vote)
+  cli.py                     # Standalone orchestrator CLI entrypoint
+
+harness/                     # Operator-facing dispatch/control layer
+  cli.py                     # `harness do|runs|show|dashboard` command interface
+  dispatch.py                # Prompt build, mode routing, snapshot diffing, run artifact capture
+  roles.py                   # Generator/critic chain defaults, worker mapping, watchdog setup
+  snapshot.py                # Git-independent before/after filesystem snapshot + diff helpers
 ```
 
-Top-level options (apply to every command) declare your subscription plans, which set
-the baseline effort tier:
+The dashboard package is intentionally separate from this high-level tree and
+is launched through `harness dashboard`; see `docs/dashboard-design.md` for the
+v1 UX and API contract.
 
-```
---claude-plan "20x max"  --codex-plan "$100"  --agy-plan free
-```
+## Status
+AgentOrch is a cloud-only orchestrator extracted from earlier internal lineage
+and is in active polish toward public release. It requires Python 3.10+ in
+operator environments and is exercised against locally installed `codex`,
+`claude`, `agy`, and `grok` CLIs.
 
-### Commands
+## Documentation
+- `AGENTS.md` — guidance for LLM agents integrating AgentOrch as a callable tool.
+- `CLAUDE.md` — operator/maintainer guide with runtime rules and architecture notes.
+- `docs/experiments.md` — empirical findings that informed workflow defaults.
+- `docs/dashboard-design.md` — dashboard v1 design and implementation spec.
 
-| Command       | What it does |
-|---------------|--------------|
-| `master`      | Full pipeline: plan → per-step Tree-of-Thought exploration → adversarial refinement, with checkpointing + compaction. |
-| `chain`       | Linear pipeline; each stage's output is piped as context into the next. Per-stage fallback is **on by default**. |
-| `adversarial` | Generator/critic loop until the critic approves (optionally gated by a programmatic test command). |
-| `tot`         | Single-layer Tree-of-Thought: N parallel branches, scored by an evaluator, best selected. |
+Additional practical entry points:
 
-Examples:
+- `harness/cli.py` — command surface for `do`, `runs`, `show`, and `dashboard`.
+- `harness/dispatch.py` — mode routing, snapshot diff capture, and run metadata.
+- `agy_orchestrator/workflows/*.py` — per-mode workflow behavior and docstrings.
 
-```bash
-# Plan-and-build a project end to end, resilient to any one provider running out of usage
-python -m agy_orchestrator --codex-plan "$100" master \
-  --prompt "Build a single-file WebGL black hole demo" \
-  --agent codex --fallback \
-  --checkpoint .run.ckpt --compaction-interval 6
+## Contributing
+Issues and pull requests are welcome.
+Run `python -m pytest -q` before submitting changes.
+The CLI is the contract; flags and behavior are documented in `--help`.
 
-# Refinement chain: codex -> claude, each stage wrapped in fallback (default)
-python -m agy_orchestrator chain --prompt "Optimize this shader" --agents codex claude
-
-# Adversarial loop gated by a build/test command
-python -m agy_orchestrator adversarial --prompt "Fix the failing tests" --test-cmd "pytest -q"
-```
-
-Key `master` flags: `--branches`, `--max-iterations`, `--test-cmd`, `--fallback`,
-`--checkpoint`, `--compaction-interval` (0 disables), `--max-context-chars` (0 disables).
-
-## Tracking a run
-
-Logging is INFO-level by default — planner steps, ToT branch scores, adversarial
-iterations, fallback transitions, checkpoint writes, and compaction events all log as
-they happen. For live child output, prefix with `AGY_STREAM=1`.
-
-## Workflow harness
-
-`harness/` is the operator layer used to drive workers (codex/agy) via the
-orchestrator during design sessions. Every dispatch is captured for review.
-
-```bash
-python -m harness do "add a --version flag to the CLI"          # adversarial (default)
-python -m harness do "rename helper X to Y" --mode direct       # one-shot
-python -m harness do "build feature Z" --mode master --test-cmd "pytest -q"
-python -m harness runs                                          # list recent runs
-python -m harness show <run_id>                                 # print a run's diff + meta
-```
-
-Roles (all overridable via `--generator` / `--critic`, fallback on by default):
-
-- **generator** = `codex` (code writer) → falls back to `agy` on a usage wall.
-- **critic** = `agy` at high effort / best model → falls back to `codex` when agy
-  usage is exhausted.
-
-Each dispatch writes `runs/<timestamp>/`:
-
-```
-runs/<ts>/
-  prompt.txt           # exact prompt sent to the worker
-  stdout.log           # final workflow output
-  stderr.log           # full INFO-level tracking (planner/critic/fallback/...)
-  changed-files.diff   # git-independent unified diff of what changed on disk
-  meta.json            # mode, roles, success, duration, changed-file lists
-```
-
-Workers write **directly into the repo**; the diff is computed by snapshotting
-the tree before/after, so it works with or without git. Failures are recorded,
-never raised into the operator's shell.
-
-## Tests
-
-```bash
-python -m pytest -q
-```
-
-## Layout
-
-```
-agy_orchestrator/
-  cli.py                      # argparse entrypoint + workflow runners
-  core/
-    agent.py                  # AgentInstance ABC: async exec, retries/backoff, AGY_STREAM
-    optimizer.py              # UsageAwareAllocator: effort/model downgrade on low usage
-    profile.py                # UserProfile: plan -> baseline effort
-    agents/                   # agy / claude / codex adapters + fallback wrapper
-  execution/
-    pipeline.py               # LinearPipeline, ParallelSwarm
-    tdag.py                   # TaskDAG (dependency-aware concurrent execution)
-    verifier.py               # QualityVerifier (programmatic test gate)
-  interaction/
-    decision_engine.py        # auto/human question resolution
-  workflows/
-    adversarial.py            # generator/critic refinement loop
-    tree_of_thought.py        # parallel branch generation + scored selection
-    master.py                 # plan -> ToT -> adversarial, checkpoint + compaction
-```
+## License
+License: TBD
