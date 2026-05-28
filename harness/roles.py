@@ -34,6 +34,21 @@ AGENT_CLASSES: Dict[str, Type[AgentInstance]] = {
     "grok": GrokAgent,
 }
 
+# Provider family for each worker — used by the cross-family verifier guard
+# (see check_chains_cross_family below). The literature on LLM-as-judge
+# ("When Does Verification Pay Off?", arxiv 2512.02304) finds that
+# self-verification — critic from the same model family as the generator —
+# substantially underperforms cross-family verification: the critic
+# inherits the same blind spots as the generator, so failure modes go
+# unnoticed. We surface this as a warning, not a block — the operator may
+# override deliberately (e.g. only one provider is configured).
+WORKER_FAMILY: Dict[str, str] = {
+    "codex": "openai",
+    "claude": "anthropic",
+    "agy": "google",
+    "grok": "xai",
+}
+
 # Per-provider model/effort. "best model" per provider, high effort.
 AGENT_DEFAULTS: Dict[str, Dict[str, object]] = {
     "codex": {"model": "standard", "effort": "high"},   # -> gpt-5.3-codex
@@ -234,6 +249,44 @@ def build_master_agent_class(
         post_construct_hook=arm_hook,
     )
     return fb_cls, lead_cfg["model"], lead_cfg["effort"]
+
+
+def check_chains_cross_family(
+    generator_chain: List[str], critic_chain: List[str]
+) -> Optional[str]:
+    """Return a human-readable warning if the lead generator and lead critic
+    are from the same provider family, else None.
+
+    Same-family critic = self-verification. The critic inherits the same
+    biases and blind spots as the generator and tends to under-flag the
+    failure modes most worth catching. Cross-family critic — drawn from a
+    different model family — catches substantially more (arxiv 2512.02304).
+
+    Falls open on unknown workers (returns None) — better to stay silent
+    than to false-positive on a worker we haven't mapped.
+
+    Disable the check entirely via env var ``AGY_CRITIC_FAMILY_CHECK=off``
+    for operators who deliberately want self-critique (e.g. only one
+    provider configured)."""
+    if os.environ.get("AGY_CRITIC_FAMILY_CHECK", "").lower() == "off":
+        return None
+    if not generator_chain or not critic_chain:
+        return None
+    gen_lead = generator_chain[0]
+    crit_lead = critic_chain[0]
+    gen_family = WORKER_FAMILY.get(gen_lead)
+    crit_family = WORKER_FAMILY.get(crit_lead)
+    if gen_family is None or crit_family is None:
+        return None
+    if gen_family != crit_family:
+        return None
+    return (
+        f"cross-family check: generator={gen_lead!r} and critic={crit_lead!r} "
+        f"are both in the {gen_family!r} family — self-verification "
+        f"substantially underperforms cross-family critique (arxiv 2512.02304). "
+        f"Consider --critic <different-provider> for stronger gates. "
+        f"Suppress with AGY_CRITIC_FAMILY_CHECK=off."
+    )
 
 
 def describe_chain(chain: List[str], fallback: bool) -> str:

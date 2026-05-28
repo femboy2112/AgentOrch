@@ -254,6 +254,14 @@ async def dispatch_async(
     gen_desc = roles.describe_chain(generator_chain, fallback)
     crit_desc = roles.describe_chain(critic_chain, fallback) if mode == "adversarial" else None
 
+    # Cross-family verifier guard: warn (don't block) when the critic chain
+    # leads with the same provider family as the generator. Only meaningful
+    # for adversarial mode — other modes don't use a separate critic chain.
+    if mode == "adversarial":
+        family_warning = roles.check_chains_cross_family(generator_chain, critic_chain)
+        if family_warning:
+            logger.warning(family_warning)
+
     def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
         model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
         effort_val = cfg.get("effort")
