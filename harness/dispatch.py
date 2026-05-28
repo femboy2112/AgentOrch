@@ -28,6 +28,7 @@ from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
 from agy_orchestrator.workflows.pat import PatWorkflow
 from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
+from agy_orchestrator.workflows.vote import VoteWorkflow
 from dashboard.event_bus import EventBus
 from harness import roles
 from harness.snapshot import diff_snapshots, take_snapshot
@@ -165,6 +166,34 @@ async def _run_workflow(
             max_iterations=max_iterations,
             verifier=verifier,
             agent_class=agent_class,
+            working_directory=working_directory,
+        )
+        return await wf.execute(prompt), wf
+
+    if mode == "vote":
+        # K-parallel candidates in isolated workspaces; verifier picks the
+        # winner. K = `branches` (reusing the existing CLI knob). Each
+        # candidate rotates through the generator_chain so K=3 with the
+        # default chain (codex,agy,grok) produces one candidate per
+        # provider — the heterogeneity gain (arxiv 2602.03794).
+        if verifier is None:
+            raise ValueError("vote mode requires --test-cmd (the verifier gate)")
+        k = max(1, branches)
+        vote_generators: List[AgentInstance] = []
+        for i in range(k):
+            token = generator_chain[i % len(generator_chain)]
+            # Each slot is its own single-worker agent (no fallback chain
+            # inside a slot — diversity comes from different slots, not
+            # from fallback within one slot).
+            slot_agent = roles.build_role_agent(
+                [token], prompt=prompt, fallback=False, cycles=cycles,
+                codex_config=codex_config,
+                post_construct_hook=post_construct_hook,
+            )
+            vote_generators.append(slot_agent)
+        wf = VoteWorkflow(
+            generators=vote_generators,
+            verifier=verifier,
             working_directory=working_directory,
         )
         return await wf.execute(prompt), wf
