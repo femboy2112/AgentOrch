@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
-
 _WORKER_EVENT_KINDS = {
     "lifecycle",
     "reasoning",
