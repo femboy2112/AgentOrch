@@ -131,6 +131,10 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
     assert resp.status_code == 200
     run_id = resp.json()["run_id"]
 
+    live = client.get("/api/live")
+    assert live.status_code == 200
+    assert isinstance(live.json()["running"], list)
+
     deadline = time.time() + 2.0
     while time.time() < deadline and run_id in app.state.dashboard.running:
         time.sleep(0.01)
@@ -144,8 +148,15 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
     for row in worker_events:
         payload = row["data"]
         assert required_fields.issubset(payload)
+        assert "_event_id" not in payload
     assert events[-1]["event"] == "done"
     assert events[-1]["data"]["run_id"] == run_id
+
+    replay = client.get(f"/api/sse/{run_id}", headers={"Last-Event-ID": "0"})
+    assert replay.status_code == 200
+    replay_events = _parse_sse(replay.text)
+    replay_worker = [e for e in replay_events if e["event"] == "worker_event"]
+    assert [e["data"]["kind"] for e in replay_worker] == ["message"]
 
     runs = client.get("/api/runs")
     assert runs.status_code == 200

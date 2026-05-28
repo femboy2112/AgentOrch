@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque
+from typing import AsyncIterator, Deque
 
 from fastapi import FastAPI
 
@@ -22,8 +23,26 @@ class DashboardState:
     recent_done: Deque[dict] = field(default_factory=lambda: deque(maxlen=32))
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    state: DashboardState = app.state.dashboard
+    state.bus.reset()
+    try:
+        yield
+    finally:
+        tasks = list(state.tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for run_id in list(state.bus.queues):
+            state.bus.close(run_id)
+        state.tasks.clear()
+        state.running.clear()
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AgentOrch Dashboard", version="0.1.0")
+    app = FastAPI(title="AgentOrch Dashboard", version="0.1.0", lifespan=_lifespan)
     app.state.dashboard = DashboardState(
         bus=dispatch_mod.EVENT_BUS,
         runs_dir=dispatch_mod.RUNS_DIR,

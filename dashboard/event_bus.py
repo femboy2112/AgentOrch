@@ -29,6 +29,18 @@ class EventBus:
         self._wake: Dict[str, asyncio.Event] = {}
         self._next_ids: Dict[str, int] = {}
 
+    def reset(self) -> None:
+        """Clear all per-run state.
+
+        The dashboard server owns lifecycle and may reset the shared bus at
+        startup to avoid leaking run state across app instances/tests.
+        """
+        self.queues.clear()
+        self.sinks.clear()
+        self.closed.clear()
+        self._wake.clear()
+        self._next_ids.clear()
+
     def _ensure(self, run_id: str) -> None:
         if run_id not in self.queues:
             self.queues[run_id] = []
