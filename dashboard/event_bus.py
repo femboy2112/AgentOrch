@@ -68,9 +68,10 @@ class EventBus:
             self._next_ids[run_id] = max(self._next_ids[run_id], event_id + 1)
             self.queues[run_id].append(payload)
 
+            clean = {k: v for k, v in payload.items() if k != "_event_id"}
             for sink in list(self.sinks.get(run_id, [])):
                 try:
-                    sink(payload)
+                    sink(clean)
                 except Exception:
                     pass
             try:
@@ -113,7 +114,8 @@ class EventBus:
                 event_id = event.get("_event_id")
                 if isinstance(event_id, int) and event_id <= floor:
                     continue
-                yield event
+                clean = {k: v for k, v in event.items() if k != "_event_id"}
+                yield clean
 
             if run_id in self.closed:
                 return
@@ -152,28 +154,46 @@ class EventBus:
                 if not line:
                     continue
                 try:
-                    event = json.loads(line)
+                    raw_event = json.loads(line)
                 except Exception:
                     continue
-                if isinstance(event, dict):
-                    event_id = event.get("_event_id")
+                if isinstance(raw_event, dict):
+                    event_id = raw_event.get("_event_id")
                     if not isinstance(event_id, int):
                         # Preserve tolerant append-only replay by falling back to
                         # stable line index when older rows lack _event_id.
                         event_id = idx
                     if event_id <= floor:
                         continue
-                    out.append(event)
+                    clean = {k: v for k, v in raw_event.items() if k != "_event_id"}
+                    out.append(clean)
         return out
 
     @staticmethod
     def replay_events(events_path: Path, *, after_id: int = -1) -> List[tuple[int, dict]]:
+        """Return (original_event_id, clean_WorkerEvent) tuples for SSE replay.
+        Tolerates legacy jsonl lines that contain _event_id (extracts for id + SSE,
+        strips for the yielded WorkerEvent payload to match §3 exactly).
+        """
+        if not events_path.exists():
+            return []
         out: List[tuple[int, dict]] = []
-        for idx, event in enumerate(EventBus.replay_jsonl(events_path)):
-            event_id = event.get("_event_id")
-            if not isinstance(event_id, int):
-                event_id = idx
-            if event_id <= after_id:
-                continue
-            out.append((event_id, event))
+        with events_path.open("r", encoding="utf-8", errors="replace") as f:
+            for idx, raw in enumerate(f):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    raw_event = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(raw_event, dict):
+                    continue
+                event_id = raw_event.get("_event_id")
+                if not isinstance(event_id, int):
+                    event_id = idx
+                if event_id <= after_id:
+                    continue
+                clean = {k: v for k, v in raw_event.items() if k != "_event_id"}
+                out.append((event_id, clean))
         return out

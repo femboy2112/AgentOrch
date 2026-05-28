@@ -26,26 +26,27 @@ def test_event_bus_publish_subscribe_close_replay():
     got = asyncio.run(_collect(bus, "r1"))
     assert len(got) == 2
     assert [e["kind"] for e in got] == ["reasoning", "message"]
-    assert [e["_event_id"] for e in got] == [0, 1]
     for event in got:
+        assert "_event_id" not in event
         assert {"ts", "run_id", "worker", "model", "effort", "branch", "kind", "text", "data"}.issubset(event)
 
     replay = asyncio.run(_collect(bus, "r1", last_event_id="0"))
     assert len(replay) == 1
-    assert replay[0]["_event_id"] == 1
+    assert "_event_id" not in replay[0]
 
 
 def test_event_bus_jsonl_replay_tolerates_partial_tail(tmp_path: Path):
     path = tmp_path / "events.jsonl"
     path.write_text(
-        json.dumps({"_event_id": 0, "kind": "reasoning"}) + "\n"
-        + '{"_event_id": 1, "kind": "message"}\n'
+        json.dumps({"kind": "reasoning"}) + "\n"
+        + json.dumps({"kind": "message"}) + "\n"
         + '{"_event_id": ',
         encoding="utf-8",
     )
     replay = EventBus.replay_jsonl(path, last_event_id="0")
     assert len(replay) == 1
-    assert replay[0]["_event_id"] == 1
+    assert "_event_id" not in replay[0]
+    assert replay[0]["kind"] == "message"
 
 
 def test_event_bus_unknown_kind_falls_back_to_stderr():
@@ -63,15 +64,16 @@ def test_event_bus_unknown_kind_falls_back_to_stderr():
 def test_event_bus_jsonl_replay_filters_by_event_id_not_line_index(tmp_path: Path):
     path = tmp_path / "events.jsonl"
     path.write_text(
-        json.dumps({"_event_id": 10, "kind": "reasoning"}) + "\n"
+        json.dumps({"kind": "reasoning", "_event_id": 10}) + "\n"
         + '{"bad-json":'
         + "\n"
-        + json.dumps({"_event_id": 11, "kind": "message"}) + "\n",
+        + json.dumps({"kind": "message", "_event_id": 11}) + "\n",
         encoding="utf-8",
     )
     replay = EventBus.replay_jsonl(path, last_event_id="10")
     assert len(replay) == 1
-    assert replay[0]["_event_id"] == 11
+    assert "_event_id" not in replay[0]
+    assert replay[0]["kind"] == "message"
 
 
 def test_event_bus_late_subscriber_gets_replay_plus_live_without_duplicates():
@@ -96,7 +98,8 @@ def test_event_bus_late_subscriber_gets_replay_plus_live_without_duplicates():
 
     got = asyncio.run(_run())
     assert [e["text"] for e in got] == ["first", "second"]
-    assert [e["_event_id"] for e in got] == [0, 1]
+    for e in got:
+        assert "_event_id" not in e
 
 
 def test_event_bus_multiple_subscribers_each_receive_full_stream():

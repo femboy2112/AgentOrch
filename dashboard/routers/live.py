@@ -69,13 +69,16 @@ async def _iter_worker_events(request: Request, run_id: str) -> AsyncIterator[by
         after_id = event_id
         yield _sse_pack(event="worker_event", data=event, event_id=event_id)
 
+    # Live events from bus are clean (§3 shape, no _event_id). Synthesize SSE ids
+    # by incrementing from the last replay id so reconnect protocol works.
+    live_id = (after_id + 1) if after_id >= 0 else 0
     async for event in state.bus.subscribe(run_id, after_id=after_id):
         if await request.is_disconnected():
             return
-        event_id = event.get("_event_id") if isinstance(event, dict) else None
-        if isinstance(event_id, int):
-            after_id = event_id
-        yield _sse_pack(event="worker_event", data=event, event_id=event_id if isinstance(event_id, int) else None)
+        eid = live_id
+        live_id += 1
+        after_id = eid
+        yield _sse_pack(event="worker_event", data=event, event_id=eid)
 
     yield _sse_pack(event="done", data=_read_meta(state.runs_dir, run_id))
 
