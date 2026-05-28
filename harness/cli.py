@@ -8,12 +8,14 @@ code, with every run captured under runs/<ts>/ for tracking and review.
   python -m harness do "build feature Y" --mode master --test-cmd "pytest -q"
   python -m harness runs            # list recent runs
   python -m harness show <run_id>   # print a run's diff + summary
+  python -m harness dashboard       # launch dashboard server
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import subprocess
 import sys
 
 from harness import roles
@@ -114,6 +116,13 @@ def _cmd_show(args) -> int:
     return 0
 
 
+def _cmd_dashboard(args) -> int:
+    cmd = [sys.executable, "-m", "dashboard", "--port", str(args.port)]
+    if args.no_browser:
+        cmd.append("--no-browser")
+    return subprocess.call(cmd)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="harness", description="Workflow harness: drive agy/codex via the orchestrator."
@@ -158,6 +167,11 @@ def main(argv=None) -> int:
     show = sub.add_parser("show", help="Show a run's diff and metadata")
     show.add_argument("run_id", type=str)
     show.set_defaults(func=_cmd_show)
+
+    dashboard = sub.add_parser("dashboard", help="Launch the AgentOrch control dashboard")
+    dashboard.add_argument("--port", type=int, default=8765, help="Dashboard port (default: 8765)")
+    dashboard.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser tab")
+    dashboard.set_defaults(func=_cmd_dashboard)
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
