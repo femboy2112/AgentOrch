@@ -158,6 +158,8 @@ class EventBus:
                 if isinstance(event, dict):
                     event_id = event.get("_event_id")
                     if not isinstance(event_id, int):
+                        # Preserve tolerant append-only replay by falling back to
+                        # stable line index when older rows lack _event_id.
                         event_id = idx
                     if event_id <= floor:
                         continue
