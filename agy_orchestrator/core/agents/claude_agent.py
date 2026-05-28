@@ -4,7 +4,6 @@ import re
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
-from dashboard.adapters import AdapterCtx, parse_claude_stream_line
 
 logger = logging.getLogger(__name__)
 
@@ -145,64 +144,12 @@ class ClaudeAgent(AgentInstance):
             return "".join(chunks)
         return raw_stdout
 
-    @staticmethod
-    def _parse_stream_line(line: str) -> List[dict]:
-        txt = line.strip()
-        if not txt:
-            return []
-        try:
-            obj = json.loads(txt)
-        except Exception:
-            return []
-        if not isinstance(obj, dict):
-            return []
-
-        typ = str(obj.get("type") or "")
-        out: List[dict] = []
-        if typ in {"message_start", "message_stop"}:
-            out.append({"kind": "lifecycle", "data": {"event": typ, "detail": obj}})
-            return out
-        if typ in {"thinking", "thinking_delta"}:
-            text = obj.get("thinking") or obj.get("delta") or obj.get("text")
-            if text:
-                return [{"kind": "reasoning", "text": str(text), "data": {}}]
-            return []
-        if typ in {"text", "text_delta"}:
-            text = obj.get("text") or obj.get("delta")
-            if text:
-                return [{"kind": "message", "text": str(text), "data": {}}]
-            return []
-        if typ == "tool_use":
-            return [{
-                "kind": "tool_call",
-                "data": {"name": obj.get("name") or "tool", "args": obj.get("input") or {}},
-            }]
-        if typ == "tool_result":
-            return [{
-                "kind": "tool_result",
-                "data": {"name": obj.get("name") or "tool", "summary": obj.get("content") or ""},
-            }]
-        if typ == "result":
-            usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-            out.append({"kind": "lifecycle", "data": {"event": "result", "detail": obj}})
-            out.append({
-                "kind": "usage",
-                "data": {
-                    "in_tokens": usage.get("input_tokens"),
-                    "out_tokens": usage.get("output_tokens"),
-                    "reasoning_tokens": usage.get("reasoning_tokens"),
-                    "cost_usd": usage.get("cost_usd"),
-                    "api_ms": usage.get("api_ms"),
-                },
-            })
-            text = obj.get("result")
-            if text:
-                out.append({"kind": "message", "text": str(text), "data": {}})
-            return out
-        return []
-
     def _events_from_stdout_line(self, line: str) -> List[dict]:
         if not self.dashboard_stream_json:
+            return []
+        try:
+            from dashboard.adapters import AdapterCtx, parse_claude_stream_line
+        except Exception:
             return []
         ctx = getattr(self, "_adapter_ctx", None)
         if ctx is None:

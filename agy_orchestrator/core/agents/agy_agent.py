@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
-from dashboard.adapters import parse_agy_stderr, parse_agy_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +110,17 @@ class AgyAgent(AgentInstance):
         return cmd
 
     def _events_from_stderr_line(self, line: str) -> List[dict]:
+        try:
+            from dashboard.adapters import parse_agy_stderr
+        except Exception:
+            return super()._events_from_stderr_line(line)
         return parse_agy_stderr(line)
 
     def _events_from_stdout_complete(self, raw_stdout: str) -> List[dict]:
+        try:
+            from dashboard.adapters import parse_agy_stdout
+        except Exception:
+            return super()._events_from_stdout_complete(raw_stdout)
         return parse_agy_stdout(raw_stdout)
 
     def _postprocess(self, raw_stdout: str) -> str:

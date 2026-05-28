@@ -7,7 +7,6 @@ import tempfile
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
-from dashboard.adapters import AdapterCtx, parse_grok_stream_line
 
 logger = logging.getLogger(__name__)
 
@@ -147,33 +146,11 @@ class GrokAgent(AgentInstance):
             kept.append(line)
         return "\n".join(kept)
 
-    @staticmethod
-    def _parse_stream_line(line: str) -> List[dict]:
-        txt = line.strip()
-        if not txt:
-            return []
+    def _events_from_stdout_line(self, line: str) -> List[dict]:
         try:
-            obj = json.loads(txt)
+            from dashboard.adapters import AdapterCtx, parse_grok_stream_line
         except Exception:
             return []
-        if not isinstance(obj, dict):
-            return []
-        out: List[dict] = []
-        thought = obj.get("thought")
-        if thought:
-            out.append({"kind": "reasoning", "text": str(thought), "data": {}})
-        message = obj.get("text")
-        if message:
-            out.append({"kind": "message", "text": str(message), "data": {}})
-        stop_reason = obj.get("stopReason")
-        if stop_reason:
-            out.append({
-                "kind": "lifecycle",
-                "data": {"event": "stop_reason", "detail": {"stopReason": stop_reason}},
-            })
-        return out
-
-    def _events_from_stdout_line(self, line: str) -> List[dict]:
         ctx = getattr(self, "_adapter_ctx", None)
         if ctx is None:
             ctx = AdapterCtx()

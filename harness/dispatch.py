@@ -80,29 +80,6 @@ def _worker_hint(agent: AgentInstance, fallback_chain: Optional[List[str]]) -> s
     return "agy"
 
 
-def _wire_agent_events(
-    agent: AgentInstance,
-    *,
-    run_id: str,
-    bus: EventBus,
-    fallback_chain: Optional[List[str]] = None,
-    branch: Optional[int] = None,
-    dashboard_stream_json: bool = False,
-) -> None:
-    worker = _worker_hint(agent, fallback_chain)
-    model = getattr(agent, "model", None) or "n/a"
-    effort = getattr(agent, "effort", None) or "n/a"
-    agent.event_callback = bus.publisher_for(
-        run_id,
-        worker=worker,
-        model=str(model),
-        effort=str(effort),
-        branch=branch,
-    )
-    if hasattr(agent, "dashboard_stream_json"):
-        setattr(agent, "dashboard_stream_json", bool(dashboard_stream_json))
-
-
 async def _run_workflow(
     mode: str,
     prompt: str,
