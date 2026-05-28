@@ -25,6 +25,7 @@ from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.adversarial import AdversarialReview
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
+from agy_orchestrator.workflows.pat import PatWorkflow
 from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
 from dashboard.event_bus import EventBus
 from harness import roles
@@ -163,6 +164,38 @@ async def _run_workflow(
             max_iterations=max_iterations,
             verifier=verifier,
             agent_class=agent_class,
+            working_directory=working_directory,
+        )
+        return await wf.execute(prompt), wf
+
+    if mode == "pat":
+        # Plan-after-Trial: direct generator attempt gated by verifier;
+        # on failure, escalate to master mode. Verifier is mandatory.
+        if verifier is None:
+            raise ValueError("pat mode requires --test-cmd (the Stage 1 verifier gate)")
+        direct_gen = roles.build_role_agent(
+            generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
+            codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
+        )
+        agent_class, model, effort = roles.build_master_agent_class(
+            generator_chain, fallback=fallback, cycles=cycles,
+            codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
+        )
+        master_wf = MasterWorkflow(
+            model=model,
+            effort=effort,
+            branches=branches,
+            max_iterations=max_iterations,
+            verifier=verifier,
+            agent_class=agent_class,
+            working_directory=working_directory,
+        )
+        wf = PatWorkflow(
+            direct_generator=direct_gen,
+            master_workflow=master_wf,
+            verifier=verifier,
             working_directory=working_directory,
         )
         return await wf.execute(prompt), wf

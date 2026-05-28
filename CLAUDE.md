@@ -29,6 +29,7 @@ python -m harness do "INSTRUCTION"            # default: adversarial (gen+critic
 python -m harness do "INSTRUCTION" --mode direct     # one-shot, fast/cheap
 python -m harness do "INSTRUCTION" --mode feedback --test-cmd "pytest -q"  # repair loop
 python -m harness do "INSTRUCTION" --mode master     # whole-feature build
+python -m harness do "INSTRUCTION" --mode pat --test-cmd "pytest -q"        # try direct, plan on fail
 python -m harness do "INSTRUCTION" --web-search      # enable codex web search
 python -m harness do "INSTRUCTION" --test-cmd "pytest -q"   # quality gate
 python -m harness do "INSTRUCTION" --out-dir /path/to/other/repo  # write THERE, not into AgentOrch
@@ -46,8 +47,11 @@ AgentOrch (they're orchestrator-internal logs, not user data).
 **Mode by scope:** `direct` for small/precise edits we already designed;
 `adversarial` (default) when quality matters and a critic pass helps; `feedback`
 when a programmatic test is the oracle; `cascade` to escalate cheap→strong on
-verifier failure; `master` for multi-step features. Long builds: run in the
-background and review the `runs/<ts>/` artifacts when done.
+verifier failure; `master` for multi-step features; `pat` when most tasks at
+this prompt scale are likely solvable in one shot but you want the master
+safety net on misses (Plan-after-Trial, arxiv 2605.07248, ~40% cost saver
+when Stage 1 carries). Long builds: run in the background and review the
+`runs/<ts>/` artifacts when done.
 
 **Roles (overridable with `--generator` / `--critic`):**
 - generator = **codex** writes code → falls back to agy on a usage wall.
