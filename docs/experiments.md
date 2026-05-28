@@ -193,6 +193,7 @@ to `model_sweep` / `token_efficiency` for medians; pass `--sequential` to
 
 ## 7. Open items
 
+- **Retired (this dispatch):** UsageAwareAllocator removed; --mode auto + live ledger + fallback chain provide real routing.
 - **Clean calibrate re-run** (post-cwd-sandbox fix): needed before
   publishing a definitive multi-file / interdependent crossover table.
 - **Patch-vs-rewrite economics**: the cheap-first draft-and-fill workflow
