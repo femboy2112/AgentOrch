@@ -17,7 +17,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.ledger import build_ledger
@@ -180,11 +180,25 @@ async def dispatch_async(
     test_cmd: Optional[str] = None,
     web_search: bool = False,
     dashboard_stream_json: bool = False,
+    out_dir: Optional[Union[str, Path]] = None,
 ) -> DispatchResult:
-    """Execute one instruction and capture the run."""
+    """Execute one instruction and capture the run.
+
+    ``out_dir`` is the directory the worker subprocess runs in (its cwd) and
+    the scope of the before/after snapshot diff. Defaults to AgentOrch's own
+    repo root, which is the historical behaviour. Set it when invoking
+    AgentOrch from another repo so the worker writes there instead of into
+    AgentOrch. The ``runs/<id>/`` artifacts always live under AgentOrch
+    (they're orchestrator-internal logs, not user data).
+    """
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
     critic_chain = critic_chain or list(roles.CRITIC_CHAIN)
     codex_config = ["tools.web_search=true"] if web_search else None
+
+    # Where the worker actually writes files. Default = AgentOrch repo root,
+    # which preserves the prior behaviour exactly.
+    work_dir = Path(out_dir).expanduser().resolve() if out_dir else PROJECT_ROOT
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     run_id = run_id or _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
     run_dir = RUNS_DIR / run_id
@@ -216,6 +230,12 @@ async def dispatch_async(
         # Dashboard-only stream JSON; normal CLI path remains --output-format json.
         if worker == "claude" and hasattr(agent, "dashboard_stream_json"):
             setattr(agent, "dashboard_stream_json", bool(dashboard_stream_json))
+        # Pin the worker's cwd to the operator-chosen output directory so it
+        # doesn't pollute AgentOrch when invoked from elsewhere. Only set when
+        # work_dir is not the repo root; staying ``None`` keeps the historical
+        # inherit-parent-cwd behaviour for the default case.
+        if work_dir != PROJECT_ROOT:
+            agent.cwd = str(work_dir)
 
     EVENT_BUS.add_sink(run_id, _sink)
     dispatch_pub = EVENT_BUS.publisher_for(
@@ -249,7 +269,7 @@ async def dispatch_async(
 
     verifier = QualityVerifier(test_commands=[test_cmd]) if test_cmd else None
 
-    before = take_snapshot(PROJECT_ROOT)
+    before = take_snapshot(work_dir)
     started = time.monotonic()
     success = True
     error: Optional[str] = None
@@ -288,7 +308,7 @@ async def dispatch_async(
     )
     logger.info("Dispatch %s | confidence=%s (%s)", run_id, quality["confidence"], quality["note"])
 
-    after = take_snapshot(PROJECT_ROOT)
+    after = take_snapshot(work_dir)
     diff = diff_snapshots(before, after)
 
     (run_dir / "stdout.log").write_text(output, encoding="utf-8")
@@ -332,6 +352,7 @@ def dispatch(
     test_cmd: Optional[str] = None,
     web_search: bool = False,
     dashboard_stream_json: bool = False,
+    out_dir: Optional[Union[str, Path]] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run. Synchronous entrypoint."""
     return asyncio.run(
@@ -349,5 +370,6 @@ def dispatch(
             test_cmd=test_cmd,
             web_search=web_search,
             dashboard_stream_json=dashboard_stream_json,
+            out_dir=out_dir,
         )
     )

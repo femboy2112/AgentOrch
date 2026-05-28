@@ -31,9 +31,17 @@ python -m harness do "INSTRUCTION" --mode feedback --test-cmd "pytest -q"  # rep
 python -m harness do "INSTRUCTION" --mode master     # whole-feature build
 python -m harness do "INSTRUCTION" --web-search      # enable codex web search
 python -m harness do "INSTRUCTION" --test-cmd "pytest -q"   # quality gate
+python -m harness do "INSTRUCTION" --out-dir /path/to/other/repo  # write THERE, not into AgentOrch
 python -m harness runs                        # list recent runs
 python -m harness show <run_id>               # print a run's diff + meta
 ```
+
+**Working directory (`--out-dir`):** by default, workers run with cwd =
+AgentOrch's repo root, so file-writes land here. When another agent or
+orchestrator invokes AgentOrch as a tool, pass `--out-dir <path>` so the
+worker writes into the caller's repo instead, and the dispatch's snapshot
+diff covers that directory. The `runs/<id>/` artifacts always stay under
+AgentOrch (they're orchestrator-internal logs, not user data).
 
 **Mode by scope:** `direct` for small/precise edits we already designed;
 `adversarial` (default) when quality matters and a critic pass helps; `feedback`

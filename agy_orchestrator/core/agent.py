@@ -79,6 +79,11 @@ class AgentInstance(ABC):
         # Optional dashboard/event-bus callback. Best-effort only: failures in
         # observability must never affect execution.
         self.event_callback: Optional[Callable[[dict], None]] = None
+        # Working directory the worker child process runs in. None = inherit
+        # whatever cwd the parent (harness/dashboard) was launched in. The
+        # harness sets this to its --out-dir so a worker invocation from
+        # another repo doesn't pollute AgentOrch itself.
+        self.cwd: Optional[str] = None
 
     @classmethod
     @abstractmethod
@@ -312,6 +317,7 @@ class AgentInstance(ABC):
                         stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        cwd=self.cwd,
                     )
                     self._current_process = process
 

@@ -78,6 +78,7 @@ def _cmd_do(args) -> int:
         branches=args.branches,
         test_cmd=args.test_cmd,
         web_search=args.web_search,
+        out_dir=args.out_dir,
     )
     _print_result(result)
     return 0 if result.success else 1
@@ -159,6 +160,11 @@ def main(argv=None) -> int:
                     help="Optional verification command run as a quality gate")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
+    do.add_argument("--out-dir", type=str, default=None, metavar="PATH",
+                    help="Directory the worker should write files into (its cwd). "
+                         "Default: AgentOrch's own repo root. Set when invoking AgentOrch "
+                         "from another repo so workers don't pollute AgentOrch. "
+                         "Snapshot diff and changed-files list scope follow this path.")
     do.set_defaults(func=_cmd_do)
 
     runs = sub.add_parser("runs", help="List recent runs")
