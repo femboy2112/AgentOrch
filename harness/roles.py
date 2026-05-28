@@ -17,7 +17,7 @@ Everything here is overridable per dispatch from the CLI; these are defaults.
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Callable, Dict, List, Optional, Tuple, Type
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
@@ -56,6 +56,7 @@ CRITIC_CHAIN: List[str] = ["agy", "codex"]
 # tests can reset via _reset_calibration() if they need to.
 
 _CALIBRATION: Optional[CalibrationTable] = None
+RolePostConstructHook = Callable[[AgentInstance, str, Dict[str, object]], None]
 
 
 def _get_calibration() -> CalibrationTable:
@@ -121,6 +122,7 @@ def build_role_agent(
     fallback: bool = True,
     cycles: int = 2,
     codex_config: Optional[List[str]] = None,
+    post_construct_hook: Optional[RolePostConstructHook] = None,
 ) -> AgentInstance:
     """Instantiate a single agent for a role.
 
@@ -140,6 +142,11 @@ def build_role_agent(
         cls = AGENT_CLASSES[lead_name]
         agent = cls(prompt=prompt, **lead_cfg)
         _arm_watchdog(agent, lead_name, lead_cfg)
+        if post_construct_hook is not None:
+            try:
+                post_construct_hook(agent, lead_name, lead_cfg)
+            except Exception:
+                pass
         return agent
 
     classes = [AGENT_CLASSES[name] for name in chain]
@@ -155,7 +162,13 @@ def build_role_agent(
         worker = name_by_cls.get(agent_cls)
         if worker is None:
             return
-        _arm_watchdog(sub, worker, configs_by_cls.get(agent_cls, {}))
+        cfg = configs_by_cls.get(agent_cls, {})
+        _arm_watchdog(sub, worker, cfg)
+        if post_construct_hook is not None:
+            try:
+                post_construct_hook(sub, worker, cfg)
+            except Exception:
+                pass
 
     fb_cls = make_fallback_agent(
         classes, cycles=cycles, configs=configs_by_cls,
@@ -168,6 +181,7 @@ def build_role_agent(
 def build_master_agent_class(
     chain: List[str], *, fallback: bool = True, cycles: int = 2,
     codex_config: Optional[List[str]] = None,
+    post_construct_hook: Optional[RolePostConstructHook] = None,
 ):
     """Return ``(agent_class, model, effort)`` for MasterWorkflow.
 
@@ -181,7 +195,20 @@ def build_master_agent_class(
         raise ValueError("role chain must be non-empty")
     lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config)
     if not fallback or len(chain) == 1:
-        return AGENT_CLASSES[lead_name], lead_cfg["model"], lead_cfg["effort"]
+        cls = AGENT_CLASSES[lead_name]
+        if post_construct_hook is None:
+            return cls, lead_cfg["model"], lead_cfg["effort"]
+
+        class HookedLead(cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                try:
+                    post_construct_hook(self, lead_name, lead_cfg)
+                except Exception:
+                    pass
+
+        HookedLead.__name__ = f"Hooked{cls.__name__}"
+        return HookedLead, lead_cfg["model"], lead_cfg["effort"]
     classes = [AGENT_CLASSES[name] for name in chain]
     configs_by_cls = _configs_for(chain, codex_config)
     name_by_cls: Dict[Type[AgentInstance], str] = {
@@ -192,7 +219,13 @@ def build_master_agent_class(
         worker = name_by_cls.get(agent_cls)
         if worker is None:
             return
-        _arm_watchdog(sub, worker, configs_by_cls.get(agent_cls, {}))
+        cfg = configs_by_cls.get(agent_cls, {})
+        _arm_watchdog(sub, worker, cfg)
+        if post_construct_hook is not None:
+            try:
+                post_construct_hook(sub, worker, cfg)
+            except Exception:
+                pass
 
     fb_cls = make_fallback_agent(
         classes, cycles=cycles, configs=configs_by_cls,

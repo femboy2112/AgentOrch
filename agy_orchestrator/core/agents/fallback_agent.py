@@ -126,6 +126,17 @@ def make_fallback_agent(
                 if agent_cls is ClaudeAgent and getattr(self, "fork_session", False):
                     kwargs["fork_session"] = True
             sub = agent_cls(**kwargs)  # type: ignore[arg-type]
+            cb_factory = getattr(self, "event_callback_factory", None)
+            if callable(cb_factory):
+                try:
+                    sub.event_callback = cb_factory(agent_cls, sub)
+                except Exception as exc:
+                    logger.warning("[Fallback] event_callback_factory raised: %s", exc)
+                    sub.event_callback = self.event_callback
+            else:
+                sub.event_callback = self.event_callback
+            if hasattr(sub, "dashboard_stream_json") and hasattr(self, "dashboard_stream_json"):
+                setattr(sub, "dashboard_stream_json", bool(getattr(self, "dashboard_stream_json")))
             # Optional caller-supplied hook (e.g. harness watchdog arming) runs
             # AFTER construction so it sees the final sub with its config applied.
             hook = type(self)._post_construct_hook

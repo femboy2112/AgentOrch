@@ -7,6 +7,7 @@ import tempfile
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
+from dashboard.adapters import AdapterCtx, parse_grok_stream_line
 
 logger = logging.getLogger(__name__)
 
@@ -147,27 +148,71 @@ class GrokAgent(AgentInstance):
         return "\n".join(kept)
 
     @staticmethod
-    def _extract_text(raw_stdout: str) -> str:
-        """Pull "text" from the JSON object; tolerate plain output / extra logs."""
+    def _parse_stream_line(line: str) -> List[dict]:
+        txt = line.strip()
+        if not txt:
+            return []
+        try:
+            obj = json.loads(txt)
+        except Exception:
+            return []
+        if not isinstance(obj, dict):
+            return []
+        out: List[dict] = []
+        thought = obj.get("thought")
+        if thought:
+            out.append({"kind": "reasoning", "text": str(thought), "data": {}})
+        message = obj.get("text")
+        if message:
+            out.append({"kind": "message", "text": str(message), "data": {}})
+        stop_reason = obj.get("stopReason")
+        if stop_reason:
+            out.append({
+                "kind": "lifecycle",
+                "data": {"event": "stop_reason", "detail": {"stopReason": stop_reason}},
+            })
+        return out
+
+    def _events_from_stdout_line(self, line: str) -> List[dict]:
+        ctx = getattr(self, "_adapter_ctx", None)
+        if ctx is None:
+            ctx = AdapterCtx()
+            self._adapter_ctx = ctx
+        return parse_grok_stream_line(line, ctx)
+
+    def _events_from_stdout_complete(self, raw_stdout: str) -> List[dict]:
+        text = self._extract_text(raw_stdout).strip()
+        if not text:
+            return []
+        return [{"kind": "message", "text": text, "data": {}}]
+
+    @staticmethod
+    def _extract_payload(raw_stdout: str) -> Optional[dict]:
         s = raw_stdout.strip()
         try:
             obj = json.loads(s)
-            if isinstance(obj, dict) and "text" in obj:
-                return obj["text"]
+            if isinstance(obj, dict):
+                return obj
         except Exception:
-            # JSON may be embedded among stray log lines — grab the last {...}.
             m = re.search(r"\{.*\}", s, re.DOTALL)
             if m:
                 try:
                     obj = json.loads(m.group(0))
-                    if isinstance(obj, dict) and "text" in obj:
-                        return obj["text"]
+                    if isinstance(obj, dict):
+                        return obj
                 except Exception:
                     pass
+        return None
+
+    @staticmethod
+    def _extract_text(raw_stdout: str) -> str:
+        """Pull "text" from the JSON object; tolerate plain output / extra logs."""
+        obj = GrokAgent._extract_payload(raw_stdout)
+        if obj and "text" in obj:
+            return str(obj["text"])
         return raw_stdout
 
     @staticmethod
     def _extract_session_id(raw_stdout: str) -> Optional[str]:
         m = re.search(r'"sessionId"\s*:\s*"([^"]+)"', raw_stdout)
         return m.group(1) if m else None
-

@@ -17,14 +17,16 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.ledger import build_ledger
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.adversarial import AdversarialReview
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
 from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
+from dashboard.event_bus import EventBus
 from harness import roles
 from harness.snapshot import diff_snapshots, take_snapshot
 
@@ -32,6 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "runs"
 
 logger = logging.getLogger("harness")
+EVENT_BUS = EventBus()
 
 WORKER_PREAMBLE = (
     "You are a coding worker operating inside an existing project repository at the "
@@ -69,6 +72,37 @@ def _build_prompt(instruction: str, context: Optional[str]) -> str:
     return "\n".join(parts)
 
 
+def _worker_hint(agent: AgentInstance, fallback_chain: Optional[List[str]]) -> str:
+    if fallback_chain:
+        return fallback_chain[0]
+    if hasattr(agent, "_worker_name"):
+        return agent._worker_name()
+    return "agy"
+
+
+def _wire_agent_events(
+    agent: AgentInstance,
+    *,
+    run_id: str,
+    bus: EventBus,
+    fallback_chain: Optional[List[str]] = None,
+    branch: Optional[int] = None,
+    dashboard_stream_json: bool = False,
+) -> None:
+    worker = _worker_hint(agent, fallback_chain)
+    model = getattr(agent, "model", None) or "n/a"
+    effort = getattr(agent, "effort", None) or "n/a"
+    agent.event_callback = bus.publisher_for(
+        run_id,
+        worker=worker,
+        model=str(model),
+        effort=str(effort),
+        branch=branch,
+    )
+    if hasattr(agent, "dashboard_stream_json"):
+        setattr(agent, "dashboard_stream_json", bool(dashboard_stream_json))
+
+
 async def _run_workflow(
     mode: str,
     prompt: str,
@@ -81,6 +115,7 @@ async def _run_workflow(
     branches: int,
     verifier: Optional[QualityVerifier],
     codex_config: Optional[List[str]],
+    post_construct_hook: Optional[roles.RolePostConstructHook] = None,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
@@ -88,6 +123,7 @@ async def _run_workflow(
         gen = roles.build_role_agent(
             generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
         )
         return await gen.run_async(), None
 
@@ -95,10 +131,12 @@ async def _run_workflow(
         gen = roles.build_role_agent(
             generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
         )
         critic = roles.build_role_agent(
             critic_chain, prompt="", fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
         )
         wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations)
         return await wf.execute(prompt), wf
@@ -111,6 +149,7 @@ async def _run_workflow(
         gen = roles.build_role_agent(
             generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
         )
         wf = TestFeedbackWorkflow(gen, verifier, max_iterations=max_iterations)
         return await wf.execute(prompt), wf
@@ -123,7 +162,8 @@ async def _run_workflow(
             raise ValueError("cascade mode requires --test-cmd (the escalation gate)")
         stages = [
             roles.build_role_agent([token], prompt=prompt, fallback=False,
-                                   cycles=cycles, codex_config=codex_config)
+                                   cycles=cycles, codex_config=codex_config,
+                                   post_construct_hook=post_construct_hook)
             for token in generator_chain
         ]
         wf = CascadeWorkflow(stages, verifier, max_iterations_per_stage=max_iterations)
@@ -133,6 +173,7 @@ async def _run_workflow(
         agent_class, model, effort = roles.build_master_agent_class(
             generator_chain, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
         )
         wf = MasterWorkflow(
             model=model,
@@ -160,6 +201,7 @@ def dispatch(
     branches: int = 3,
     test_cmd: Optional[str] = None,
     web_search: bool = False,
+    dashboard_stream_json: bool = False,
 ) -> DispatchResult:
     """Execute one instruction and capture the run. Synchronous entrypoint."""
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
@@ -169,12 +211,52 @@ def dispatch(
     run_id = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    events_path = run_dir / "events.jsonl"
+    events_path.touch()
+
+    def _sink(event: dict) -> None:
+        with events_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     prompt = _build_prompt(instruction, context)
     (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
     gen_desc = roles.describe_chain(generator_chain, fallback)
     crit_desc = roles.describe_chain(critic_chain, fallback) if mode == "adversarial" else None
+
+    def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
+        model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
+        effort_val = cfg.get("effort")
+        effort = str(effort_val if effort_val not in (None, "n/a") else getattr(agent, "effort", None) or "n/a")
+        agent.event_callback = EVENT_BUS.publisher_for(
+            run_id,
+            worker=worker,
+            model=model,
+            effort=effort,
+            branch=getattr(agent, "branch", None),
+        )
+        # Dashboard-only stream JSON; normal CLI path remains --output-format json.
+        if worker == "claude" and hasattr(agent, "dashboard_stream_json"):
+            setattr(agent, "dashboard_stream_json", bool(dashboard_stream_json))
+
+    EVENT_BUS.add_sink(run_id, _sink)
+    dispatch_pub = EVENT_BUS.publisher_for(
+        run_id,
+        worker=generator_chain[0],
+        model="n/a",
+        effort="n/a",
+    )
+    dispatch_pub({
+        "kind": "lifecycle",
+        "data": {
+            "event": "dispatch_started",
+            "detail": {
+                "mode": mode,
+                "generator_chain": generator_chain,
+                "critic_chain": critic_chain,
+            },
+        },
+    })
 
     # Route all tracking logs into this run's stderr.log while still showing them.
     file_handler = logging.FileHandler(run_dir / "stderr.log", encoding="utf-8")
@@ -201,6 +283,7 @@ def dispatch(
             generator_chain=generator_chain, critic_chain=critic_chain,
             fallback=fallback, cycles=cycles, max_iterations=max_iterations,
             branches=branches, verifier=verifier, codex_config=codex_config,
+            post_construct_hook=_post_construct_hook,
         ))
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
@@ -208,6 +291,15 @@ def dispatch(
         logger.error("Dispatch %s failed: %s", run_id, error)
     finally:
         duration = time.monotonic() - started
+        dispatch_pub({
+            "kind": "lifecycle",
+            "data": {
+                "event": "dispatch_finished",
+                "detail": {"success": success, "duration_s": round(duration, 1)},
+            },
+        })
+        EVENT_BUS.close(run_id)
+        EVENT_BUS.sinks.pop(run_id, None)
         root_logger.removeHandler(file_handler)
         file_handler.close()
 

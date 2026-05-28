@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
+from dashboard.adapters import parse_agy_stderr, parse_agy_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,18 @@ class AgyAgent(AgentInstance):
         for k, v in self.additional_flags.items():
             cmd.extend([f"--{k}", str(v)])
         return cmd
+
+    def _events_from_stderr_line(self, line: str) -> List[dict]:
+        return parse_agy_stderr(line)
+
+    def _events_from_stdout_complete(self, raw_stdout: str) -> List[dict]:
+        return parse_agy_stdout(raw_stdout)
+
+    def _postprocess(self, raw_stdout: str) -> str:
+        text = raw_stdout.strip()
+        if text:
+            self._emit_event({"kind": "message", "text": text, "data": {}})
+        return raw_stdout
 
     # --- model pinning via settings.json (see module docstring) ----------------
     @staticmethod

@@ -5,7 +5,7 @@ import random
 import sys
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,9 @@ class AgentInstance(ABC):
         # only when streaming). Sinks (ledger, calibration) read these.
         self.last_wall_ms: Optional[float] = None
         self.last_out_bytes: Optional[int] = None
+        # Optional dashboard/event-bus callback. Best-effort only: failures in
+        # observability must never affect execution.
+        self.event_callback: Optional[Callable[[dict], None]] = None
 
     @classmethod
     @abstractmethod
@@ -132,6 +135,34 @@ class AgentInstance(ABC):
         """Release any per-call resources (e.g. a temp prompt file). No-op by default."""
         pass
 
+    def _worker_name(self) -> str:
+        name = self.__class__.__name__.lower()
+        for worker in ("codex", "claude", "agy", "grok"):
+            if worker in name:
+                return worker
+        return "agy"
+
+    def _emit_event(self, event: dict) -> None:
+        cb = self.event_callback
+        if cb is None:
+            return
+        try:
+            cb(dict(event or {}))
+        except Exception:
+            pass
+
+    def _events_from_stdout_line(self, line: str) -> List[dict]:
+        return []
+
+    def _events_from_stderr_line(self, line: str) -> List[dict]:
+        txt = line.rstrip("\n")
+        if not txt:
+            return []
+        return [{"kind": "stderr", "text": txt, "data": {}}]
+
+    def _events_from_stdout_complete(self, raw_stdout: str) -> List[dict]:
+        return []
+
     async def _stream_communicate(self, process, stdin_bytes: Optional[bytes] = None,
                                   *, max_output_bytes: int = 0,
                                   stall_seconds: float = 0) -> Tuple[bytes, bytes]:
@@ -168,7 +199,7 @@ class AgentInstance(ABC):
         out_total = [0]
         last_progress = [time.monotonic()]
 
-        async def _drain(reader, chunks, echo: bool, count: bool) -> None:
+        async def _drain(reader, chunks, echo: bool, count: bool, stream: str) -> None:
             if reader is None:
                 return
             while True:
@@ -182,6 +213,16 @@ class AgentInstance(ABC):
                 if echo:
                     sys.stderr.buffer.write(line)
                     sys.stderr.buffer.flush()
+                text = line.decode(errors="replace")
+                try:
+                    if stream == "stdout":
+                        events = self._events_from_stdout_line(text)
+                    else:
+                        events = self._events_from_stderr_line(text)
+                except Exception:
+                    events = []
+                for event in events:
+                    self._emit_event(event)
 
         async def _watchdog() -> None:
             # Poll every 2s; cheap relative to subprocess scheduling, fine-grained
@@ -217,8 +258,8 @@ class AgentInstance(ABC):
         err_chunks: List[bytes] = []
         await asyncio.gather(
             _feed(),
-            _drain(process.stdout, out_chunks, echo=False, count=True),
-            _drain(process.stderr, err_chunks, echo=True, count=False),
+            _drain(process.stdout, out_chunks, echo=False, count=True, stream="stdout"),
+            _drain(process.stderr, err_chunks, echo=True, count=False, stream="stderr"),
             _watchdog(),
         )
         await process.wait()
@@ -257,8 +298,10 @@ class AgentInstance(ABC):
         # needs line-by-line visibility to count bytes and detect stalls. Stays
         # opt-in: with no budgets set, behaviour is identical to the prior path.
         watchdog_armed = self.max_output_bytes > 0 or self.stall_seconds > 0
-        stream_mode = bool(os.environ.get("AGY_STREAM")) or watchdog_armed
+        stream_mode = bool(os.environ.get("AGY_STREAM")) or watchdog_armed or self.event_callback is not None
 
+        self._emit_event({"kind": "lifecycle", "data": {"event": "agent_started", "detail": {}}})
+        finished: Optional[bool] = None
         try:
             for attempt in range(1, self.max_retries + 1):
                 self._watchdog_reason = None
@@ -309,11 +352,19 @@ class AgentInstance(ABC):
                     # see it; raise fast so the chain can re-route on the rule.
                     if self._watchdog_reason:
                         marker = f"{WATCHDOG_MARKER}{self._watchdog_reason}]"
+                        self._emit_event({
+                            "kind": "watchdog",
+                            "text": marker,
+                            "data": {"reason": self._watchdog_reason},
+                        })
                         self.stderr = f"{marker} {self.stderr}".strip()
                         raise RuntimeError(self.stderr)
 
                     if self.returncode == 0:
                         self.stdout = self._postprocess(raw_stdout)
+                        for event in self._events_from_stdout_complete(raw_stdout):
+                            self._emit_event(event)
+                        finished = True
                         return self.stdout
 
                     logger.warning("Attempt %d/%d failed with code %s:\n%s",
@@ -338,8 +389,18 @@ class AgentInstance(ABC):
                     await asyncio.sleep(backoff_time)
 
             logger.error("All %d attempts failed.", self.max_retries)
+            finished = False
             raise RuntimeError(f"AgentInstance failed after {self.max_retries} attempts: {self.stderr}")
         finally:
+            if finished is None:
+                finished = False
+            self._emit_event({
+                "kind": "lifecycle",
+                "data": {
+                    "event": "agent_finished",
+                    "detail": {"success": finished, "returncode": self.returncode},
+                },
+            })
             await self._kill_current()
             self._cleanup()
 
