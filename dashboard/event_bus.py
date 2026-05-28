@@ -7,24 +7,21 @@ from pathlib import Path
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
 
-_CLOSE = object()
-
-
 class EventBus:
     """Per-run-id queues with sink fanout and replay support."""
 
     def __init__(self) -> None:
-        self.queues: Dict[str, asyncio.Queue] = {}
+        self.queues: Dict[str, List[dict]] = {}
         self.sinks: Dict[str, List[Callable[[dict], None]]] = {}
         self.closed: set[str] = set()
-        self._history: Dict[str, List[dict]] = {}
+        self._wake: Dict[str, asyncio.Event] = {}
         self._next_ids: Dict[str, int] = {}
 
     def _ensure(self, run_id: str) -> None:
         if run_id not in self.queues:
-            self.queues[run_id] = asyncio.Queue()
+            self.queues[run_id] = []
             self.sinks[run_id] = []
-            self._history[run_id] = []
+            self._wake[run_id] = asyncio.Event()
             self._next_ids[run_id] = 0
 
     def publisher_for(
@@ -56,7 +53,7 @@ class EventBus:
             event_id = int(payload.get("_event_id", self._next_ids[run_id]))
             payload["_event_id"] = event_id
             self._next_ids[run_id] = event_id + 1
-            self._history[run_id].append(payload)
+            self.queues[run_id].append(payload)
 
             for sink in list(self.sinks.get(run_id, [])):
                 try:
@@ -64,7 +61,7 @@ class EventBus:
                 except Exception:
                     pass
             try:
-                self.queues[run_id].put_nowait(payload)
+                self._wake[run_id].set()
             except Exception:
                 pass
 
@@ -78,33 +75,38 @@ class EventBus:
         after_id: Optional[int] = None,
     ) -> AsyncIterator[dict]:
         self._ensure(run_id)
-        floor = -1
-        if after_id is not None:
-            floor = after_id
+        floor = after_id if after_id is not None else -1
         if last_event_id is not None:
             try:
                 floor = int(last_event_id)
             except Exception:
                 floor = -1
 
-        for event in list(self._history.get(run_id, [])):
-            event_id = event.get("_event_id")
-            if isinstance(event_id, int) and event_id <= floor:
-                continue
-            yield event
+        events = self.queues[run_id]
+        idx = 0
+        if floor >= 0:
+            while idx < len(events):
+                event_id = events[idx].get("_event_id")
+                if isinstance(event_id, int) and event_id <= floor:
+                    idx += 1
+                    continue
+                break
 
-        if run_id in self.closed:
-            return
-
-        q = self.queues[run_id]
         while True:
-            event = await q.get()
-            if event is _CLOSE:
+            events = self.queues[run_id]
+            while idx < len(events):
+                event = events[idx]
+                idx += 1
+                event_id = event.get("_event_id")
+                if isinstance(event_id, int) and event_id <= floor:
+                    continue
+                yield event
+
+            if run_id in self.closed:
                 return
-            event_id = event.get("_event_id")
-            if isinstance(event_id, int) and event_id <= floor:
-                continue
-            yield event
+            wake = self._wake[run_id]
+            await wake.wait()
+            wake.clear()
 
     def add_sink(self, run_id: str, sink: Callable[[dict], None]) -> None:
         self._ensure(run_id)
@@ -116,7 +118,7 @@ class EventBus:
             return
         self.closed.add(run_id)
         try:
-            self.queues[run_id].put_nowait(_CLOSE)
+            self._wake[run_id].set()
         except Exception:
             pass
 
@@ -152,4 +154,3 @@ class EventBus:
         for idx, event in enumerate(EventBus.replay_jsonl(events_path, last_event_id=str(after_id))):
             out.append((after_id + 1 + idx, event))
         return out
-

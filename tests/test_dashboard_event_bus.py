@@ -46,6 +46,49 @@ def test_event_bus_jsonl_replay_tolerates_partial_tail(tmp_path: Path):
     assert replay[0]["_event_id"] == 1
 
 
+def test_event_bus_late_subscriber_gets_replay_plus_live_without_duplicates():
+    bus = EventBus()
+    pub = bus.publisher_for("r2", worker="codex", model="gpt-5", effort="high")
+    pub({"kind": "reasoning", "text": "first", "data": {}})
+
+    async def _run() -> list[dict]:
+        got: list[dict] = []
+
+        async def _consume() -> None:
+            async for event in bus.subscribe("r2"):
+                got.append(event)
+                if len(got) == 2:
+                    bus.close("r2")
+
+        task = asyncio.create_task(_consume())
+        await asyncio.sleep(0)
+        pub({"kind": "message", "text": "second", "data": {}})
+        await task
+        return got
+
+    got = asyncio.run(_run())
+    assert [e["text"] for e in got] == ["first", "second"]
+    assert [e["_event_id"] for e in got] == [0, 1]
+
+
+def test_event_bus_multiple_subscribers_each_receive_full_stream():
+    bus = EventBus()
+    pub = bus.publisher_for("r3", worker="codex", model="gpt-5", effort="high")
+
+    async def _run() -> tuple[list[dict], list[dict]]:
+        t1 = asyncio.create_task(_collect(bus, "r3"))
+        t2 = asyncio.create_task(_collect(bus, "r3"))
+        await asyncio.sleep(0)
+        pub({"kind": "reasoning", "text": "a", "data": {}})
+        pub({"kind": "message", "text": "b", "data": {}})
+        bus.close("r3")
+        return await asyncio.gather(t1, t2)
+
+    got1, got2 = asyncio.run(_run())
+    assert [e["kind"] for e in got1] == ["reasoning", "message"]
+    assert [e["kind"] for e in got2] == ["reasoning", "message"]
+
+
 class _FakeEventAgent:
     def __init__(self, *a, **kw):
         self.prompt = kw.get("prompt", "")
@@ -83,4 +126,3 @@ def test_dispatch_writes_events_jsonl(tmp_path: Path, monkeypatch):
     assert any(e.get("kind") == "message" for e in lines)
     assert any(e.get("data", {}).get("event") == "dispatch_started" for e in lines if e.get("kind") == "lifecycle")
     assert any(e.get("data", {}).get("event") == "dispatch_finished" for e in lines if e.get("kind") == "lifecycle")
-

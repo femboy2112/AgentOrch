@@ -46,8 +46,10 @@ AGENT_DEFAULTS: Dict[str, Dict[str, object]] = {
 
 # Ordered fallback chains by role. Generator leads with codex (the code writer);
 # critic leads with agy (premium review) then drops to codex when agy is walled.
-GENERATOR_CHAIN: List[str] = ["codex", "agy"]
-CRITIC_CHAIN: List[str] = ["agy", "codex"]
+# Default excludes claude (account-sharing rule per CLAUDE.md §"Account-sharing rule"
+# and dashboard-design.md §8): use codex/agy/grok cycled for generator/critic.
+GENERATOR_CHAIN: List[str] = ["codex", "agy", "grok"]
+CRITIC_CHAIN: List[str] = ["agy", "codex", "grok"]
 
 
 # --- watchdog arming ------------------------------------------------------- #

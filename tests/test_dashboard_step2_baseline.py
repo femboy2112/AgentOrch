@@ -12,7 +12,7 @@ def test_claude_normal_cli_path_uses_json_output_format():
 
 
 def test_default_harness_chains_exclude_claude():
-    assert roles.GENERATOR_CHAIN == ["codex", "agy"]
-    assert roles.CRITIC_CHAIN == ["agy", "codex"]
+    assert roles.GENERATOR_CHAIN == ["codex", "agy", "grok"]
+    assert roles.CRITIC_CHAIN == ["agy", "codex", "grok"]
     assert "claude" not in roles.GENERATOR_CHAIN
     assert "claude" not in roles.CRITIC_CHAIN
