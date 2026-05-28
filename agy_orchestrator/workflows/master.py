@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class MasterWorkflow:
     """
-    Combines Tree of Thought and Adversarial Review to manage and execute 
+    Combines Tree of Thought and Adversarial Review to manage and execute
     large, complex projects accurately.
     """
     def __init__(
@@ -183,13 +183,13 @@ class MasterWorkflow:
             task = tasks[i]
             logger.info(f"--- Executing Step {i+1}/{len(tasks)} ---")
             logger.info(f"Task description: {task[:100]}...")
-            
+
             step_prompt = (
                 f"You are implementing Step {i+1} of a larger project.\n\n"
                 f"Project Context (What has been built so far):\n{project_context}\n\n"
                 f"Current Task to implement NOW:\n{task}"
             )
-            
+
             # Phase A: Tree of Thought (Exploration). Skip entirely when branches<=1
             # — exploring + judging a single branch is pure overhead; go straight to
             # the adversarial refinement of the step prompt (cheap-mode early-exit).
@@ -204,14 +204,14 @@ class MasterWorkflow:
                     self.agent_class(prompt=step_prompt, model=self.model, effort=self.effort)
                     for _ in range(self.branches)
                 ]
-                # Evaluator is sequential, can safely resume main session
-                eval_kwargs = dict(model=self.model, effort="high")
-                if workflow_session_id:
-                    eval_kwargs["session_id"] = workflow_session_id
-                tot_evaluator = self.agent_class(prompt="", **eval_kwargs)
+                # The judge clones this evaluator per branch and scores them in
+                # parallel with independent (sessionless) instances, so do NOT bind
+                # the workflow session here — resuming it would both contaminate
+                # per-branch scoring and pollute the main thread.
+                tot_evaluator = self.agent_class(prompt="", model=self.model, effort="high")
                 tot = TreeOfThought(tot_branches, tot_evaluator, selector=self.selector)
                 best_tot_output = await tot.execute()
-            
+
             # Phase B: Adversarial Review (Refinement) — resume main workflow session
             logger.info("Phase B: Adversarial Review Refinement")
             gen_kwargs = dict(model=self.model, effort=self.effort)
@@ -236,16 +236,16 @@ class MasterWorkflow:
                 adv_prompt = step_prompt
 
             adv_critic = self.agent_class(prompt="", **critic_kwargs)
-            
+
             adv = AdversarialReview(
                 generator_instance=adv_generator,
                 critic_instance=adv_critic,
                 verifier=self.verifier,
                 max_iterations=self.max_iterations
             )
-            
+
             final_step_output = await adv.execute(adv_prompt)
-            
+
             logger.info(f"Step {i+1} Completed. Summarizing for project context.")
             # Summarize the step output to keep project_context compact.
             # Passing full HTML/code outputs into every subsequent prompt balloons to 50KB+.

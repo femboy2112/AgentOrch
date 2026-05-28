@@ -32,7 +32,7 @@ def _is_approved(feedback: str) -> bool:
 class AdversarialReview:
     """
     Executes a continuous loop where a Generator produces output,
-    and a Critic reviews it against specifications. The loop 
+    and a Critic reviews it against specifications. The loop
     continues until the Critic explicitly approves the output.
     """
     def __init__(
@@ -55,7 +55,7 @@ class AdversarialReview:
         self.approved = False
         self.verified = False  # programmatic verifier passed
         self.stalled = False   # bailed early on a repeated critique
-        
+
     async def execute(self, initial_prompt: str) -> str:
         current_prompt = initial_prompt
         last_output = ""
@@ -67,7 +67,7 @@ class AdversarialReview:
 
             self.generator.prompt = current_prompt
             last_output = await self.generator.run_async()
-            
+
             # Programmatic Verification Gate. A passing verifier (tests/lint) is
             # GROUND TRUTH — return immediately rather than falling through to the
             # LLM critic, which can only talk a weak model into REGRESSING output
@@ -91,7 +91,7 @@ class AdversarialReview:
                     f"already works unchanged."
                 )
                 continue
-                    
+
             # LLM Critic Gate
             critic_prompt = (
                 f"Please review the following output against the original requirement.\n"
@@ -113,7 +113,7 @@ class AdversarialReview:
             )
             self.critic.prompt = critic_prompt
             critic_feedback = await self.critic.run_async()
-            
+
             if _is_approved(critic_feedback):
                 logger.info("Critic approved the output.")
                 self.approved = True
@@ -148,6 +148,6 @@ class AdversarialReview:
                 f"Critic Feedback:\n{critic_feedback}\n\n"
                 f"{revise_instruction}"
             )
-            
+
         logger.warning(f"Max iterations ({self.max_iterations}) reached without Critic approval.")
         return last_output

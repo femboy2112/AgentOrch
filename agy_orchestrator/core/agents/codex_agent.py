@@ -37,12 +37,12 @@ class CodexAgent(AgentInstance):
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
         ]
-        
+
         if self.model and self.model != "standard":
             cmd.extend(["--model", self.model])
         elif self.model == "standard":
             cmd.extend(["--model", "gpt-5.3-codex"])
-            
+
         if hasattr(self, "effort") and self.effort:
             effort = "xhigh" if self.effort == "max" else self.effort
             cmd.extend(["-c", f"model_reasoning_effort=\"{effort}\""])

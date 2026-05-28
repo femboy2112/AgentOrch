@@ -6,7 +6,7 @@ class UserProfile:
         self.claude_plan = claude_plan
         self.codex_plan = codex_plan
         self.agy_plan = agy_plan
-        
+
     def get_baseline_effort(self, agent_name: str) -> str:
         """Returns the default starting effort level based on the plan tier."""
         plan = getattr(self, f"{agent_name}_plan", "free").lower()

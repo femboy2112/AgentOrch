@@ -57,9 +57,9 @@ class QualityVerifier:
                 error_msg = f"Command failed with exit code {process.returncode}: {cmd}\n"
                 error_msg += f"-- STDOUT --\n{stdout.decode()}\n"
                 error_msg += f"-- STDERR --\n{stderr.decode()}"
-                
+
                 logger.warning(f"Verification failed:\n{error_msg}")
                 return False, error_msg
-                
+
         logger.info("All verifications passed successfully.")
         return True, "All tests passed successfully."

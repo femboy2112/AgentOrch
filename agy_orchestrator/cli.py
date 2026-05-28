@@ -34,16 +34,16 @@ async def run_adversarial(args, profile):
     agent_class = get_agent_class(args.agent)
     allocator = UsageAwareAllocator(profile, agent_class, args.agent, args.model)
     config = await allocator.get_current_config()
-    
+
     print(f"\n[AdversarialReview] Using {args.agent}:{config['model']}:{config['effort']}\n")
-    
+
     generator = create_agent(agent_class, prompt="", model=config["model"], effort=config["effort"])
     critic = create_agent(agent_class, prompt="", model=config["model"], effort="high")
-    
+
     verifier = None
     if args.test_cmd:
         verifier = QualityVerifier(test_commands=[args.test_cmd])
-        
+
     workflow = AdversarialReview(generator, critic, verifier, max_iterations=args.max_iterations)
     result = await workflow.execute(args.prompt)
     print("\n--- Final Verified Output ---\n")
@@ -53,15 +53,15 @@ async def run_tot(args, profile):
     agent_class = get_agent_class(args.agent)
     allocator = UsageAwareAllocator(profile, agent_class, args.agent, args.model)
     config = await allocator.get_current_config()
-    
+
     print(f"\n[TreeOfThought] Using {args.agent}:{config['model']}:{config['effort']}\n")
-    
+
     branches = [
         create_agent(agent_class, prompt=args.prompt, model=config["model"], effort=config["effort"])
         for _ in range(args.branches)
     ]
     evaluator = create_agent(agent_class, prompt="", model=config["model"], effort="high")
-    
+
     workflow = TreeOfThought(branches, evaluator)
     result = await workflow.execute()
     print("\n--- Best Selected Output ---\n")
@@ -71,7 +71,7 @@ async def run_master(args, profile):
     agent_class = get_agent_class(args.agent)
     allocator = UsageAwareAllocator(profile, agent_class, args.agent, args.model)
     config = await allocator.get_current_config()
-    
+
     print(f"\n[MasterWorkflow] Using {args.agent}:{config['model']}:{config['effort']}\n")
 
     if getattr(args, "fallback", False):
@@ -141,9 +141,9 @@ def main():
     parser.add_argument("--claude-plan", type=str, default="free", help="Claude subscription plan (e.g. '20x max')")
     parser.add_argument("--codex-plan", type=str, default="free", help="Codex subscription plan (e.g. '$100')")
     parser.add_argument("--agy-plan", type=str, default="free", help="Agy subscription plan")
-    
+
     subparsers = parser.add_subparsers(dest="command", required=True)
-    
+
     # Adversarial Subcommand
     adv_parser = subparsers.add_parser("adversarial", help="Run Adversarial Review workflow")
     adv_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
@@ -151,14 +151,14 @@ def main():
     adv_parser.add_argument("--model", type=str, default="standard", help="Base model to use")
     adv_parser.add_argument("--test-cmd", type=str, help="Optional programmatic test command")
     adv_parser.add_argument("--max-iterations", type=int, default=5, help="Max loops")
-    
+
     # Tree of Thought Subcommand
     tot_parser = subparsers.add_parser("tot", help="Run Tree-of-Thought workflow")
     tot_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
     tot_parser.add_argument("--agent", type=str, choices=["agy", "claude", "codex", "grok"], default="agy", help="Agent type to use")
     tot_parser.add_argument("--model", type=str, default="standard", help="Base model to use")
     tot_parser.add_argument("--branches", type=int, default=3, help="Number of ToT branches")
-    
+
     # Master Subcommand
     master_parser = subparsers.add_parser("master", help="Run Master Orchestrator workflow")
     master_parser.add_argument("--prompt", type=str, required=True, help="The goal prompt")
@@ -182,9 +182,9 @@ def main():
     chain_parser.add_argument("--fallback", action=argparse.BooleanOptionalAction, default=True, help="Wrap each stage in usage-exhaustion fallback: primary->agy->claude->codex (cycling). Default on; --no-fallback to disable.")
 
     args = parser.parse_args()
-    
+
     profile = UserProfile(claude_plan=args.claude_plan, codex_plan=args.codex_plan, agy_plan=args.agy_plan)
-    
+
     if args.command == "adversarial":
         asyncio.run(run_adversarial(args, profile))
     elif args.command == "tot":

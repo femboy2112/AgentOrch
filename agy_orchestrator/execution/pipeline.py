@@ -7,12 +7,12 @@ logger = logging.getLogger(__name__)
 
 class LinearPipeline:
     """
-    Executes a sequence of AgentInstances, piping the stdout of one 
+    Executes a sequence of AgentInstances, piping the stdout of one
     into the stdin (as additional prompt context) of the next.
     """
     def __init__(self, instances: List[AgentInstance]):
         self.instances = instances
-        
+
     async def execute(self, initial_input: Optional[str] = None) -> str:
         current_input = initial_input
         for idx, instance in enumerate(self.instances):
@@ -21,12 +21,12 @@ class LinearPipeline:
 
 class ParallelSwarm:
     """
-    Executes multiple AgentInstances concurrently. Useful for exploring 
+    Executes multiple AgentInstances concurrently. Useful for exploring
     multiple paths (like in Tree of Thought) or handling chunked tasks.
     """
     def __init__(self, instances: List[AgentInstance]):
         self.instances = instances
-        
+
     async def execute(self, common_input: Optional[str] = None) -> List[str]:
         tasks = [
             asyncio.create_task(instance.run_async(piped_input=common_input))

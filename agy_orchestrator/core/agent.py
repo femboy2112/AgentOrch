@@ -39,7 +39,7 @@ class AgentInstance(ABC):
         self.additional_flags = additional_flags or {}
         for k, v in kwargs.items():
             setattr(self, k, v)
-        
+
         self.stdout = ""
         self.stderr = ""
         self.returncode: Optional[int] = None
