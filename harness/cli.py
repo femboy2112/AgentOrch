@@ -47,6 +47,10 @@ def _print_result(result) -> None:
         iters = result.quality.get("iterations_used")
         extra = f" ({iters} iter)" if iters else ""
         print(f"  confidence: {col}{conf}{C_RESET}{extra} — {result.quality.get('note','')}")
+        delta = result.quality.get("verifier_delta")
+        if delta:
+            dcol = C_GREEN if delta == "fixed" else (C_YELLOW if delta in ("preserved", "unchanged") else C_RED)
+            print(f"  verifier  : {dcol}{delta}{C_RESET}")
     if result.error:
         print(f"  {C_RED}error     : {result.error}{C_RESET}")
     if result.changed_files:
