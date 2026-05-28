@@ -1,9 +1,10 @@
+import asyncio
 import copy
 import logging
-import asyncio
 import re
 from collections import Counter
 from typing import Dict, List, Tuple
+
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.pipeline import ParallelSwarm
 

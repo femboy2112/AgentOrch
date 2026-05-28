@@ -13,7 +13,6 @@ critiques at once makes it regress. Returns as soon as the verifier passes.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.verifier import QualityVerifier

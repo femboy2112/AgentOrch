@@ -1,9 +1,10 @@
+import asyncio
 import json
 import logging
 import os
 import re
 import tempfile
-from typing import Optional, List
+from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 
@@ -45,9 +46,9 @@ class GrokAgent(AgentInstance):
     async def get_available_models(cls) -> List[str]:
         """Query `grok models`; fall back to the known default on any error."""
         try:
-            process = await _asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 "grok", "models",
-                stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await process.communicate()
             if process.returncode == 0:

@@ -1,7 +1,6 @@
-import sys
 import asyncio
 import logging
-from typing import Optional
+import sys
 
 logger = logging.getLogger(__name__)
 

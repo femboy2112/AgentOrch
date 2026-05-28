@@ -4,7 +4,7 @@ import os
 import random
 import sys
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

@@ -49,5 +49,5 @@ def test_timeout_disabled_when_zero(monkeypatch):
 
     agent = _Echo(prompt="x")
     agent.timeout = 0
-    out = asyncio.run(agent.run_async())
+    asyncio.run(agent.run_async())
     assert agent.returncode == 0

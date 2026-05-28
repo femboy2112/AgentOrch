@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import Optional
+
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.verifier import QualityVerifier
 

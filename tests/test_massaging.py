@@ -81,6 +81,7 @@ def test_score_parsing_handles_fraction_and_chatter():
 def test_parallel_swarm_tolerates_a_failed_branch():
     """ToT/Master must survive one branch crashing — survivors still selected."""
     import asyncio as _a
+
     from agy_orchestrator.execution.pipeline import ParallelSwarm
 
     class _Boom(_CannedAgent):
@@ -206,6 +207,7 @@ def test_diff_only_changes_revise_prompt():
 def test_test_feedback_loops_until_verifier_passes():
     """TestFeedbackWorkflow: generator revises until the verifier (strong oracle) passes."""
     import asyncio as _a
+
     from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
 
     gen = _ScriptedCritic(["bad code v1", "good code v2"])
@@ -222,6 +224,7 @@ def test_test_feedback_loops_until_verifier_passes():
 
 def test_test_feedback_requires_verifier():
     import pytest
+
     from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
     with pytest.raises(ValueError):
         TestFeedbackWorkflow(_CannedAgent("x"), None)
@@ -242,6 +245,7 @@ def test_adversarial_stalls_on_repeated_critique():
 def test_cascade_escalates_to_stronger_stage():
     """Cheap stage fails the verifier; cascade escalates to the strong stage that passes."""
     import asyncio as _a
+
     from agy_orchestrator.workflows.cascade import CascadeWorkflow
 
     cheap = _CannedAgent("cheap attempt")   # never passes
@@ -264,6 +268,7 @@ def test_cascade_escalates_to_stronger_stage():
 
 def test_cascade_requires_verifier():
     import pytest
+
     from agy_orchestrator.workflows.cascade import CascadeWorkflow
     with pytest.raises(ValueError):
         CascadeWorkflow([_CannedAgent("x")], None)

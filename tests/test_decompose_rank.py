@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 
 from agy_orchestrator.core.agent import AgentInstance
-from agy_orchestrator.workflows.generate_and_rank import GenerateAndRankWorkflow
 from agy_orchestrator.workflows.decompose import AdaptiveDecomposer
+from agy_orchestrator.workflows.generate_and_rank import GenerateAndRankWorkflow
 
 
 # --------------------------------------------------------------------------- #
@@ -206,7 +206,6 @@ def test_decompose_overall_fails_if_any_subtask_fails():
 
 def test_decompose_respects_max_depth():
     """A task that always fails stops recursing at max_depth."""
-    depths_seen = []
 
     def solve_one(task):
         return ("nope", False)  # everything fails -> always tries to decompose

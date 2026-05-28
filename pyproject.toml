@@ -27,7 +27,9 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-# Pragmatic default set + a few quality lints surfaced by the audit:
-# F541 (f-string w/o placeholders), G004 (f-string in logging), and the basics.
-select = ["E", "F", "W", "I", "G004", "F541"]
+# Enforced baseline: pyflakes (F), pycodestyle (E/W), import order (I), and
+# F541 (empty f-strings). `ruff check` is clean against this set.
+select = ["E", "F", "W", "I", "F541"]
 ignore = ["E501"]  # long lines: wrap opportunistically, don't fail the build on them
+# Opt-in extras (run `ruff check --extend-select G004` to also flag the ~19
+# logging f-strings — a minor eager-eval style nit, left out of the gate).

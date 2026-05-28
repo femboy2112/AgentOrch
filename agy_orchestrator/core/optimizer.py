@@ -1,7 +1,8 @@
 import logging
-from typing import Dict, Any, Type
-from agy_orchestrator.core.profile import UserProfile
+from typing import Any, Dict, Type
+
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.profile import UserProfile
 
 logger = logging.getLogger(__name__)
 

@@ -265,8 +265,8 @@ async def run(args) -> None:
     names = args.tasks or list(ALL_TASKS)
     workers = args.workers
     model_of = _describe_models(workers)
-    print(f"cloud code-quality bench — single-shot, hidden-pytest graded")
-    print(f"workers: " + ", ".join(f"{w} ({model_of[w]})" for w in workers))
+    print("cloud code-quality bench — single-shot, hidden-pytest graded")
+    print("workers: " + ", ".join(f"{w} ({model_of[w]})" for w in workers))
     print(f"tasks:   {len(names)}  ({sum(t in EASY for t in names)} easy, "
           f"{sum(t not in EASY for t in names)} hard)   timeout={int(os.environ.get('AGY_TIMEOUT','0'))}s\n")
 
@@ -307,7 +307,7 @@ async def run(args) -> None:
         print(f"{w:10} {f'{easy_ok}/{n_easy}':>7} {f'{hard_ok}/{n_hard}':>7} "
               f"{f'{total}/{len(names)}':>7} {avg:7.0f}")
     rankable.sort(reverse=True)
-    print(f"\nranking (total, then hard, then speed): "
+    print("\nranking (total, then hard, then speed): "
           + " > ".join(r[3] for r in rankable))
 
 

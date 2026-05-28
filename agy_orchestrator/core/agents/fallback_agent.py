@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Type
 
-from agy_orchestrator.core.agent import AgentInstance, USAGE_MARKERS
+from agy_orchestrator.core.agent import USAGE_MARKERS, AgentInstance
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
 

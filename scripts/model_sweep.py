@@ -29,11 +29,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.cloud_eval import EASY_TASKS, HARD_TASKS, extract_code, run_test, CLOUD_SUFFIX
-from agy_orchestrator.core.agents.codex_agent import CodexAgent
-from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
-from agy_orchestrator.core.agents.grok_agent import GrokAgent
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
+from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
+from agy_orchestrator.core.agents.codex_agent import CodexAgent
+from agy_orchestrator.core.agents.grok_agent import GrokAgent
+from scripts.cloud_eval import CLOUD_SUFFIX, EASY_TASKS, HARD_TASKS, extract_code, run_test
 
 ALL_TASKS = {**EASY_TASKS, **HARD_TASKS}
 

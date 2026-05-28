@@ -12,7 +12,6 @@ parallel agy branches run one-at-a-time while pinned (the price of agy's global
 model selection). Runs that don't request a known model skip all of this and use
 agy's current default.
 """
-from typing import Optional, Dict, List
 import asyncio
 import fcntl
 import json
@@ -20,6 +19,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import Dict, List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 

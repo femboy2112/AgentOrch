@@ -15,7 +15,6 @@ import argparse
 import json
 import logging
 import sys
-from pathlib import Path
 
 from harness import roles
 from harness.dispatch import RUNS_DIR, dispatch
@@ -59,7 +58,7 @@ def _print_result(result) -> None:
     else:
         print(f"  {C_YELLOW}changed   : (no files changed on disk){C_RESET}")
     print(f"  artifacts : {result.run_dir}/")
-    print(f"              prompt.txt  stdout.log  stderr.log  changed-files.diff  meta.json")
+    print("              prompt.txt  stdout.log  stderr.log  changed-files.diff  meta.json")
 
 
 def _cmd_do(args) -> int:

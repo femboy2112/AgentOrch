@@ -1,5 +1,7 @@
-from typing import Optional, List
+from typing import List, Optional
+
 from agy_orchestrator.core.agent import AgentInstance
+
 
 class CodexAgent(AgentInstance):
     @classmethod
@@ -16,7 +18,7 @@ class CodexAgent(AgentInstance):
 
     def filter_stderr(self, stderr: str) -> str:
         lines = stderr.splitlines()
-        filtered = [l for l in lines if "network" not in l.lower() and "timeout" not in l.lower()]
+        filtered = [ln for ln in lines if "network" not in ln.lower() and "timeout" not in ln.lower()]
         return "\n".join(filtered)
 
     def _full_prompt(self, piped_input: Optional[str] = None) -> str:

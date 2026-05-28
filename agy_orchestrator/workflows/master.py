@@ -1,11 +1,10 @@
-import logging
-import json
-import os
 import hashlib
-from typing import Optional, List, Tuple
+import json
+import logging
+import os
+from typing import List, Optional, Tuple
 
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
-from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.adversarial import AdversarialReview
 from agy_orchestrator.workflows.tree_of_thought import TreeOfThought
