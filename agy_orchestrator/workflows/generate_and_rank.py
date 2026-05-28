@@ -25,6 +25,10 @@ each of the K candidates independently. Therefore:
     so for K>1 the verifier only sets the ``self.verified`` signal on whatever is
     currently on disk — it does NOT reorder candidates. This keeps the semantics
     correct rather than pretending to verify text that was never applied.
+  * K  > 1 + execution selector -> for code tasks we can lift this limitation by
+    executing EACH candidate in its own fresh sandbox. That per-candidate
+    isolation makes execution-based ranking sound again, so pass-count ranking can
+    replace text-only LLM judging.
 
 In short: the verifier is exploited as a true gate exactly when it can be (K==1),
 and the judge ranks the text otherwise. This is honest about what disk state lets
@@ -38,6 +42,7 @@ import logging
 from typing import List, Optional, Tuple
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.execution.execution_selector import ExecutionSelector
 from agy_orchestrator.execution.pipeline import ParallelSwarm
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.tree_of_thought import _parse_score, build_judge_prompt
@@ -68,6 +73,7 @@ class GenerateAndRankWorkflow:
         generator_instances: List[AgentInstance],
         verifier: Optional[QualityVerifier] = None,
         ranker: Optional[AgentInstance] = None,
+        execution_selector: Optional[ExecutionSelector] = None,
         working_directory: str = ".",
     ):
         if not generator_instances:
@@ -75,6 +81,7 @@ class GenerateAndRankWorkflow:
         self.generators = generator_instances
         self.verifier = verifier
         self.ranker = ranker
+        self.execution_selector = execution_selector
         self.working_directory = working_directory
         # Signals for the run ledger (task #9).
         self.verified = False
@@ -115,6 +122,22 @@ class GenerateAndRankWorkflow:
         """K > 1: rank candidate TEXT with the judge (disk verification is unsound
         across un-isolated candidates). A verifier, if present, is run once only to
         set the ``verified`` signal on the artifact currently on disk."""
+        if self.execution_selector is not None:
+            logger.info("GenerateAndRank: ranking %d candidates by execution...",
+                        len(candidates))
+            best_index, scores = await self.execution_selector.select(candidates)
+            for idx, (passed, total) in enumerate(scores):
+                logger.info("GenerateAndRank: candidate %d execution score = %d/%d.",
+                            idx + 1, passed, total)
+            best_passed, best_total = scores[best_index]
+            self.verified = best_total > 0 and best_passed == best_total
+            self.n_passed = sum(
+                1 for passed, total in scores if total > 0 and passed == total
+            )
+            logger.info("GenerateAndRank: selected candidate %d by execution score %d/%d.",
+                        best_index + 1, best_passed, best_total)
+            return candidates[best_index]
+
         if self.ranker is not None:
             best = await self._rank_by_judge(candidates)
         else:

@@ -17,6 +17,11 @@ venv/
 # Harness run artifacts (logs/diffs per dispatch — not source)
 runs/
 
+# Bench-worker leftovers if cwd-isolation in scripts/token_efficiency.py ever
+# regresses (mod_*.py + pipeline.py are synthesized task names from task_synth.py).
+/mod_*.py
+/pipeline.py
+
 # Worker-CLI residue (agy drops a symlink into ~/.gemini)
 .antigravitycli/
 .tlica_state/

@@ -229,8 +229,104 @@ HARD_TASKS = {
     ),
 }
 
-ALL_TASKS = {**EASY_TASKS, **HARD_TASKS}
+# --- "brutal" tier: subtle algorithmic edge cases where frontier models diverge ---
+# These exist to find a QUALITY frontier — the easy+hard tiers are saturated (every
+# strong model scores 100%), so latency was the only differentiator. Each task has a
+# notorious failure mode (truncate-toward-zero division, regex DP, sliding-window
+# bookkeeping, '0'-decoding, greedy two-pass) and adversarial hidden tests. Every
+# grader is verified: a correct reference solution passes its full suite.
+BRUTAL_TASKS = {
+    "calc3": (
+        "Write a Python function `calc(expr: str) -> int` that evaluates an arithmetic "
+        "expression with +, -, *, / operators, parentheses, UNARY minus (e.g. -(3+4) and "
+        "leading/embedded negatives), and arbitrary spaces. Standard precedence (* and / "
+        "bind tighter than + and -), left-to-right. Integer division TRUNCATES TOWARD ZERO "
+        "(so (0-3)/2 == -1, NOT -2). Operands and results may be negative.",
+        """
+        from solution import calc
+        def test_calc():
+            assert calc("1+1")==2
+            assert calc("2*(5-(3+2))")==0
+            assert calc("14-3/2")==13
+            assert calc("(0-3)/2")==-1
+            assert calc("-2+ 1")==-1
+            assert calc("2*(5-(3+2)/2)")==6
+            assert calc("-(3+4)*2")==-14
+            assert calc("100/3")==33
+        """,
+    ),
+    "regex_match": (
+        "Write a Python function `is_match(s: str, p: str) -> bool` implementing regular "
+        "expression matching over the ENTIRE string s, supporting '.' (matches any single "
+        "character) and '*' (matches zero or more of the PRECEDING element). The match must "
+        "cover all of s, not a substring.",
+        """
+        from solution import is_match
+        def test_rx():
+            assert is_match("aa","a") is False
+            assert is_match("aa","a*") is True
+            assert is_match("ab",".*") is True
+            assert is_match("aab","c*a*b") is True
+            assert is_match("mississippi","mis*is*p*.") is False
+            assert is_match("mississippi","mis*is*ip*.") is True
+            assert is_match("","") is True
+            assert is_match("","c*") is True
+        """,
+    ),
+    "min_window": (
+        "Write a Python function `min_window(s: str, t: str) -> str` returning the minimum "
+        "window substring of s that contains every character of t including duplicates (in "
+        "any order). If there is no such window, return the empty string. If s or t is empty, "
+        "return the empty string. The answer is guaranteed unique when it exists.",
+        """
+        from solution import min_window
+        def test_mw():
+            assert min_window("ADOBECODEBANC","ABC")=="BANC"
+            assert min_window("a","a")=="a"
+            assert min_window("a","aa")==""
+            assert min_window("aa","aa")=="aa"
+            assert min_window("ab","b")=="b"
+            assert min_window("cabwefgewcwaefgcf","cae")=="cwae"
+        """,
+    ),
+    "decode_ways": (
+        "Write a Python function `num_decodings(s: str) -> int` that counts the ways to "
+        "decode a digit string where '1'->'A' ... '26'->'Z'. A '0' has no mapping and is "
+        "only valid as part of '10' or '20'. Leading zeros in a two-digit group are invalid "
+        "(e.g. '06' is not 6). Return 0 for any string that cannot be decoded.",
+        """
+        from solution import num_decodings
+        def test_dw():
+            assert num_decodings("12")==2
+            assert num_decodings("226")==3
+            assert num_decodings("06")==0
+            assert num_decodings("0")==0
+            assert num_decodings("10")==1
+            assert num_decodings("100")==0
+            assert num_decodings("2101")==1
+            assert num_decodings("27")==1
+        """,
+    ),
+    "candy": (
+        "Write a Python function `candy(ratings: list[int]) -> int` returning the minimum "
+        "number of candies to distribute to children in a line such that each child gets at "
+        "least one candy and any child with a strictly higher rating than an ADJACENT "
+        "neighbor gets strictly more candies than that neighbor.",
+        """
+        from solution import candy
+        def test_candy():
+            assert candy([1,0,2])==5
+            assert candy([1,2,2])==4
+            assert candy([1,3,2,2,1])==7
+            assert candy([1,2,87,87,87,2,1])==13
+            assert candy([5])==1
+        """,
+    ),
+}
+
+ALL_TASKS = {**EASY_TASKS, **HARD_TASKS, **BRUTAL_TASKS}
 EASY = set(EASY_TASKS)
+BRUTAL = set(BRUTAL_TASKS)
 
 # Cloud workers are agentic (they default to editing files / running tools). For
 # a pure generation bench we forbid that and demand a single fenced block.
@@ -282,8 +378,8 @@ async def run(args) -> None:
             results[r["worker"]][task] = r
             mark = "PASS" if r["ok"] else "FAIL"
             cells.append(f"{r['worker']}=[{mark}] {r['t']:4.0f}s")
-        tag = "easy" if task in EASY else "HARD"
-        print(f"{task:16} {tag}  " + " | ".join(cells))
+        tag = "easy" if task in EASY else ("BRUTAL" if task in BRUTAL else "HARD")
+        print(f"{task:16} {tag:6}  " + " | ".join(cells))
         for r in rows:
             if not r["ok"] and r["tail"]:
                 why = "EMPTY OUTPUT" if r["empty"] else r["tail"]

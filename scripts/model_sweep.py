@@ -33,9 +33,16 @@ from agy_orchestrator.core.agents.agy_agent import AgyAgent
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
-from scripts.cloud_eval import CLOUD_SUFFIX, EASY_TASKS, HARD_TASKS, extract_code, run_test
+from scripts.cloud_eval import (
+    BRUTAL_TASKS,
+    CLOUD_SUFFIX,
+    EASY_TASKS,
+    HARD_TASKS,
+    extract_code,
+    run_test,
+)
 
-ALL_TASKS = {**EASY_TASKS, **HARD_TASKS}
+ALL_TASKS = {**EASY_TASKS, **HARD_TASKS, **BRUTAL_TASKS}
 
 # Default sweep grid (worker, model, effort). Kept modest to bound cost; expand
 # via --grid. Models/efforts are the empirically-verified ones (verified_models.md).
@@ -119,6 +126,11 @@ async def main() -> None:
                     help="combos as worker:model[:effort] (default: built-in grid)")
     ap.add_argument("--timeout", type=int, default=300, help="per-call ceiling (AGY_TIMEOUT)")
     ap.add_argument("--out", default="/tmp/agentorch_research/sweep_results.jsonl")
+    ap.add_argument("--sequential", action="store_true",
+                    help="run tasks ONE AT A TIME (no within-combo concurrency) — for clean "
+                         "per-call latency measurement free of self-contention")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="repeats per (combo,task); the scoreboard averages all runs")
     args = ap.parse_args()
     os.environ["AGY_TIMEOUT"] = str(args.timeout)
 
@@ -139,10 +151,14 @@ async def main() -> None:
 
     for worker, model, effort in grid:
         key = label_of(worker, model, effort)
-        rows = await asyncio.gather(*[
-            run_one(worker, model, effort, t, ALL_TASKS[t][0], ALL_TASKS[t][1])
-            for t in args.tasks
-        ])
+        calls = [(worker, model, effort, t, ALL_TASKS[t][0], ALL_TASKS[t][1])
+                 for t in args.tasks for _ in range(args.repeats)]
+        if args.sequential:
+            # One call at a time: the only honest way to measure per-call latency,
+            # since concurrent calls to the same backend queue/throttle each other.
+            rows = [await run_one(*c) for c in calls]
+        else:
+            rows = await asyncio.gather(*[run_one(*c) for c in calls])
         for r in rows:
             outf.write(json.dumps(r) + "\n")
             results.append(r)
