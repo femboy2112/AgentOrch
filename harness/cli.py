@@ -119,8 +119,8 @@ def _cmd_show(args) -> int:
 
 def _cmd_dashboard(args) -> int:
     cmd = [sys.executable, "-m", "dashboard", "--port", str(args.port)]
-    if args.no_browser:
-        cmd.append("--no-browser")
+    if args.browser:
+        cmd.append("--browser")
     os.execvp(cmd[0], cmd)
     return 1
 
@@ -177,7 +177,12 @@ def main(argv=None) -> int:
 
     dashboard = sub.add_parser("dashboard", help="Launch the AgentOrch control dashboard")
     dashboard.add_argument("--port", type=int, default=8765, help="Dashboard port (default: 8765)")
-    dashboard.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser tab")
+    dashboard.add_argument("--browser", action="store_true",
+                           help="Open the dashboard in the default browser. Off by default — "
+                                "the dashboard is dev/automation-driven; auto-opening a tab on "
+                                "every boot is a footgun (see dashboard/__main__.py).")
+    dashboard.add_argument("--no-browser", action="store_true",
+                           help="(deprecated no-op; not opening a browser is now the default)")
     dashboard.set_defaults(func=_cmd_dashboard)
 
     args = parser.parse_args(argv)

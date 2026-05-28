@@ -4,10 +4,15 @@ Single-user localhost dashboard for dispatch control, live reasoning streams, an
 
 ## Launch
 
-- Direct: `python -m dashboard`
-- Harness entrypoint: `python -m harness dashboard`
-- Headless/local CI smoke: `python -m dashboard --no-browser`
+- Direct: `python -m dashboard` (does NOT open a browser by default)
+- Open the page in your browser too: `python -m dashboard --browser`
+- Harness entrypoint: `python -m harness dashboard [--browser]`
 - Default bind: `127.0.0.1:8765`
+
+> **Why opt-in?** A previous default of auto-opening the browser caused a
+> master-mode worker smoke-testing the dashboard across 8 phases to spawn
+> enough Firefox windows to wedge a workstation. Browser launch is now
+> explicit. `--no-browser` is accepted as a deprecated no-op for back-compat.
 
 ## Core Pages
 
