@@ -20,6 +20,7 @@ from typing import List, Optional
 import pytest
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.execution.verifier import VerifierResult
 from harness import dispatch as dispatch_mod
 from harness import roles
 
@@ -187,7 +188,13 @@ def test_verifier_runs_in_out_dir_not_project_root(tmp_path, monkeypatch):
             self.test_commands = test_commands or []
         async def verify(self, working_directory: str):
             seen_cwds.append(working_directory)
-            return True, "ok"
+            return VerifierResult(
+                ok=True,
+                message="ok",
+                returncode=0,
+                cmd="stub",
+                duration_ms=0,
+            )
 
     # Force adversarial mode to use our capturing verifier.
     from agy_orchestrator.execution import verifier as verifier_mod

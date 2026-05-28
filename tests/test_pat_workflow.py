@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 import pytest
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.execution.verifier import VerifierResult
 from agy_orchestrator.workflows.pat import PatWorkflow
 
 
@@ -42,7 +43,7 @@ class _StubGenerator(AgentInstance):
 
 
 class _ScriptedVerifier:
-    """Returns scripted (success, message) tuples per call. The whole point is
+    """Returns scripted outcomes per call. The whole point is
     to control whether Stage 1 'passes' and Stage 2 ever runs."""
 
     def __init__(self, results: List[Tuple[bool, str]]):
@@ -50,11 +51,17 @@ class _ScriptedVerifier:
         self._idx = 0
         self.calls = 0
 
-    async def verify(self, working_directory: str) -> Tuple[bool, str]:
+    async def verify(self, working_directory: str) -> VerifierResult:
         self.calls += 1
-        result = self._results[min(self._idx, len(self._results) - 1)]
+        ok, message = self._results[min(self._idx, len(self._results) - 1)]
         self._idx += 1
-        return result
+        return VerifierResult(
+            ok=ok,
+            message=message,
+            returncode=0 if ok else 1,
+            cmd="stub",
+            duration_ms=0,
+        )
 
 
 class _StubMaster:
@@ -180,7 +187,13 @@ def test_working_directory_propagates_to_verifier():
     class _CwdRecordingVerifier:
         async def verify(self, working_directory: str):
             seen_cwds.append(working_directory)
-            return True, "ok"
+            return VerifierResult(
+                ok=True,
+                message="ok",
+                returncode=0,
+                cmd="stub",
+                duration_ms=0,
+            )
 
     wf = PatWorkflow(
         direct_generator=gen, master_workflow=master,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.execution.verifier import VerifierResult
 from agy_orchestrator.workflows.decompose import AdaptiveDecomposer
 from agy_orchestrator.workflows.generate_and_rank import GenerateAndRankWorkflow
 
@@ -63,7 +64,13 @@ def test_rank_single_candidate_verifier_gate_passes():
 
     class _Verifier:
         async def verify(self, working_directory="."):
-            return (True, "")
+            return VerifierResult(
+                ok=True,
+                message="",
+                returncode=0,
+                cmd="stub",
+                duration_ms=0,
+            )
 
     gen = _CannedAgent("the only candidate")
     wf = GenerateAndRankWorkflow([gen], verifier=_Verifier())
@@ -79,7 +86,13 @@ def test_rank_single_candidate_verifier_gate_fails():
 
     class _Verifier:
         async def verify(self, working_directory="."):
-            return (False, "AssertionError: x != y")
+            return VerifierResult(
+                ok=False,
+                message="AssertionError: x != y",
+                returncode=1,
+                cmd="stub",
+                duration_ms=0,
+            )
 
     gen = _CannedAgent("broken candidate")
     wf = GenerateAndRankWorkflow([gen], verifier=_Verifier())
