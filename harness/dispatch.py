@@ -165,9 +165,10 @@ async def _run_workflow(
     raise ValueError(f"unknown mode: {mode}")
 
 
-def dispatch(
+async def dispatch_async(
     instruction: str,
     *,
+    run_id: Optional[str] = None,
     mode: str = "adversarial",
     context: Optional[str] = None,
     generator_chain: Optional[List[str]] = None,
@@ -180,12 +181,12 @@ def dispatch(
     web_search: bool = False,
     dashboard_stream_json: bool = False,
 ) -> DispatchResult:
-    """Execute one instruction and capture the run. Synchronous entrypoint."""
+    """Execute one instruction and capture the run."""
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
     critic_chain = critic_chain or list(roles.CRITIC_CHAIN)
     codex_config = ["tools.web_search=true"] if web_search else None
 
-    run_id = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    run_id = run_id or _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     events_path = run_dir / "events.jsonl"
@@ -255,13 +256,13 @@ def dispatch(
     output = ""
     workflow = None
     try:
-        output, workflow = asyncio.run(_run_workflow(
+        output, workflow = await _run_workflow(
             mode, prompt,
             generator_chain=generator_chain, critic_chain=critic_chain,
             fallback=fallback, cycles=cycles, max_iterations=max_iterations,
             branches=branches, verifier=verifier, codex_config=codex_config,
             post_construct_hook=_post_construct_hook,
-        ))
+        )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
         error = f"{type(exc).__name__}: {exc}"
@@ -314,3 +315,39 @@ def dispatch(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
     )
     return result
+
+
+def dispatch(
+    instruction: str,
+    *,
+    run_id: Optional[str] = None,
+    mode: str = "adversarial",
+    context: Optional[str] = None,
+    generator_chain: Optional[List[str]] = None,
+    critic_chain: Optional[List[str]] = None,
+    fallback: bool = True,
+    cycles: int = 2,
+    max_iterations: int = 5,
+    branches: int = 3,
+    test_cmd: Optional[str] = None,
+    web_search: bool = False,
+    dashboard_stream_json: bool = False,
+) -> DispatchResult:
+    """Execute one instruction and capture the run. Synchronous entrypoint."""
+    return asyncio.run(
+        dispatch_async(
+            instruction,
+            run_id=run_id,
+            mode=mode,
+            context=context,
+            generator_chain=generator_chain,
+            critic_chain=critic_chain,
+            fallback=fallback,
+            cycles=cycles,
+            max_iterations=max_iterations,
+            branches=branches,
+            test_cmd=test_cmd,
+            web_search=web_search,
+            dashboard_stream_json=dashboard_stream_json,
+        )
+    )
