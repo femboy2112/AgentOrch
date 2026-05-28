@@ -62,28 +62,38 @@ class EventBus:
         def _publish(event: dict) -> None:
             if run_id in self.closed:
                 return
+            
             payload = dict(event or {})
-            payload["ts"] = float(payload.get("ts") or time.time())
-            payload["run_id"] = run_id
-            payload["worker"] = payload.get("worker") or worker
-            payload["model"] = payload.get("model") or model or "n/a"
-            payload["effort"] = payload.get("effort") or effort or "n/a"
-            payload["branch"] = payload.get("branch", branch)
             kind = str(payload.get("kind") or "stderr")
-            payload["kind"] = kind if kind in _WORKER_EVENT_KINDS else "stderr"
-            payload["text"] = payload.get("text", "")
-            if payload.get("data") is None or "data" not in payload or not isinstance(payload.get("data"), dict):
-                payload["data"] = {}
+            kind = kind if kind in _WORKER_EVENT_KINDS else "stderr"
+            data = payload.get("data", {})
+            if not isinstance(data, dict):
+                data = {}
+
+            clean_event = {
+                "ts": float(payload.get("ts") or time.time()),
+                "run_id": run_id,
+                "worker": payload.get("worker") or worker,
+                "model": payload.get("model") or model or "n/a",
+                "effort": payload.get("effort") or effort or "n/a",
+                "branch": payload.get("branch", branch),
+                "kind": kind,
+                "text": payload.get("text", ""),
+                "data": data,
+            }
 
             event_id = int(payload.get("_event_id", self._next_ids[run_id]))
-            payload["_event_id"] = event_id
+            
+            # Internal _event_id is needed for queues but stripped before yielding/sinking
+            internal_event = dict(clean_event)
+            internal_event["_event_id"] = event_id
+            
             self._next_ids[run_id] = max(self._next_ids[run_id], event_id + 1)
-            self.queues[run_id].append(payload)
+            self.queues[run_id].append(internal_event)
 
-            clean = {k: v for k, v in payload.items() if k != "_event_id"}
             for sink in list(self.sinks.get(run_id, [])):
                 try:
-                    sink(clean)
+                    sink(clean_event)
                 except Exception:
                     pass
             try:
