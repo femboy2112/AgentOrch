@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.calibration import append_live_row
 from agy_orchestrator.execution.ledger import build_ledger
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.adversarial import AdversarialReview
@@ -354,6 +355,41 @@ async def dispatch_async(
         produced_output=bool(output and output.strip()),
     )
     logger.info("Dispatch %s | confidence=%s (%s)", run_id, quality["confidence"], quality["note"])
+
+    # Close the calibration loop: every verified dispatch contributes one
+    # observation to the live ledger that CalibrationTable.load() reads on
+    # next process start. Only verified runs count — matching the offline
+    # sweep's gate, so a critic-approved-but-tests-failed run doesn't
+    # pollute the routing baselines. We use the lead generator worker as
+    # the key; multi-stage modes (cascade, pat, master) inherit it.
+    if quality.get("confidence") == "verified":
+        lead_token = generator_chain[0]
+        lead_cfg = roles.AGENT_DEFAULTS.get(lead_token, {})
+        effort_val = lead_cfg.get("effort")
+        effort = str(effort_val) if effort_val not in (None, "n/a") else None
+        # workflow may not surface wall_ms/out_bytes if the agent ran via
+        # the non-streaming path; this is best-effort and falls open.
+        wall_ms_value: Optional[float] = (duration * 1000.0) if duration else None
+        out_bytes_value: Optional[int] = None
+        # Prefer per-agent telemetry when the workflow exposes it.
+        if workflow is not None:
+            agent_for_telemetry = (
+                getattr(workflow, "direct_generator", None)
+                or getattr(workflow, "generator", None)
+            )
+            if agent_for_telemetry is not None:
+                out_bytes_value = getattr(agent_for_telemetry, "last_out_bytes", None)
+                agent_wall = getattr(agent_for_telemetry, "last_wall_ms", None)
+                if agent_wall is not None:
+                    wall_ms_value = float(agent_wall)
+        append_live_row(
+            worker=lead_token,
+            model=str(lead_cfg.get("model", "") or ""),
+            effort=effort,
+            ok=True,
+            out_bytes=out_bytes_value,
+            wall_ms=wall_ms_value,
+        )
 
     after = take_snapshot(work_dir)
     diff = diff_snapshots(before, after)
