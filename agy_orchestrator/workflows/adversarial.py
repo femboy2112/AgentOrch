@@ -81,8 +81,8 @@ class AdversarialReview:
             # LLM critic, which can only talk a weak model into REGRESSING output
             # that already passes ("Small LMs Need Strong Verifiers", 2404.17140).
             if self.verifier:
-                success, error_msg = await self.verifier.verify(working_directory=self.working_directory)
-                if success:
+                result = await self.verifier.verify(working_directory=self.working_directory)
+                if result.ok:
                     logger.info("Programmatic verification passed — accepting (no critic pass needed).")
                     self.verified = True
                     self.approved = True
@@ -93,7 +93,7 @@ class AdversarialReview:
                 # test-feedback loop in workflows/test_feedback.py).
                 current_prompt = (
                     f"{initial_prompt}\n\nYour last output:\n{last_output}\n\n"
-                    f"It FAILED verification with this error:\n{error_msg}\n\n"
+                    f"It FAILED verification with this error:\n{result.message}\n\n"
                     f"Fix ONLY what the error indicates and output the complete corrected "
                     f"version. Re-read the requirement for edge cases; keep everything that "
                     f"already works unchanged."

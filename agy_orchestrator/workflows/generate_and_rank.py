@@ -108,14 +108,14 @@ class GenerateAndRankWorkflow:
     async def _rank_single(self, candidate: str) -> str:
         """K == 1: use the verifier as a true gate on the resident artifact."""
         if self.verifier is not None:
-            success, error_msg = await self.verifier.verify(working_directory=self.working_directory)
-            self.verified = success
-            self.n_passed = 1 if success else 0
-            if success:
+            result = await self.verifier.verify(working_directory=self.working_directory)
+            self.verified = result.ok
+            self.n_passed = 1 if result.ok else 0
+            if result.ok:
                 logger.info("GenerateAndRank: sole candidate passed the verifier gate.")
             else:
                 logger.info("GenerateAndRank: sole candidate failed the verifier: %s",
-                            error_msg or "(no detail)")
+                            result.message or "(no detail)")
         return candidate
 
     async def _rank_many(self, candidates: List[str]) -> str:
@@ -147,9 +147,9 @@ class GenerateAndRankWorkflow:
         # The verifier cannot reorder un-isolated candidates, but we still report
         # whether whatever is currently on disk passes, for the ledger.
         if self.verifier is not None:
-            success, _ = await self.verifier.verify(working_directory=self.working_directory)
-            self.verified = success
-            self.n_passed = 1 if success else 0
+            result = await self.verifier.verify(working_directory=self.working_directory)
+            self.verified = result.ok
+            self.n_passed = 1 if result.ok else 0
         return best
 
     async def _rank_by_judge(self, candidates: List[str]) -> str:

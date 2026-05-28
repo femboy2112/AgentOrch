@@ -289,6 +289,42 @@ def check_chains_cross_family(
     )
 
 
+def check_agy_parallelism_warning(
+    mode: str, generator_chain: List[str], branches: int
+) -> Optional[str]:
+    """Warn when a high-parallel mode would spawn ≥2 agy candidates.
+
+    Agy's CLI pins ~/.gemini/settings.json via a cross-process file lock to
+    keep its single-call model selection safe. Two agy candidates running in
+    parallel serialize on that lock — the parallelism gain of vote/tot is
+    lost. Cross-provider chains (codex,agy,grok) are unaffected because
+    only ONE candidate per dispatch lands on agy.
+
+    Disable via env var AGY_PARALLELISM_CHECK=off."""
+    if os.environ.get("AGY_PARALLELISM_CHECK", "").lower() == "off":
+        return None
+    if mode not in ("vote", "tot"):
+        return None
+    # vote rotates through generator_chain. tot uses the master agent_class
+    # (the lead provider). For both, count how many of the first 'branches'
+    # slots would land on agy.
+    if not generator_chain:
+        return None
+    k = max(1, branches)
+    agy_slots = sum(
+        1 for i in range(k) if generator_chain[i % len(generator_chain)] == "agy"
+    )
+    if agy_slots < 2:
+        return None
+    return (
+        f"agy-parallelism check: mode={mode!r} with branches={k} would spawn "
+        f"{agy_slots} agy candidates in parallel. agy serializes on a cross-"
+        f"process settings.json lock, so the parallelism gain is lost. Consider "
+        f"a more heterogeneous --generator chain. Suppress with "
+        f"AGY_PARALLELISM_CHECK=off."
+    )
+
+
 def describe_chain(chain: List[str], fallback: bool) -> str:
     if not fallback or len(chain) == 1:
         name, cfg = _cfg_for_token(chain[0])

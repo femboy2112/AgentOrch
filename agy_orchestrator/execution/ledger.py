@@ -61,7 +61,9 @@ def build_ledger(workflow: Any, *, mode: str, had_verifier: bool,
     }
     if telemetry:
         for k in ("wall_ms", "out_bytes", "watchdog_reason",
-                  "worker", "model", "effort"):
+                  "worker", "model", "effort",
+                  "baseline_ok", "baseline_error_hash", "baseline_duration_ms",
+                  "verifier_delta"):
             v = telemetry.get(k)
             if v is not None:
                 row[k] = v

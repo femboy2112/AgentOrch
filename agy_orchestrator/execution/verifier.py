@@ -1,9 +1,33 @@
 import asyncio
+import hashlib
 import logging
 import os
-from typing import List, Tuple
+import time
+from dataclasses import dataclass
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class VerifierResult:
+    ok: bool
+    message: str = ""
+    returncode: int = 0
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    duration_ms: int = 0
+    timeout: bool = False
+    cmd: str = ""
+    error_hash: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __iter__(self):
+        # Back-compat unpacking: success, error_msg = await verifier.verify(...)
+        yield self.ok
+        yield self.message
+
 
 class QualityVerifier:
     """
@@ -19,24 +43,34 @@ class QualityVerifier:
             timeout = float(os.environ.get("AGY_TEST_TIMEOUT", "600") or 0)
         self.timeout = timeout
 
-    async def verify(self, working_directory: str) -> Tuple[bool, str]:
+    async def verify(self, working_directory: str) -> VerifierResult:
         """
         Runs the configured test commands in the specified directory.
 
         Returns:
-            Tuple[bool, str]: (Success boolean, Error details string)
+            VerifierResult: structured verification outcome.
         """
         if not self.test_commands:
-            return True, "No verification commands configured."
+            return VerifierResult(
+                ok=True,
+                message="No verification commands configured",
+                returncode=0,
+                duration_ms=0,
+            )
 
+        total_duration_ms = 0
         for cmd in self.test_commands:
             logger.info(f"Running verification: {cmd} in {working_directory}")
+            start = time.monotonic()
             process = await asyncio.create_subprocess_shell(
                 cmd,
                 cwd=working_directory,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
+            stdout = b""
+            stderr = b""
+            timed_out = False
 
             try:
                 comm = process.communicate()
@@ -46,20 +80,59 @@ class QualityVerifier:
                     stdout, stderr = await comm
             except asyncio.TimeoutError:
                 logger.warning("Verification command exceeded %.0fs; killing: %s", self.timeout, cmd)
+                timed_out = True
                 try:
                     process.kill()
                     await asyncio.wait_for(process.wait(), 5)
                 except Exception:
                     pass
-                return False, f"Verification command timed out after {self.timeout:.0f}s: {cmd}"
+            duration_ms = round((time.monotonic() - start) * 1000)
+            total_duration_ms += duration_ms
+
+            stdout_tail = stdout.decode(errors="replace")[-2000:] if stdout else ""
+            stderr_tail = stderr.decode(errors="replace")[-2000:] if stderr else ""
+
+            if timed_out:
+                result = VerifierResult(
+                    ok=False,
+                    message=f"Verification command timed out after {self.timeout:.0f}s: {cmd}",
+                    returncode=process.returncode if process.returncode is not None else -1,
+                    stdout_tail=stdout_tail,
+                    stderr_tail=stderr_tail,
+                    duration_ms=duration_ms,
+                    timeout=True,
+                    cmd=cmd,
+                )
+                if result.stderr_tail:
+                    result.error_hash = hashlib.sha256(
+                        result.stderr_tail.encode()
+                    ).hexdigest()[:16]
+                return result
 
             if process.returncode != 0:
-                error_msg = f"Command failed with exit code {process.returncode}: {cmd}\n"
-                error_msg += f"-- STDOUT --\n{stdout.decode()}\n"
-                error_msg += f"-- STDERR --\n{stderr.decode()}"
-
-                logger.warning(f"Verification failed:\n{error_msg}")
-                return False, error_msg
+                result = VerifierResult(
+                    ok=False,
+                    message=f"Command failed with exit code {process.returncode}: {cmd}",
+                    returncode=process.returncode,
+                    stdout_tail=stdout_tail,
+                    stderr_tail=stderr_tail,
+                    duration_ms=duration_ms,
+                    timeout=False,
+                    cmd=cmd,
+                )
+                if result.stderr_tail:
+                    result.error_hash = hashlib.sha256(
+                        result.stderr_tail.encode()
+                    ).hexdigest()[:16]
+                logger.warning("Verification failed: %s", result.message)
+                return result
 
         logger.info("All verifications passed successfully.")
-        return True, "All tests passed successfully."
+        final_cmd = "<multi>" if len(self.test_commands) > 1 else self.test_commands[0]
+        return VerifierResult(
+            ok=True,
+            message="All tests passed",
+            returncode=0,
+            duration_ms=total_duration_ms,
+            cmd=final_cmd,
+        )

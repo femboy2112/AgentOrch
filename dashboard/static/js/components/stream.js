@@ -40,6 +40,12 @@ export class StreamRenderer {
             usage: true,
             stderr: true,
         };
+        // Pending event queue + a single requestAnimationFrame flush. Fast
+        // reasoning streams (50+ events/sec from codex) would otherwise
+        // dominate the main thread with per-event textContent += and
+        // scrollTop = scrollHeight, starving toolbar button clicks.
+        this._pending = [];
+        this._flushScheduled = false;
         this._build();
     }
 
@@ -103,11 +109,9 @@ export class StreamRenderer {
 
     _appendNode(node) {
         this.viewport.appendChild(node);
-        if (this.autoScroll) {
-            this.viewport.scrollTop = this.viewport.scrollHeight;
-        } else {
-            this.jumpBtn.style.display = 'inline-flex';
-        }
+        // Scroll is set ONCE per RAF flush, not per node. The flush method
+        // handles autoScroll after the batch is fully appended; per-event
+        // scroll was the main culprit for click starvation.
     }
 
     _newLine(text, cls = '') {
@@ -117,7 +121,55 @@ export class StreamRenderer {
         return p;
     }
 
+    // Public API: queue an event for the next animation-frame flush.
+    // This is the only entry point the SSE handler should call.
     appendEvent(e) {
+        this._pending.push(e);
+        this._scheduleFlush();
+    }
+
+    _scheduleFlush() {
+        if (this._flushScheduled) {
+            return;
+        }
+        this._flushScheduled = true;
+        const flush = () => {
+            this._flushScheduled = false;
+            const batch = this._pending;
+            this._pending = [];
+            if (batch.length === 0) {
+                return;
+            }
+            // Use a DocumentFragment to coalesce DOM writes into one
+            // synchronous append at the end. Saves a layout pass per node.
+            const fragment = document.createDocumentFragment();
+            // The last-reasoning-paragraph buffer state is updated in-place
+            // as we walk the batch — it may point either at an already-in-
+            // DOM node (from a prior flush) or at a node we just created
+            // inside this fragment. Either way `.textContent +=` mutates
+            // the same element; the browser only re-renders at frame end.
+            for (const e of batch) {
+                this._renderOne(e, fragment);
+            }
+            if (fragment.childNodes.length > 0) {
+                this.viewport.appendChild(fragment);
+            }
+            if (this.autoScroll) {
+                this.viewport.scrollTop = this.viewport.scrollHeight;
+            } else if (batch.length > 0) {
+                this.jumpBtn.style.display = 'inline-flex';
+            }
+        };
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(flush);
+        } else {
+            // Headless test envs (jsdom) don't always provide RAF; fall
+            // back to a microtask so tests behave deterministically.
+            Promise.resolve().then(flush);
+        }
+    }
+
+    _renderOne(e, fragment) {
         const filterKey = eventFilterKind(e);
         if (!this.filters[filterKey]) {
             return;
@@ -139,7 +191,7 @@ export class StreamRenderer {
                 this.lastReasoningP = this._newLine(
                     `${stamp}  ${branchTag}${e.worker} / ${e.model} / ${e.effort}  ·  reasoning ▾\n${e.text}`
                 );
-                this._appendNode(this.lastReasoningP);
+                fragment.appendChild(this.lastReasoningP);
             }
             this.lastEvent = e;
             return;
@@ -167,7 +219,7 @@ export class StreamRenderer {
         }
 
         const node = this._newLine(line, this.view === 'cards' ? `stream-card ${cls}` : cls);
-        this._appendNode(node);
+        fragment.appendChild(node);
         this.lastEvent = e;
     }
 }

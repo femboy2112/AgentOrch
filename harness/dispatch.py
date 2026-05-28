@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Union
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import append_live_row
 from agy_orchestrator.execution.ledger import build_ledger
-from agy_orchestrator.execution.verifier import QualityVerifier
+from agy_orchestrator.execution.verifier import QualityVerifier, VerifierResult
 from agy_orchestrator.workflows.adversarial import AdversarialReview
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
@@ -81,6 +81,22 @@ def _worker_hint(agent: AgentInstance, fallback_chain: Optional[List[str]]) -> s
     if hasattr(agent, "_worker_name"):
         return agent._worker_name()
     return "agy"
+
+
+def _derive_verifier_delta(
+    baseline_result: Optional[VerifierResult], final_verified: bool
+) -> Optional[str]:
+    """Classify quality movement between pre-run baseline and final verifier signal."""
+    if baseline_result is None:
+        return None
+    baseline_ok = baseline_result.ok
+    if baseline_ok and final_verified:
+        return "preserved"
+    if baseline_ok and not final_verified:
+        return "regressed"
+    if not baseline_ok and final_verified:
+        return "fixed"
+    return "unchanged"
 
 
 async def _run_workflow(
@@ -262,6 +278,22 @@ async def dispatch_async(
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
     critic_chain = critic_chain or list(roles.CRITIC_CHAIN)
     codex_config = ["tools.web_search=true"] if web_search else None
+    if mode == "auto":
+        from agy_orchestrator.routing.policy import RoutingPolicy, from_dispatch_args
+        task = from_dispatch_args(
+            instruction=instruction,
+            context=context,
+            test_cmd=test_cmd,
+            branches=branches,
+            generator_chain=generator_chain,
+        )
+        decision = RoutingPolicy().choose(task)
+        logger.info("Auto-routing: mode=%s — %s", decision.mode, decision.reason)
+        mode = decision.mode
+        if decision.branches is not None:
+            branches = decision.branches
+        if decision.max_iterations is not None:
+            max_iterations = decision.max_iterations
 
     # Where the worker actually writes files. Default = AgentOrch repo root,
     # which preserves the prior behaviour exactly.
@@ -291,6 +323,10 @@ async def dispatch_async(
         family_warning = roles.check_chains_cross_family(generator_chain, critic_chain)
         if family_warning:
             logger.warning(family_warning)
+    if mode in ("vote", "tot"):
+        agy_warning = roles.check_agy_parallelism_warning(mode, generator_chain, branches)
+        if agy_warning:
+            logger.warning(agy_warning)
 
     def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
         model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
@@ -344,6 +380,25 @@ async def dispatch_async(
                 run_id, mode, gen_desc, f" | critic={crit_desc}" if crit_desc else "")
 
     verifier = QualityVerifier(test_commands=[test_cmd]) if test_cmd else None
+    baseline_result: Optional[VerifierResult] = None
+    if verifier is not None:
+        try:
+            baseline_result = await verifier.verify(working_directory=str(work_dir))
+            if baseline_result.ok:
+                logger.info("Baseline verifier: ok=True")
+            else:
+                logger.info(
+                    "Baseline verifier: ok=False (returncode=%s, error_hash=%s)",
+                    baseline_result.returncode,
+                    baseline_result.error_hash,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Baseline verifier failed (continuing): %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            baseline_result = None
 
     before = take_snapshot(work_dir)
     started = time.monotonic()
@@ -378,47 +433,49 @@ async def dispatch_async(
         root_logger.removeHandler(file_handler)
         file_handler.close()
 
+    lead_token = generator_chain[0]
+    lead_cfg = roles.AGENT_DEFAULTS.get(lead_token, {})
+    effort_val = lead_cfg.get("effort")
+    effort = str(effort_val) if effort_val not in (None, "n/a") else None
+    final_verified = bool(getattr(workflow, "verified", False))
+    verifier_delta = _derive_verifier_delta(baseline_result, final_verified)
+
+    wall_ms_value: Optional[float] = (duration * 1000.0) if duration else None
+    out_bytes_value: Optional[int] = None
+    watchdog_reason_value: Optional[str] = None
+    if workflow is not None:
+        # Prefer per-agent telemetry when the workflow exposes it.
+        agent_for_telemetry = (
+            getattr(workflow, "direct_generator", None)
+            or getattr(workflow, "generator", None)
+        )
+        if agent_for_telemetry is not None:
+            out_bytes_value = getattr(agent_for_telemetry, "last_out_bytes", None)
+            agent_wall = getattr(agent_for_telemetry, "last_wall_ms", None)
+            if agent_wall is not None:
+                wall_ms_value = float(agent_wall)
+            watchdog_reason_value = getattr(agent_for_telemetry, "_watchdog_reason", None)
+
+    telemetry = {
+        "wall_ms": wall_ms_value,
+        "out_bytes": out_bytes_value,
+        "watchdog_reason": watchdog_reason_value,
+        "worker": lead_token,
+        "model": str(lead_cfg.get("model", "") or ""),
+        "effort": effort,
+        "baseline_ok": baseline_result.ok if baseline_result is not None else None,
+        "baseline_error_hash": baseline_result.error_hash if baseline_result is not None else None,
+        "baseline_duration_ms": baseline_result.duration_ms if baseline_result is not None else None,
+        "verifier_delta": verifier_delta,
+    }
+
     # Quality-cost ledger (task #9): how much to trust this run.
     quality = build_ledger(
         workflow, mode=mode, had_verifier=verifier is not None,
         produced_output=bool(output and output.strip()),
+        telemetry=telemetry,
     )
     logger.info("Dispatch %s | confidence=%s (%s)", run_id, quality["confidence"], quality["note"])
-
-    # Close the calibration loop: every verified dispatch contributes one
-    # observation to the live ledger that CalibrationTable.load() reads on
-    # next process start. Only verified runs count — matching the offline
-    # sweep's gate, so a critic-approved-but-tests-failed run doesn't
-    # pollute the routing baselines. We use the lead generator worker as
-    # the key; multi-stage modes (cascade, pat, master) inherit it.
-    if quality.get("confidence") == "verified":
-        lead_token = generator_chain[0]
-        lead_cfg = roles.AGENT_DEFAULTS.get(lead_token, {})
-        effort_val = lead_cfg.get("effort")
-        effort = str(effort_val) if effort_val not in (None, "n/a") else None
-        # workflow may not surface wall_ms/out_bytes if the agent ran via
-        # the non-streaming path; this is best-effort and falls open.
-        wall_ms_value: Optional[float] = (duration * 1000.0) if duration else None
-        out_bytes_value: Optional[int] = None
-        # Prefer per-agent telemetry when the workflow exposes it.
-        if workflow is not None:
-            agent_for_telemetry = (
-                getattr(workflow, "direct_generator", None)
-                or getattr(workflow, "generator", None)
-            )
-            if agent_for_telemetry is not None:
-                out_bytes_value = getattr(agent_for_telemetry, "last_out_bytes", None)
-                agent_wall = getattr(agent_for_telemetry, "last_wall_ms", None)
-                if agent_wall is not None:
-                    wall_ms_value = float(agent_wall)
-        append_live_row(
-            worker=lead_token,
-            model=str(lead_cfg.get("model", "") or ""),
-            effort=effort,
-            ok=True,
-            out_bytes=out_bytes_value,
-            wall_ms=wall_ms_value,
-        )
 
     after = take_snapshot(work_dir)
     diff = diff_snapshots(before, after)
@@ -427,6 +484,48 @@ async def dispatch_async(
     (run_dir / "changed-files.diff").write_text(
         diff.unified or "(no file changes detected)\n", encoding="utf-8"
     )
+
+    stage_used = getattr(workflow, "stage_used", None) if workflow else None
+    n_candidates = getattr(workflow, "n_candidates", None) if workflow else None
+    n_passed = getattr(workflow, "n_passed", None) if workflow else None
+    winner_index = getattr(workflow, "winner_index", None) if workflow else None
+    if stage_used == -1:
+        stage_used = None
+    if winner_index == -1:
+        winner_index = None
+
+    # TODO: Wire the final VerifierResult up from workflows so this can
+    # differentiate timeout vs returncode failures for non-verified runs.
+    if quality.get("confidence") == "verified":
+        verifier_failure_kind = None
+    else:
+        verifier_failure_kind = None
+
+    # Close the calibration loop: every verified dispatch contributes one
+    # observation to the live ledger that CalibrationTable.load() reads on
+    # next process start. Only verified runs count — matching the offline
+    # sweep's gate, so a critic-approved-but-tests-failed run doesn't
+    # pollute the routing baselines. We use the lead generator worker as
+    # the key; multi-stage modes (cascade, pat, master) inherit it.
+    if quality.get("confidence") == "verified":
+        append_live_row(
+            worker=lead_token,
+            model=str(lead_cfg.get("model", "") or ""),
+            effort=effort,
+            ok=True,
+            out_bytes=out_bytes_value,
+            wall_ms=wall_ms_value,
+            mode=mode,
+            stage_used=stage_used,
+            n_candidates=n_candidates,
+            n_passed=n_passed,
+            winner_index=winner_index,
+            verifier_delta=quality.get("verifier_delta"),
+            verifier_failure_kind=verifier_failure_kind,
+            diff_files_added=len(diff.added),
+            diff_files_modified=len(diff.modified),
+            diff_files_deleted=len(diff.deleted),
+        )
 
     result = DispatchResult(
         run_id=run_id,

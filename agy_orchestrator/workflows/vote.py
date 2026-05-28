@@ -3,8 +3,9 @@
 Each candidate runs in its OWN per-candidate workspace (see
 ``execution/workspace.py``) so K workers writing in parallel can't trample
 each other. After every candidate completes, the verifier grades each
-workspace independently. The first passing candidate wins; its workspace
-is applied back to the operator's actual work_dir; losers are discarded.
+workspace independently. Passing candidates are ranked by deterministic,
+multi-criteria score; the top-ranked candidate wins and its workspace is
+applied back to the operator's actual work_dir; losers are discarded.
 
 What this gets us:
 
@@ -26,7 +27,8 @@ What this is NOT:
   for reasoning tasks while skipping the debate cost.
 * This is not deterministic majority voting on identical outputs — code
   candidates are rarely identical text. The "majority" here is "majority
-  of candidates that pass the verifier", with first-passer tiebreak.
+  of candidates that pass the verifier", then deterministic tie-breaking
+  by ranking metrics.
 
 The verifier is mandatory. Without it, K-vote degenerates to "pick the
 first candidate" which is what direct mode already does, cheaper.
@@ -36,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -44,9 +47,27 @@ from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.execution.workspace import (
     COPY_IGNORE_PATTERNS,
     candidate_workspace,
+    diff_workspace_against_base,
 )
 
 logger = logging.getLogger(__name__)
+
+VOTE_RANKING_SPEC = (
+    "files_changed: asc",
+    "has_test_changes: prefer true",
+    "diff_size: asc",
+    "index: asc",
+)
+
+
+@dataclass
+class CandidateScore:
+    index: int
+    output: str
+    workspace_path: Path
+    files_changed: int
+    diff_size: int
+    has_test_changes: bool
 
 
 class _ManagedWorkspace:
@@ -109,6 +130,7 @@ class VoteWorkflow:
         self.n_passed = 0
         self.winner_index = -1
         self.iterations_used = 0
+        self.ranking_metric: Optional[dict] = None
         # Used by the run ledger / future analyzers.
         self.candidate_outcomes: List[Tuple[bool, Optional[str]]] = []
 
@@ -145,25 +167,36 @@ class VoteWorkflow:
             self.candidate_outcomes = [(ok, err) for _out, ok, err in results]
             self.n_passed = sum(1 for _out, ok, _err in results if ok)
 
-            # Pick winner: first passing candidate (lowest index = stable
-            # tiebreak when multiple pass). The chain rotation gave each
-            # index a different worker, so first-passer naturally favours
-            # the operator's preferred lead provider.
+            passers: List[CandidateScore] = []
             for i, (out, ok, _err) in enumerate(results):
-                if ok and out is not None:
-                    self.winner_index = i
-                    self.verified = True
-                    logger.info(
-                        "Vote: %d/%d candidates passed; applying candidate %d "
-                        "(%s) to %s",
-                        self.n_passed, len(results), i,
-                        type(self.generators[i]).__name__,
-                        self.working_directory,
-                    )
-                    await self._apply_workspace(
-                        workspaces[i].path, Path(self.working_directory),
-                    )
-                    return out
+                if not ok or out is None:
+                    continue
+                score = await self._score_passer(i, out, workspaces[i])
+                passers.append(score)
+
+            if passers:
+                winner = self._rank_passers(passers)[0]
+                self.winner_index = winner.index
+                self.verified = True
+                self.ranking_metric = {
+                    "files_changed": winner.files_changed,
+                    "diff_size": winner.diff_size,
+                    "has_test_changes": winner.has_test_changes,
+                }
+                logger.info(
+                    "Vote: %d/%d passed; ranked candidate %d as winner "
+                    "(files_changed=%d, diff_size=%d, has_test_changes=%s)",
+                    self.n_passed,
+                    len(results),
+                    winner.index,
+                    winner.files_changed,
+                    winner.diff_size,
+                    winner.has_test_changes,
+                )
+                await self._apply_workspace(
+                    winner.workspace_path, Path(self.working_directory),
+                )
+                return winner.output
 
             # 0/K passed — return the best-effort first non-None output
             # for the operator to inspect, but DO NOT apply anything to
@@ -201,19 +234,66 @@ class VoteWorkflow:
             )
             return None, False, f"{type(exc).__name__}: {exc}"
         try:
-            ok, err = await self.verifier.verify(working_directory=str(ws.path))
+            result = await self.verifier.verify(working_directory=str(ws.path))
         except Exception as exc:
             logger.warning(
                 "Vote candidate %d (%s) verifier raised: %s",
                 idx, type(gen).__name__, exc,
             )
             return output, False, f"verifier-raised: {exc}"
-        if not ok:
+        if not result.ok:
             logger.info(
                 "Vote candidate %d (%s) failed verifier: %s",
-                idx, type(gen).__name__, (err or "")[:160],
+                idx, type(gen).__name__, (result.message or "")[:160],
             )
-        return output, bool(ok), err
+        return output, bool(result.ok), result.message
+
+    async def _score_passer(
+        self, idx: int, output: str, workspace: _ManagedWorkspace,
+    ) -> CandidateScore:
+        diff_text = await asyncio.to_thread(
+            diff_workspace_against_base,
+            Path(self.working_directory),
+            workspace.path,
+            backend=workspace.backend,
+        )
+        diff_size = len(diff_text)
+        files_changed = 0
+        has_test_changes = False
+        for line in diff_text.splitlines():
+            if not line.startswith("diff --git "):
+                continue
+            files_changed += 1
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            a_path = parts[2]
+            b_path = parts[3]
+            if a_path.startswith("a/"):
+                a_path = a_path[2:]
+            if b_path.startswith("b/"):
+                b_path = b_path[2:]
+            if "test" in a_path.lower() or "test" in b_path.lower():
+                has_test_changes = True
+        return CandidateScore(
+            index=idx,
+            output=output,
+            workspace_path=workspace.path,
+            files_changed=files_changed,
+            diff_size=diff_size,
+            has_test_changes=has_test_changes,
+        )
+
+    def _rank_passers(self, passers: List[CandidateScore]) -> List[CandidateScore]:
+        return sorted(
+            passers,
+            key=lambda s: (
+                s.files_changed,
+                0 if s.has_test_changes else 1,
+                s.diff_size,
+                s.index,
+            ),
+        )
 
     async def _apply_workspace(self, src: Path, dst: Path) -> None:
         """Mirror the winner's contents over the operator's actual work_dir.
@@ -249,5 +329,27 @@ class VoteWorkflow:
                         pass
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_path, dst_path)
+
+            # Remove files that no longer exist in the winner workspace.
+            for dst_path in dst.rglob("*"):
+                if not dst_path.is_file():
+                    continue
+                rel = dst_path.relative_to(dst)
+                top = rel.parts[0]
+                if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
+                    continue
+                if (src / rel).exists():
+                    continue
+                try:
+                    dst_path.unlink()
+                except OSError:
+                    continue
+                parent = dst_path.parent
+                while parent != dst:
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
 
         await asyncio.to_thread(_do_apply)

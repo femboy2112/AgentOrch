@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -11,6 +12,8 @@ from fastapi.responses import Response, StreamingResponse
 from dashboard.event_bus import EventBus
 
 router = APIRouter()
+
+_CLI_RUN_STALE_SECONDS = 300.0
 
 
 def _sse_pack(*, event: str, data: object, event_id: Optional[int] = None) -> bytes:
@@ -33,11 +36,69 @@ def _read_meta(runs_dir: Path, run_id: str) -> dict:
         return {"run_id": run_id}
 
 
+def _scan_filesystem_runs(runs_dir: Path, already_tracked: set[str]) -> list[dict]:
+    """Return running dispatches discovered from runs/ on disk."""
+    if not runs_dir.exists():
+        return []
+
+    now = time.time()
+    out: list[dict] = []
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        run_id = run_dir.name
+        if run_id in already_tracked:
+            continue
+        if (run_dir / "meta.json").exists():
+            continue
+
+        events_path = run_dir / "events.jsonl"
+        if not events_path.exists():
+            continue
+        try:
+            mtime = events_path.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime > _CLI_RUN_STALE_SECONDS:
+            continue
+
+        prompt_path = run_dir / "prompt.txt"
+        try:
+            started_at = prompt_path.stat().st_mtime if prompt_path.exists() else mtime
+        except OSError:
+            started_at = mtime
+
+        instruction_preview = ""
+        try:
+            if prompt_path.exists():
+                head = prompt_path.read_text(encoding="utf-8", errors="replace")[:240]
+                if "## Instruction" in head:
+                    head = head.split("## Instruction", 1)[1].lstrip()[:160]
+                else:
+                    head = head[:160]
+                instruction_preview = head.replace("\n", " ").strip()
+        except OSError:
+            pass
+
+        out.append(
+            {
+                "run_id": run_id,
+                "started_at": started_at,
+                "mode": "cli",
+                "instruction_preview": instruction_preview,
+                "source": "cli",
+            }
+        )
+    return out
+
+
 @router.get("/live")
 def list_live(request: Request) -> dict:
     state = request.app.state.dashboard
-    running = sorted(state.running.values(), key=lambda r: r.get("started_at", 0.0), reverse=True)
-    return {"running": running}
+    tracked = sorted(state.running.values(), key=lambda r: r.get("started_at", 0.0), reverse=True)
+    fs_runs = _scan_filesystem_runs(state.runs_dir, set(state.running.keys()))
+    merged = sorted(tracked + fs_runs, key=lambda r: r.get("started_at", 0.0), reverse=True)
+    return {"running": merged}
 
 
 @router.post("/live/{run_id}/kill")

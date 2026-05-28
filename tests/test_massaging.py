@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.execution.verifier import VerifierResult
 from agy_orchestrator.workflows.adversarial import AdversarialReview
 from agy_orchestrator.workflows.tree_of_thought import TreeOfThought
 
@@ -216,7 +217,14 @@ def test_test_feedback_loops_until_verifier_passes():
         def __init__(self): self.calls = 0
         async def verify(self, working_directory="."):
             self.calls += 1
-            return (self.calls >= 2, "" if self.calls >= 2 else "AssertionError: x != y")
+            ok = self.calls >= 2
+            return VerifierResult(
+                ok=ok,
+                message="" if ok else "AssertionError: x != y",
+                returncode=0 if ok else 1,
+                cmd="stub",
+                duration_ms=0,
+            )
 
     out = _a.run(TestFeedbackWorkflow(gen, _Verifier(), max_iterations=4).execute("build X"))
     assert out == "good code v2"
@@ -257,7 +265,14 @@ def test_cascade_escalates_to_stronger_stage():
             # We can't see the output here, so gate on call count: stage1 (cheap,
             # 1 iter) fails, stage2 (strong) passes on its first try.
             self.n = getattr(self, "n", 0) + 1
-            return (self.n >= 2, "" if self.n >= 2 else "FAILED: needs work")
+            ok = self.n >= 2
+            return VerifierResult(
+                ok=ok,
+                message="" if ok else "FAILED: needs work",
+                returncode=0 if ok else 1,
+                cmd="stub",
+                duration_ms=0,
+            )
 
     wf = CascadeWorkflow([cheap, strong], _Verifier(), max_iterations_per_stage=1)
     out = _a.run(wf.execute("do it"))

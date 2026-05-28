@@ -182,6 +182,16 @@ def append_live_row(
     ok: bool,
     out_bytes: Optional[int] = None,
     wall_ms: Optional[float] = None,
+    mode: Optional[str] = None,
+    stage_used: Optional[int] = None,
+    n_candidates: Optional[int] = None,
+    n_passed: Optional[int] = None,
+    winner_index: Optional[int] = None,
+    verifier_delta: Optional[str] = None,
+    verifier_failure_kind: Optional[str] = None,
+    diff_files_added: Optional[int] = None,
+    diff_files_modified: Optional[int] = None,
+    diff_files_deleted: Optional[int] = None,
     path: Optional[Path] = None,
 ) -> None:
     """Append one dispatch's observation to the live ledger JSONL.
@@ -201,16 +211,48 @@ def append_live_row(
     """
     if os.environ.get("AGY_LIVE_LEDGER", "").lower() == "off":
         return
-    if out_bytes is None and wall_ms is None:
+    has_metric = any(
+        v is not None
+        for v in (
+            out_bytes,
+            wall_ms,
+            mode,
+            stage_used,
+            n_candidates,
+            n_passed,
+            winner_index,
+            verifier_delta,
+            verifier_failure_kind,
+            diff_files_added,
+            diff_files_modified,
+            diff_files_deleted,
+        )
+    )
+    if not has_metric:
         return
     row = {
         "worker": worker,
         "model": model,
         "effort": effort,
         "ok": bool(ok),
+    }
+    optional_values = {
         "out_tokens": (int(out_bytes) // BYTES_PER_TOKEN) if out_bytes is not None else None,
         "wall_ms": float(wall_ms) if wall_ms is not None else None,
+        "mode": mode,
+        "stage_used": stage_used,
+        "n_candidates": n_candidates,
+        "n_passed": n_passed,
+        "winner_index": winner_index,
+        "verifier_delta": verifier_delta,
+        "verifier_failure_kind": verifier_failure_kind,
+        "diff_files_added": diff_files_added,
+        "diff_files_modified": diff_files_modified,
+        "diff_files_deleted": diff_files_deleted,
     }
+    for key, value in optional_values.items():
+        if value is not None:
+            row[key] = value
     target = Path(path or DEFAULT_LIVE_LEDGER_PATH)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

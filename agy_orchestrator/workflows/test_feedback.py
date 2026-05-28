@@ -59,12 +59,16 @@ class TestFeedbackWorkflow:
             self.iterations_used = iteration + 1
             self.generator.prompt = current_prompt
             last_output = await self.generator.run_async()
-            success, error_msg = await self.verifier.verify(working_directory=self.working_directory)
-            if success:
+            result = await self.verifier.verify(working_directory=self.working_directory)
+            if result.ok:
                 logger.info("Verifier passed on iteration %d — accepting.", iteration + 1)
                 self.verified = True
                 return last_output
             logger.info("Verifier failed; feeding the error back for repair.")
-            current_prompt = self._revise_prompt(initial_prompt, last_output, error_msg or "(no detail)")
+            current_prompt = self._revise_prompt(
+                initial_prompt,
+                last_output,
+                result.message or "(no detail)",
+            )
         logger.warning("TestFeedback exhausted %d iterations without passing.", self.max_iterations)
         return last_output

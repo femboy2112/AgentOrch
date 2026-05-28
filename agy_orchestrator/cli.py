@@ -6,7 +6,6 @@ from agy_orchestrator.core.agents.agy_agent import AgyAgent
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
-from agy_orchestrator.core.optimizer import UsageAwareAllocator
 from agy_orchestrator.core.profile import UserProfile
 from agy_orchestrator.execution.pipeline import LinearPipeline
 from agy_orchestrator.execution.verifier import QualityVerifier
@@ -32,13 +31,12 @@ def create_agent(agent_class, prompt, model, effort=None):
 
 async def run_adversarial(args, profile):
     agent_class = get_agent_class(args.agent)
-    allocator = UsageAwareAllocator(profile, agent_class, args.agent, args.model)
-    config = await allocator.get_current_config()
+    effort = profile.get_baseline_effort(args.agent)
 
-    print(f"\n[AdversarialReview] Using {args.agent}:{config['model']}:{config['effort']}\n")
+    print(f"\n[AdversarialReview] Using {args.agent}:{args.model}:{effort}\n")
 
-    generator = create_agent(agent_class, prompt="", model=config["model"], effort=config["effort"])
-    critic = create_agent(agent_class, prompt="", model=config["model"], effort="high")
+    generator = create_agent(agent_class, prompt="", model=args.model, effort=effort)
+    critic = create_agent(agent_class, prompt="", model=args.model, effort="high")
 
     verifier = None
     if args.test_cmd:
@@ -51,16 +49,15 @@ async def run_adversarial(args, profile):
 
 async def run_tot(args, profile):
     agent_class = get_agent_class(args.agent)
-    allocator = UsageAwareAllocator(profile, agent_class, args.agent, args.model)
-    config = await allocator.get_current_config()
+    effort = profile.get_baseline_effort(args.agent)
 
-    print(f"\n[TreeOfThought] Using {args.agent}:{config['model']}:{config['effort']}\n")
+    print(f"\n[TreeOfThought] Using {args.agent}:{args.model}:{effort}\n")
 
     branches = [
-        create_agent(agent_class, prompt=args.prompt, model=config["model"], effort=config["effort"])
+        create_agent(agent_class, prompt=args.prompt, model=args.model, effort=effort)
         for _ in range(args.branches)
     ]
-    evaluator = create_agent(agent_class, prompt="", model=config["model"], effort="high")
+    evaluator = create_agent(agent_class, prompt="", model=args.model, effort="high")
 
     workflow = TreeOfThought(branches, evaluator)
     result = await workflow.execute()
@@ -69,10 +66,9 @@ async def run_tot(args, profile):
 
 async def run_master(args, profile):
     agent_class = get_agent_class(args.agent)
-    allocator = UsageAwareAllocator(profile, agent_class, args.agent, args.model)
-    config = await allocator.get_current_config()
+    effort = profile.get_baseline_effort(args.agent)
 
-    print(f"\n[MasterWorkflow] Using {args.agent}:{config['model']}:{config['effort']}\n")
+    print(f"\n[MasterWorkflow] Using {args.agent}:{args.model}:{effort}\n")
 
     if getattr(args, "fallback", False):
         # On a provider's persistent failure (usage/quota wall), fall back to the
@@ -92,8 +88,8 @@ async def run_master(args, profile):
         verifier = QualityVerifier(test_commands=[args.test_cmd])
 
     workflow = MasterWorkflow(
-        model=config["model"],
-        effort=config["effort"],
+        model=args.model,
+        effort=effort,
         branches=args.branches,
         max_iterations=args.max_iterations,
         verifier=verifier,
@@ -111,8 +107,7 @@ async def run_chain(args, profile):
     use_fallback = getattr(args, "fallback", False)
     for agent_name in args.agents:
         primary = get_agent_class(agent_name)
-        allocator = UsageAwareAllocator(profile, primary, agent_name, args.model)
-        config = await allocator.get_current_config()
+        effort = profile.get_baseline_effort(agent_name)
         if use_fallback:
             # Wrap each stage in usage-exhaustion fallback: primary -> agy ->
             # claude -> codex (deduped, order preserved). Lets a chain build
@@ -123,11 +118,11 @@ async def run_chain(args, profile):
                 if cls not in ordered:
                     ordered.append(cls)
             fb_class = make_fallback_agent(ordered)
-            print(f"[LinearPipeline] {agent_name}+fallback({'->'.join(c.__name__ for c in ordered)}):{config['model']}:{config['effort']}")
-            instances.append(fb_class(prompt="", model=config["model"], effort=config["effort"]))
+            print(f"[LinearPipeline] {agent_name}+fallback({'->'.join(c.__name__ for c in ordered)}):{args.model}:{effort}")
+            instances.append(fb_class(prompt="", model=args.model, effort=effort))
         else:
-            print(f"[LinearPipeline] {agent_name}:{config['model']}:{config['effort']}")
-            instances.append(create_agent(primary, prompt="", model=config["model"], effort=config["effort"]))
+            print(f"[LinearPipeline] {agent_name}:{args.model}:{effort}")
+            instances.append(create_agent(primary, prompt="", model=args.model, effort=effort))
 
     print()
     pipeline = LinearPipeline(instances)

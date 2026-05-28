@@ -47,6 +47,10 @@ def _print_result(result) -> None:
         iters = result.quality.get("iterations_used")
         extra = f" ({iters} iter)" if iters else ""
         print(f"  confidence: {col}{conf}{C_RESET}{extra} — {result.quality.get('note','')}")
+        delta = result.quality.get("verifier_delta")
+        if delta:
+            dcol = C_GREEN if delta == "fixed" else (C_YELLOW if delta in ("preserved", "unchanged") else C_RED)
+            print(f"  verifier  : {dcol}{delta}{C_RESET}")
     if result.error:
         print(f"  {C_RED}error     : {result.error}{C_RESET}")
     if result.changed_files:
@@ -134,7 +138,7 @@ def main(argv=None) -> int:
 
     do = sub.add_parser("do", help="Dispatch one coding instruction to a worker")
     do.add_argument("instruction", type=str, help="The instruction for the worker")
-    do.add_argument("--mode", choices=["direct", "adversarial", "feedback", "cascade", "master", "pat", "vote"],
+    do.add_argument("--mode", choices=["direct", "adversarial", "feedback", "cascade", "master", "pat", "vote", "auto"],
                     default="adversarial",
                     help="Workflow shape. direct=one shot; adversarial=generate+critic loop "
                          "(default); feedback=generate+run-tests+repair loop (needs --test-cmd); "
@@ -145,7 +149,9 @@ def main(argv=None) -> int:
                          "verifier failure (needs --test-cmd; ~40% cost savings on easy tasks); "
                          "vote=K parallel candidates in isolated workspaces, verifier picks the "
                          "winner (needs --test-cmd; K=--branches; heterogeneous when chain has "
-                         "multiple providers).")
+                         "multiple providers); "
+                         "auto=rule-based router picks the right concrete mode based on task "
+                         "features (test_cmd presence, prompt scale, ambiguity keywords).")
     do.add_argument("--context", type=str, default=None,
                     help="Extra context appended to the instruction")
     do.add_argument("--generator", type=str, default=None,
