@@ -278,6 +278,22 @@ async def dispatch_async(
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
     critic_chain = critic_chain or list(roles.CRITIC_CHAIN)
     codex_config = ["tools.web_search=true"] if web_search else None
+    if mode == "auto":
+        from agy_orchestrator.routing.policy import RoutingPolicy, from_dispatch_args
+        task = from_dispatch_args(
+            instruction=instruction,
+            context=context,
+            test_cmd=test_cmd,
+            branches=branches,
+            generator_chain=generator_chain,
+        )
+        decision = RoutingPolicy().choose(task)
+        logger.info("Auto-routing: mode=%s — %s", decision.mode, decision.reason)
+        mode = decision.mode
+        if decision.branches is not None:
+            branches = decision.branches
+        if decision.max_iterations is not None:
+            max_iterations = decision.max_iterations
 
     # Where the worker actually writes files. Default = AgentOrch repo root,
     # which preserves the prior behaviour exactly.

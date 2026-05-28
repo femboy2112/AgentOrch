@@ -67,6 +67,7 @@ anything below `verified` as a draft for your review.
 | `master` | plan → tree-of-thought → adversarial per step | no (but advised) | whole features, multi-step, long context |
 | `pat` | direct first, escalate to master only on failure | **yes** | most tasks; ~40% cheaper than master when direct carries (arxiv 2605.07248) |
 | `vote` | K parallel candidates in isolated workspaces, verifier picks winner | **yes** | high-quality candidate selection; K=`--branches`; heterogeneous when chain has multiple providers |
+| `auto` | RoutingPolicy picks the concrete mode | no | When you want explainable routing without hand-picking |
 
 If you don't have a test you can run, use `adversarial`. Otherwise prefer
 `pat` for general work, `vote` when you specifically want the strongest
