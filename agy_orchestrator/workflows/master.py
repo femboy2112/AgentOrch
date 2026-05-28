@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import List, Optional, Tuple
 
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
@@ -10,6 +11,18 @@ from agy_orchestrator.workflows.adversarial import AdversarialReview
 from agy_orchestrator.workflows.tree_of_thought import TreeOfThought
 
 logger = logging.getLogger(__name__)
+
+# Matches "--- Step N Summary ---" so we can split project_context into
+# per-step blocks for the two-tier compaction below. Tolerant of leading
+# whitespace and trailing punctuation/numbers; the master writer uses an
+# exact format but a future variant shouldn't blow this up.
+_STEP_HEADER_RE = re.compile(r"^---\s*Step\s+(\d+)\s+Summary\s*---\s*$", re.MULTILINE)
+
+# How many recent step summaries to keep VERBATIM in compacted context.
+# 2 chosen empirically: the adversarial critic on step N+1 needs immediate
+# visibility into the file paths and symbol names from N and N-1; older
+# detail is fine to digest. Bump via MasterWorkflow(recent_steps_verbatim=K).
+DEFAULT_RECENT_STEPS_VERBATIM = 2
 
 class MasterWorkflow:
     """
@@ -29,6 +42,7 @@ class MasterWorkflow:
         max_context_chars: int = 12000,
         selector: str = "judge",
         working_directory: str = ".",
+        recent_steps_verbatim: int = DEFAULT_RECENT_STEPS_VERBATIM,
     ):
         self.model = model
         self.effort = effort
@@ -36,6 +50,14 @@ class MasterWorkflow:
         self.max_iterations = max_iterations
         self.verifier = verifier
         self.agent_class = agent_class
+        # Two-tier compaction: when the running context is digested, the
+        # most recent N step summaries are kept VERBATIM and only older
+        # steps go through the compactor. Avoids the "I lost the file
+        # paths from the step I just did" failure mode that hurt long
+        # master runs under the single-digest scheme. Anchor:
+        # arxiv 2509.13313 (ReSum) — periodic external summarization with
+        # bounded recent context improved long-horizon search by +8.2%.
+        self.recent_steps_verbatim = max(0, int(recent_steps_verbatim))
         # Where the verifier should run the test_cmd. Threaded into every
         # AdversarialReview the master spawns so cross-repo dispatches
         # (caller's `out_dir != PROJECT_ROOT`) verify in the right tree.
@@ -59,23 +81,99 @@ class MasterWorkflow:
             return True
         return False
 
+    def _split_context_into_steps(
+        self, project_context: str
+    ) -> Tuple[str, List[str]]:
+        """Split project_context into (preamble, [per-step block, ...]).
+
+        The preamble is the "Original Goal:" header. Each per-step block is
+        the text from one ``--- Step N Summary ---`` line up to (but not
+        including) the next one. Order is preserved; if no step markers are
+        found the whole string is returned as the preamble with an empty list
+        of blocks. The caller can rejoin blocks with ``''.join(...)`` since
+        each block already starts with its own ``\n--- Step N ...`` header.
+        """
+        matches = list(_STEP_HEADER_RE.finditer(project_context))
+        if not matches:
+            return project_context, []
+        # Preamble = everything before the first step header. The header line
+        # itself belongs to its step (preserves the leading `\n---` form).
+        first_start = matches[0].start()
+        # Backwards-include the preceding "\n" so each block reads as a
+        # standalone segment when rejoined.
+        preamble_end = first_start
+        if preamble_end > 0 and project_context[preamble_end - 1] == "\n":
+            preamble_end -= 1
+        preamble = project_context[:preamble_end]
+        blocks: List[str] = []
+        for i, m in enumerate(matches):
+            start = m.start()
+            # Walk back one char if the marker is preceded by "\n" so each
+            # block carries its leading newline. This makes joining trivial.
+            if start > 0 and project_context[start - 1] == "\n":
+                start -= 1
+            # The end of block i is "just before block i+1's leading \n",
+            # which is matches[i+1].start() - 1. No further walk-back —
+            # that boundary newline already lives at start-1 of block i+1.
+            if i + 1 < len(matches):
+                end = matches[i + 1].start() - 1
+            else:
+                end = len(project_context)
+            blocks.append(project_context[start:end])
+        return preamble, blocks
+
     async def _compact_context(self, initial_prompt: str, project_context: str) -> str:
-        """Condense the running context to a bounded digest (fresh session)."""
+        """Condense older steps; keep recent N steps verbatim (two-tier).
+
+        For a long master run, the single-digest scheme of the prior version
+        had a subtle failure mode: after compaction, the immediately
+        preceding step's concrete details (file paths, symbol names) were
+        absorbed into a paragraph-prose digest and the next critic
+        iteration couldn't tell which exact file the previous step had
+        touched. Two-tier compaction sidesteps this — older steps go through
+        the digest (cheap context), the LAST ``recent_steps_verbatim`` step
+        summaries are kept whole (rich, precise context for the next step).
+        Anchor: arxiv 2509.13313.
+
+        Falls open on edge cases — if there aren't enough step markers to
+        split, behaves identically to the prior single-digest scheme.
+        """
         header = f"Original Goal: {initial_prompt}\n\n=== Accumulated Implementation (compacted) ===\n"
+        preamble, blocks = self._split_context_into_steps(project_context)
+        keep = self.recent_steps_verbatim
+
+        # No step markers OR fewer steps than we want to keep verbatim:
+        # nothing to split on. Compact the whole thing the old way.
+        if not blocks or keep == 0 or len(blocks) <= keep:
+            to_digest = project_context
+            verbatim_suffix = ""
+        else:
+            older = blocks[:-keep]
+            recent = blocks[-keep:]
+            to_digest = preamble + "".join(older)
+            verbatim_suffix = "".join(recent)
+
+        # Bound the digest input — even with two-tier, an enormous older-tier
+        # tail can blow up the compactor prompt. The 24K cap matches the
+        # prior behaviour; the recent verbatim block is excluded from this
+        # cap because preserving its full content is the whole point.
         compactor = self.agent_class(
             prompt=(
                 "Condense the following project progress log into a TIGHT running digest "
                 "(<= 1500 words). Preserve the original goal, every file created/modified, key "
                 "design decisions, and any names (classes/functions/IDs/APIs) later steps need. "
                 "Drop redundancy and full code. Output only the digest.\n\n"
-                f"{project_context[:24000]}"
+                f"{to_digest[:24000]}"
             ),
             model=self.model,
             effort="low",
         )
         try:
             digest = await compactor.run_async()
-            return header + digest.strip() + "\n"
+            compacted = header + digest.strip() + "\n"
+            if verbatim_suffix:
+                compacted += "\n=== Recent steps (verbatim) ===" + verbatim_suffix + "\n"
+            return compacted
         except Exception as exc:  # robust fallback: keep goal + most-recent tail
             logger.warning("Context compaction failed (%s); truncating to recent tail.", exc)
             tail = project_context[-self.max_context_chars :] if self.max_context_chars else project_context
