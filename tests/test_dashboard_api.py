@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from dashboard.server import create_app
 from harness import dispatch as dispatch_mod
 from harness.dispatch import DispatchResult
+from harness import roles
 
 
 def _parse_sse(body: str) -> list[dict]:
@@ -115,9 +116,19 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
     app = create_app()
     client = TestClient(app)
 
+    home = client.get("/")
+    assert home.status_code == 200
+    assert "AgentOrch Dashboard" in home.text
+
     health = client.get("/healthz")
     assert health.status_code == 200
     assert health.text == "ok"
+
+    budget = client.get("/api/dispatch/budget")
+    assert budget.status_code == 200
+    budget_rows = budget.json()["rows"]
+    assert [row["worker"] for row in budget_rows] == list(dict.fromkeys(roles.GENERATOR_CHAIN + roles.CRITIC_CHAIN))
+    assert all("max_output_bytes" in row and "stall_seconds" in row for row in budget_rows)
 
     resp = client.post(
         "/api/dispatch",

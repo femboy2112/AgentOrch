@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import AsyncIterator, Deque
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from dashboard.event_bus import EventBus
 from harness import dispatch as dispatch_mod
@@ -47,6 +49,22 @@ def create_app() -> FastAPI:
         bus=dispatch_mod.EVENT_BUS,
         runs_dir=dispatch_mod.RUNS_DIR,
     )
+    static_dir = Path(__file__).resolve().parent / "static"
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="dashboard-static")
+
+    def _index_response() -> FileResponse:
+        return FileResponse(static_dir / "index.html")
+
+    @app.get("/", include_in_schema=False)
+    def dashboard_index() -> RedirectResponse:
+        return RedirectResponse(url="/dispatch", status_code=307)
+
+    @app.get("/dispatch", include_in_schema=False)
+    @app.get("/live", include_in_schema=False)
+    @app.get("/runs", include_in_schema=False)
+    @app.get("/runs/{run_id:path}", include_in_schema=False)
+    def dashboard_page() -> FileResponse:
+        return _index_response()
 
     from dashboard.routers import dispatch, health, live, runs
 

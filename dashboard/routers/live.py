@@ -50,17 +50,18 @@ def kill_live(run_id: str, request: Request) -> dict:
     return {"killed": True}
 
 
-async def _iter_worker_events(request: Request, run_id: str) -> AsyncIterator[bytes]:
+async def _iter_worker_events(request: Request, run_id: str, resume_after: Optional[int] = None) -> AsyncIterator[bytes]:
     state = request.app.state.dashboard
     events_path = state.runs_dir / run_id / "events.jsonl"
 
-    after_id = -1
-    last_event_id = request.headers.get("last-event-id")
-    if last_event_id is not None:
-        try:
-            after_id = int(last_event_id)
-        except Exception:
-            after_id = -1
+    after_id = resume_after if resume_after is not None else -1
+    if resume_after is None:
+        last_event_id = request.headers.get("last-event-id")
+        if last_event_id is not None:
+            try:
+                after_id = int(last_event_id)
+            except Exception:
+                after_id = -1
 
     # Replay from persisted JSONL first (if present), then continue with live bus.
     for event_id, event in EventBus.replay_events(events_path, after_id=after_id):
@@ -84,8 +85,8 @@ async def _iter_worker_events(request: Request, run_id: str) -> AsyncIterator[by
 
 
 @router.get("/sse/{run_id}")
-async def run_sse(run_id: str, request: Request) -> Response:
-    return StreamingResponse(_iter_worker_events(request, run_id), media_type="text/event-stream")
+async def run_sse(run_id: str, request: Request, after_id: Optional[int] = None) -> Response:
+    return StreamingResponse(_iter_worker_events(request, run_id, resume_after=after_id), media_type="text/event-stream")
 
 
 async def _iter_recent(request: Request) -> AsyncIterator[bytes]:

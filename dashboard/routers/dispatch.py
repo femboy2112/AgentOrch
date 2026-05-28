@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from harness import dispatch as dispatch_mod
+from harness import roles
 
 router = APIRouter()
 
@@ -26,6 +27,14 @@ class DispatchRequest(BaseModel):
     cycles: int = Field(default=2, ge=1)
     max_iterations: int = Field(default=5, ge=1)
     branches: int = Field(default=3, ge=1)
+
+
+def _parse_chain_csv(raw: Optional[str], default: list[str]) -> list[str]:
+    if raw is None:
+        return list(default)
+    tokens = [chunk.strip().lower() for chunk in raw.split(",")]
+    out = [token for token in tokens if token]
+    return out or list(default)
 
 
 async def _run_dispatch(request: Request, run_id: str, payload: DispatchRequest) -> None:
@@ -96,3 +105,47 @@ async def create_dispatch(payload: DispatchRequest, request: Request) -> dict:
     state.running[run_id] = running
     state.tasks[run_id] = asyncio.create_task(_run_dispatch(request, run_id, payload))
     return {"run_id": run_id}
+
+
+@router.get("/dispatch/budget")
+def get_dispatch_budget(
+    mode: str = "adversarial",
+    generator: Optional[str] = None,
+    critic: Optional[str] = None,
+) -> dict:
+    generator_chain = _parse_chain_csv(generator, list(roles.GENERATOR_CHAIN))
+    critic_chain = _parse_chain_csv(critic, list(roles.CRITIC_CHAIN))
+    workers: list[str] = list(generator_chain)
+    if mode == "adversarial":
+        workers.extend(critic_chain)
+
+    seen: set[str] = set()
+    rows: list[dict] = []
+    cal = roles._get_calibration()
+
+    for worker in workers:
+        if worker in seen:
+            continue
+        seen.add(worker)
+        if worker not in roles.AGENT_CLASSES:
+            raise HTTPException(status_code=400, detail=f"unknown worker in chain: {worker}")
+
+        _, cfg = roles._cfg_for_token(worker)
+        model = str(cfg.get("model") or "n/a")
+        effort_val = cfg.get("effort")
+        effort = str(effort_val if effort_val is not None else "n/a")
+        effort_lookup = None if effort == "n/a" else effort
+
+        max_output_bytes, stall_seconds = cal.budget_for(worker, model, effort_lookup)
+        rows.append(
+            {
+                "worker": worker,
+                "model": model,
+                "effort": effort,
+                "max_output_bytes": max_output_bytes,
+                "stall_seconds": stall_seconds,
+                "has_calibration": cal.has_data_for(worker, model, effort_lookup),
+            }
+        )
+
+    return {"rows": rows}
