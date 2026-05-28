@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
+import os
 import sys
 
 from harness import roles
@@ -120,7 +120,8 @@ def _cmd_dashboard(args) -> int:
     cmd = [sys.executable, "-m", "dashboard", "--port", str(args.port)]
     if args.no_browser:
         cmd.append("--no-browser")
-    return subprocess.call(cmd)
+    os.execvp(cmd[0], cmd)
+    return 1
 
 
 def main(argv=None) -> int:
