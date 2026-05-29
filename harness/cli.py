@@ -82,6 +82,7 @@ def _cmd_do(args) -> int:
         branches=args.branches,
         test_cmd=args.test_cmd,
         web_search=args.web_search,
+        mission_critical=args.mission_critical,
         out_dir=args.out_dir,
     )
     _print_result(result)
@@ -146,7 +147,7 @@ def main(argv=None) -> int:
                          "on verifier failure (needs --test-cmd); "
                          "master=plan+ToT+adversarial for whole features; "
                          "pat=Plan-after-Trial: direct attempt first, escalate to master only on "
-                         "verifier failure (needs --test-cmd; ~40% cost savings on easy tasks); "
+                         "verifier failure (needs --test-cmd; ~40%% cost savings on easy tasks); "
                          "vote=K parallel candidates in isolated workspaces, verifier picks the "
                          "winner (needs --test-cmd; K=--branches; heterogeneous when chain has "
                          "multiple providers); "
@@ -171,6 +172,11 @@ def main(argv=None) -> int:
                     help="Optional verification command run as a quality gate")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
+    do.add_argument("--mission-critical", action="store_true",
+                    help="Prepend a catastrophic-failure-focused preamble to the "
+                         "critic prompt (adversarial mode). Opt-in: more exhaustive, "
+                         "severity-prioritized review for code whose failure could "
+                         "exhaust resources or crash/hang the host. Off by default.")
     do.add_argument("--out-dir", type=str, default=None, metavar="PATH",
                     help="Directory the worker should write files into (its cwd). "
                          "Default: AgentOrch's own repo root. Set when invoking AgentOrch "
