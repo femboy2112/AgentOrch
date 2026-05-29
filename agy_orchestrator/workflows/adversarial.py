@@ -11,6 +11,15 @@ logger = logging.getLogger(__name__)
 # a critic that merely *mentions* APPROVED inside its thinking can't converge.
 _THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
+CATASTROPHIC_FOCUS_PREAMBLE = (
+    "Review this adversarially and exhaustively: treat token cost as no object, and "
+    "your overriding goal is to surface any flaw that could be CATASTROPHIC - "
+    "anything that could exhaust resources, spawn unbounded processes, or crash or "
+    "hang the host machine or this process itself. Trace the control flow and "
+    "construct the adversarial input that triggers the worst case. Leave nothing "
+    "unremarked; default to flagging.\n\n"
+)
+
 
 def _is_approved(feedback: str) -> bool:
     """True only when the critic genuinely approves.
@@ -44,6 +53,7 @@ class AdversarialReview:
         max_iterations: int = 5,
         diff_only: bool = False,
         working_directory: str = ".",
+        critic_preamble: str = "",
     ):
         self.generator = generator_instance
         self.critic = critic_instance
@@ -58,6 +68,8 @@ class AdversarialReview:
         # with `make check` in the wrong tree. Default "." preserves the prior
         # behaviour exactly for in-repo runs.
         self.working_directory = working_directory
+        # When non-empty, this text is prepended to the critic prompt to push the review toward catastrophic-failure focus (opt-in, e.g. mission-critical dispatches).
+        self.critic_preamble = critic_preamble
         # Quality signals, populated by execute() for the run ledger (task #9).
         self.iterations_used = 0
         self.approved = False
@@ -119,6 +131,8 @@ class AdversarialReview:
                 f"If it meets all requirements with no defects, reply exactly with 'APPROVED'. "
                 f"Otherwise, provide specific, actionable changes needed."
             )
+            if self.critic_preamble:
+                critic_prompt = self.critic_preamble + critic_prompt
             self.critic.prompt = critic_prompt
             critic_feedback = await self.critic.run_async()
 

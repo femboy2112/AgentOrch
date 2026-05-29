@@ -23,7 +23,10 @@ from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import append_live_row
 from agy_orchestrator.execution.ledger import build_ledger
 from agy_orchestrator.execution.verifier import QualityVerifier, VerifierResult
-from agy_orchestrator.workflows.adversarial import AdversarialReview
+from agy_orchestrator.workflows.adversarial import (
+    CATASTROPHIC_FOCUS_PREAMBLE,
+    AdversarialReview,
+)
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
 from agy_orchestrator.workflows.pat import PatWorkflow
@@ -113,6 +116,7 @@ async def _run_workflow(
     codex_config: Optional[List[str]],
     post_construct_hook: Optional[roles.RolePostConstructHook] = None,
     working_directory: str = ".",
+    mission_critical: bool = False,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
@@ -136,7 +140,8 @@ async def _run_workflow(
             post_construct_hook=post_construct_hook,
         )
         wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations,
-                               working_directory=working_directory)
+                               working_directory=working_directory,
+                               critic_preamble=(CATASTROPHIC_FOCUS_PREAMBLE if mission_critical else ""))
         return await wf.execute(prompt), wf
 
     if mode == "feedback":
@@ -263,6 +268,7 @@ async def dispatch_async(
     branches: int = 3,
     test_cmd: Optional[str] = None,
     web_search: bool = False,
+    mission_critical: bool = False,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
 ) -> DispatchResult:
@@ -414,6 +420,7 @@ async def dispatch_async(
             branches=branches, verifier=verifier, codex_config=codex_config,
             post_construct_hook=_post_construct_hook,
             working_directory=str(work_dir),
+            mission_critical=mission_critical,
         )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
@@ -562,6 +569,7 @@ def dispatch(
     branches: int = 3,
     test_cmd: Optional[str] = None,
     web_search: bool = False,
+    mission_critical: bool = False,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
 ) -> DispatchResult:
@@ -580,6 +588,7 @@ def dispatch(
             branches=branches,
             test_cmd=test_cmd,
             web_search=web_search,
+            mission_critical=mission_critical,
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
         )
