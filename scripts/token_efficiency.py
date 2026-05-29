@@ -62,6 +62,21 @@ CLAUDE_ALIAS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6",
                 "opus": "claude-opus-4-8", "standard": "claude-sonnet-4-6"}
 
 
+def _reported_output_tokens(raw, text: str):
+    """Return output_tokens, or None when the telemetry is unreliable.
+
+    The claude CLI (and occasionally codex) sometimes reports ``output_tokens=0``
+    — or omits it — on a call that plainly produced output (non-empty text, real
+    cost/api time). A literal 0 is SILENTLY counted by the efficiency median/min
+    (``_med`` skips only None, not 0), so a phantom zero understates the frontier
+    and can make a normal run look "free". When the response text is non-empty
+    but the count is 0/missing, report None (unknown) so the scoreboard skips it
+    rather than trusting the zero. A genuinely empty response keeps its 0/None."""
+    if not raw and text.strip():
+        return None
+    return raw
+
+
 def _run(cmd: list[str], stdin: str, timeout: float,
          cwd: str | None = None) -> tuple[str, str, float]:
     t0 = time.time()
@@ -88,7 +103,8 @@ def run_claude(model: str, effort, prompt: str, timeout: float,
                 api_ms = b.get("duration_api_ms")
     except Exception:
         pass
-    return {"text": text, "out_tokens": usage.get("output_tokens"),
+    return {"text": text,
+            "out_tokens": _reported_output_tokens(usage.get("output_tokens"), text),
             "reasoning_tokens": None, "in_tokens": usage.get("input_tokens"),
             "cost_usd": cost, "api_ms": api_ms, "wall_ms": wall}
 
@@ -117,7 +133,8 @@ def run_codex(model: str, effort, prompt: str, timeout: float,
                 msgs.append(t)
     if msgs:
         text = max(msgs, key=len)
-    return {"text": text, "out_tokens": usage.get("output_tokens"),
+    return {"text": text,
+            "out_tokens": _reported_output_tokens(usage.get("output_tokens"), text),
             "reasoning_tokens": usage.get("reasoning_output_tokens"),
             "in_tokens": usage.get("input_tokens"), "cost_usd": None,
             "api_ms": None, "wall_ms": wall}
