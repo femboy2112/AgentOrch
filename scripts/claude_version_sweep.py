@@ -34,8 +34,16 @@ Usage:
     python scripts/claude_version_sweep.py                  # all known models, all brutal tasks
     python scripts/claude_version_sweep.py --dry-run        # print the plan, spawn NOTHING
     python scripts/claude_version_sweep.py --effort high    # override effort (opus/sonnet only)
+    python scripts/claude_version_sweep.py --efforts low high max   # version×effort grid (opt-in)
+    python scripts/claude_version_sweep.py --include-1m     # also sweep [1m] opus variants (opt-in)
     python scripts/claude_version_sweep.py --tasks calc3 candy --repeats 2
     python scripts/claude_version_sweep.py --models claude-opus-4-8 claude-opus-4-7
+
+On effort & [1m] (see --help): the default sweep holds effort fixed per tier so
+the only variable is the model VERSION. On the saturated brutal tasks effort and
+[1m] do not move pass-rate — they shift tokens/latency only — so --efforts is a
+token/floor probe and --include-1m is near-redundant here (1m matters on
+long-context work, not short tasks). Both are opt-in and off by default.
 """
 from __future__ import annotations
 
@@ -66,6 +74,19 @@ KNOWN_CLAUDE_MODELS: list[tuple[str, str | None]] = [
 # override is NOT applied to these (it would error the CLI).
 _NO_EFFORT_MODELS = {"claude-haiku-4-5"}
 
+# Valid headless `--effort` values (`claude --help`, verified 2026-05-29).
+# `ultracode` is deliberately ABSENT: it is an interactive-UI-only effort level
+# and the headless flag rejects it ("must be one of: low, medium, high, xhigh,
+# max"). Validating against this set fails fast on typos AND documents the limit.
+VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+# The `[1m]` 1M-context suffix works on opus 4.7+ only (verified convention).
+# WHY IT'S OPT-IN AND USUALLY POINTLESS HERE: on the short brutal tasks 1m is
+# near-redundant — same pass-rate and ~same token count as the base model, since
+# nothing uses the extra context window. Its real signal is long-context
+# workloads (big diff-feedback, master-mode long runs), not this sweep.
+_1M_CAPABLE_PREFIXES = ("claude-opus-4-7", "claude-opus-4-8")
+
 
 def _resolve_effort(model: str, default_effort: str | None,
                     override: str | None) -> str | None:
@@ -76,17 +97,44 @@ def _resolve_effort(model: str, default_effort: str | None,
     return override if override is not None else default_effort
 
 
-def _build_grid(models: list[str] | None,
-                effort_override: str | None) -> list[tuple[str, str, str | None]]:
-    """Return [(worker, model, effort), ...] for the requested claude versions."""
+def _expand_1m(model: str) -> list[str]:
+    """Base model, plus its `[1m]` variant when the model supports it."""
+    if "[1m]" in model or not model.startswith(_1M_CAPABLE_PREFIXES):
+        return [model]
+    return [model, model + "[1m]"]
+
+
+def _build_grid(models: list[str] | None, effort_override: str | None,
+                efforts: list[str] | None, include_1m: bool
+                ) -> list[tuple[str, str, str | None]]:
+    """Return [(worker, model, effort), ...] for the requested claude versions.
+
+    - ``efforts`` (a list): sweep each model across every listed effort — a
+      version×effort grid. Haiku collapses to one no-effort row; dups removed.
+    - ``effort_override`` (single): one effort for all (ignored when ``efforts``).
+    - ``include_1m``: also add the ``[1m]`` variant of every 1m-capable opus.
+    """
     if models:
         # User passed explicit full ids; carry no per-model default effort, so
-        # rely on the override (or None). Unknown models still get the haiku guard.
+        # rely on the override/efforts (or None). Unknown models still get the
+        # haiku guard via _resolve_effort.
         pairs = [(m, None) for m in models]
     else:
         pairs = list(KNOWN_CLAUDE_MODELS)
-    return [("claude", m, _resolve_effort(m, default_eff, effort_override))
-            for m, default_eff in pairs]
+
+    if include_1m:
+        pairs = [(variant, eff) for m, eff in pairs for variant in _expand_1m(m)]
+
+    if efforts:
+        rows = [("claude", m, _resolve_effort(m, eff, None))
+                for m, _default in pairs for eff in efforts]
+    else:
+        rows = [("claude", m, _resolve_effort(m, default_eff, effort_override))
+                for m, default_eff in pairs]
+
+    # Dedup — haiku collapses every effort to a single None row.
+    seen: set = set()
+    return [r for r in rows if not (r in seen or seen.add(r))]
 
 
 def main() -> None:
@@ -100,6 +148,19 @@ def main() -> None:
     ap.add_argument("--effort", default=None,
                     help="Override effort for all opus/sonnet models "
                          "(haiku always runs without --effort).")
+    ap.add_argument("--efforts", nargs="*", default=None,
+                    help="Sweep each opus/sonnet model across THESE efforts "
+                         "(version×effort grid; e.g. --efforts low high max). "
+                         "Overrides --effort. CAVEAT: on the saturated brutal "
+                         "tasks effort moves tokens/latency, NOT pass-rate — "
+                         "higher effort is wasted, lower effort is a "
+                         "quality-floor finder. For the token frontier proper "
+                         "use scripts/token_efficiency.py.")
+    ap.add_argument("--include-1m", action="store_true",
+                    help="Also sweep the [1m] 1M-context variant of every "
+                         "1m-capable opus model (4.7+). NEAR-REDUNDANT on the "
+                         "short brutal tasks (same pass-rate + tokens as the "
+                         "base model); meaningful only on long-context work.")
     ap.add_argument("--repeats", type=int, default=1,
                     help="Repeats per (model,task); medians reported.")
     ap.add_argument("--timeout", type=int, default=240)
@@ -108,7 +169,13 @@ def main() -> None:
                     help="Print the plan + resolved `claude --model` per row; spawn nothing.")
     args = ap.parse_args()
 
-    grid = _build_grid(args.models, args.effort)
+    bad = [e for e in (args.efforts or []) + ([args.effort] if args.effort else [])
+           if e not in VALID_EFFORTS]
+    if bad:
+        ap.error(f"invalid effort(s) {bad}; valid: {sorted(VALID_EFFORTS)}. "
+                 "('ultracode' is interactive-UI-only and rejected by the headless --effort flag.)")
+
+    grid = _build_grid(args.models, args.effort, args.efforts, args.include_1m)
     n_calls = len(grid) * len(args.tasks) * args.repeats
 
     print("claude version sweep")
@@ -119,7 +186,7 @@ def main() -> None:
     print("  rows:")
     for worker, model, effort in grid:
         eff = effort if effort else "(no --effort)"
-        print(f"    claude --model {model:24} effort={eff}")
+        print(f"    claude --model {model:30} effort={eff}")
     print(flush=True)
 
     if args.dry_run:
