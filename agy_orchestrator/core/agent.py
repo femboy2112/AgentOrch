@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import signal
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -266,10 +267,7 @@ class AgentInstance(ABC):
                     self._watchdog_reason = WATCHDOG_VERBOSE
                     logger.warning("watchdog: VERBOSE trip — %d bytes > budget %d; killing",
                                    out_total[0], max_output_bytes)
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
+                    self._killpg_tree(process)
                     return
                 if stall_seconds > 0 and (time.monotonic() - last_progress[0]) > stall_seconds:
                     # Only trip stall if NOTHING has been produced on EITHER stream
@@ -280,10 +278,7 @@ class AgentInstance(ABC):
                         self._watchdog_reason = WATCHDOG_STALLED
                         logger.warning("watchdog: STALLED trip — no output for %.0fs; killing",
                                        stall_seconds)
-                        try:
-                            process.kill()
-                        except Exception:
-                            pass
+                        self._killpg_tree(process)
                         return
 
         out_chunks: List[bytes] = []
@@ -298,17 +293,35 @@ class AgentInstance(ABC):
         self.last_out_bytes = out_total[0]
         return b"".join(out_chunks), b"".join(err_chunks)
 
-    async def _kill_current(self) -> None:
-        """Kill and reap the tracked child if it is still running. Best-effort,
-        bounded so a wedged process can't hang the reaping itself."""
-        proc = self._current_process
-        self._current_process = None
-        if proc is None or proc.returncode is not None:
+    @staticmethod
+    def _killpg_tree(proc: "asyncio.subprocess.Process") -> None:
+        """SIGKILL the child's ENTIRE process group, not just the child.
+
+        The worker is spawned with start_new_session=True, so it leads its own
+        process group and every descendant (e.g. a `codex exec` grandchild
+        running `make check`) shares that pgid. Killing the group reaps the whole
+        tree; killing only the child lets the grandchild escape, reparent to init,
+        and keep running — the runaway-codex failure mode. Falls back to a plain
+        child kill if the group lookup/kill fails (e.g. it already exited)."""
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
             return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
         try:
             proc.kill()
         except Exception:
             pass
+
+    async def _kill_current(self) -> None:
+        """Kill and reap the tracked child TREE if it is still running.
+        Best-effort, bounded so a wedged process can't hang the reaping itself."""
+        proc = self._current_process
+        self._current_process = None
+        if proc is None or proc.returncode is not None:
+            return
+        self._killpg_tree(proc)
         try:
             await asyncio.wait_for(proc.wait(), 5)
         except Exception:
@@ -346,6 +359,13 @@ class AgentInstance(ABC):
                         stderr=asyncio.subprocess.PIPE,
                         cwd=self.cwd,
                         env=self._child_env(),
+                        # Own session/process group so the WHOLE worker tree is
+                        # reapable on timeout/watchdog kill. Without this, killing
+                        # the wrapper (e.g. `codex`) leaves its heavy grandchild
+                        # (`codex exec` running `make check`) to reparent to init
+                        # and keep burning CPU, starving the real verifier. See
+                        # _kill_current()/_killpg_tree().
+                        start_new_session=True,
                     )
                     self._current_process = process
 
