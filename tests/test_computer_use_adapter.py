@@ -291,8 +291,11 @@ def test_teardown_cleans_xvfb_and_artifacts():
     assert ctrl.get_session("r-td") is None
 
 
-def test_adapter_stop_sets_stop_event_and_tears_down():
-    adapter = ComputerUseWorkerAdapter()
+def test_adapter_stop_sets_stop_event_and_tears_down(tmp_path: Path):
+    # Inject a tmp_path-scoped sink (matching the other adapter tests) so the
+    # run does not write runs/r-stop/ into the real repo runs/ dir.
+    sink = AuditEventSink("r-stop", events_path=tmp_path / "e.jsonl")
+    adapter = ComputerUseWorkerAdapter(audit_sink_factory=lambda rid: sink)
     h = adapter.start({"run_id": "r-stop", "objective": "stop test", "budgets": {"max_steps": 1}})
     res = adapter.stop("r-stop")
     assert isinstance(res, StopResult) or hasattr(res, "terminated")
