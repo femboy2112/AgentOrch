@@ -71,8 +71,22 @@ class DispatchResult:
     quality: Optional[dict] = None
 
 
-def _build_prompt(instruction: str, context: Optional[str]) -> str:
+def _build_prompt(
+    instruction: str, context: Optional[str], spec: Optional[str] = None
+) -> str:
     parts = [WORKER_PREAMBLE, "\n## Instruction\n" + instruction.strip()]
+    if spec:
+        # An approved FloodSpec design doc: the authoritative source of truth.
+        # Placed before free-form context so it dominates the worker's framing —
+        # and, for master mode, so the planner decomposes THIS design rather than
+        # re-inventing one from the bare instruction.
+        parts.append(
+            "\n## Approved design specification (authoritative)\n"
+            "Build the system described by this specification. It has been reviewed "
+            "and approved; treat it as the source of truth for architecture, "
+            "interfaces, data models, and constraints. Do not redesign it — "
+            "implement it.\n\n" + spec.strip()
+        )
     if context:
         parts.append("\n## Additional context\n" + context.strip())
     return "\n".join(parts)
@@ -269,10 +283,16 @@ async def dispatch_async(
     test_cmd: Optional[str] = None,
     web_search: bool = False,
     mission_critical: bool = False,
+    spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run.
+
+    ``spec`` is an approved FloodSpec design document (the text, not a path);
+    when present it is injected as the authoritative design the worker must
+    implement — for master mode the planner decomposes it instead of the bare
+    instruction.
 
     ``out_dir`` is the directory the worker subprocess runs in (its cwd) and
     the scope of the before/after snapshot diff. Defaults to AgentOrch's own
@@ -316,7 +336,7 @@ async def dispatch_async(
         with events_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
-    prompt = _build_prompt(instruction, context)
+    prompt = _build_prompt(instruction, context, spec)
     (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
     gen_desc = roles.describe_chain(generator_chain, fallback)
@@ -570,6 +590,7 @@ def dispatch(
     test_cmd: Optional[str] = None,
     web_search: bool = False,
     mission_critical: bool = False,
+    spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
 ) -> DispatchResult:
@@ -589,6 +610,7 @@ def dispatch(
             test_cmd=test_cmd,
             web_search=web_search,
             mission_critical=mission_critical,
+            spec=spec,
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
         )
