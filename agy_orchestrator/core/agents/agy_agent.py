@@ -72,6 +72,13 @@ class AgyAgent(AgentInstance):
         self.effort = effort
         self.input_files = input_files or []
         self.output_files = output_files or []
+        # Neuter the browser launcher for headless agy runs: on token expiry agy
+        # would otherwise open Firefox for Google OAuth, which the operator can't
+        # complete (the subprocess stdin isn't a terminal to paste the code into)
+        # and which hangs the call. Pointing BROWSER at a no-op makes expiry a
+        # clean fast failure that the fallback chain (agy->codex->grok) rolls over.
+        # Re-auth is done out-of-band via an interactive `agy -i` session.
+        self.extra_env = {"BROWSER": "/bin/true"}
 
     @classmethod
     async def get_available_models(cls) -> List[str]:
@@ -105,6 +112,7 @@ class AgyAgent(AgentInstance):
             injected_prompt += f"\n\n[Piped Context from previous step]:\n{piped_input}"
 
         cmd = ["agy", "--print", injected_prompt, "--dangerously-skip-permissions"]
+        cmd += ["--print-timeout", os.environ.get("AGY_PRINT_TIMEOUT", "300s")]
         for k, v in self.additional_flags.items():
             cmd.extend([f"--{k}", str(v)])
         return cmd

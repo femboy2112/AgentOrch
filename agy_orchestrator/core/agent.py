@@ -84,6 +84,11 @@ class AgentInstance(ABC):
         # harness sets this to its --out-dir so a worker invocation from
         # another repo doesn't pollute AgentOrch itself.
         self.cwd: Optional[str] = None
+        # Extra environment variables to inject into the child subprocess. Empty
+        # by default (child inherits the parent env unchanged). Subclasses set
+        # this to override/add vars for their CLI (e.g. AgyAgent neuters BROWSER
+        # so an expired-token OAuth flow can't pop a browser inside a headless run).
+        self.extra_env: Dict[str, str] = {}
 
     @classmethod
     @abstractmethod
@@ -167,6 +172,14 @@ class AgentInstance(ABC):
 
     def _events_from_stdout_complete(self, raw_stdout: str) -> List[dict]:
         return []
+
+    def _child_env(self) -> Optional[Dict[str, str]]:
+        """Environment for the child subprocess: parent env plus self.extra_env,
+        or None to inherit the parent env unchanged (the default — preserves
+        prior behavior exactly when no overrides are set)."""
+        if not self.extra_env:
+            return None
+        return {**os.environ, **self.extra_env}
 
     async def _stream_communicate(self, process, stdin_bytes: Optional[bytes] = None,
                                   *, max_output_bytes: int = 0,
@@ -332,6 +345,7 @@ class AgentInstance(ABC):
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=self.cwd,
+                        env=self._child_env(),
                     )
                     self._current_process = process
 
