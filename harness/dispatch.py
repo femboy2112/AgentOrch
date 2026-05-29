@@ -17,7 +17,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import append_live_row
@@ -286,6 +286,10 @@ async def dispatch_async(
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
+    computer_use_mode: Optional[str] = None,
+    computer_use_task_priority: Optional[str] = None,
+    computer_use_budgets: Optional[Dict[str, Any]] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run.
 
@@ -304,6 +308,8 @@ async def dispatch_async(
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
     critic_chain = critic_chain or list(roles.CRITIC_CHAIN)
     codex_config = ["tools.web_search=true"] if web_search else None
+    # Step 12: recognize computer-use as standard worker token (no LLM path)
+    _is_cu = bool(generator_chain) and generator_chain[0] == roles.COMPUTER_USE_TOKEN
     if mode == "auto":
         from agy_orchestrator.routing.policy import RoutingPolicy, from_dispatch_args
         task = from_dispatch_args(
@@ -433,15 +439,41 @@ async def dispatch_async(
     output = ""
     workflow = None
     try:
-        output, workflow = await _run_workflow(
-            mode, prompt,
-            generator_chain=generator_chain, critic_chain=critic_chain,
-            fallback=fallback, cycles=cycles, max_iterations=max_iterations,
-            branches=branches, verifier=verifier, codex_config=codex_config,
-            post_construct_hook=_post_construct_hook,
-            working_directory=str(work_dir),
-            mission_critical=mission_critical,
-        )
+        if _is_cu:
+            # Step 12 minimal glue: exercise the real adapter (writes events.jsonl under runs/<id>/,
+            # respects --out-dir via harness snapshot scope, supports cu params).
+            # Only direct-style runs are exercised here; complex workflows stay LLM-only.
+            from agy_orchestrator.computer_use.adapter import ComputerUseWorkerAdapter
+            from agy_orchestrator.computer_use.audit import AuditEventSink as CUAuditSink
+
+            def _cu_sink(rid: str):
+                # Append to the harness-prepared events.jsonl and fan out to bus for dashboard.
+                s = CUAuditSink(run_id=rid, events_path=events_path)
+                pub = EVENT_BUS.publisher_for(rid, worker="computer-use", model="n/a", effort="n/a")
+                s.add_callback(lambda d: pub({"kind": "computer_use_event", "data": d}) or None)
+                return s
+
+            adapter = ComputerUseWorkerAdapter(audit_sink_factory=_cu_sink)
+            cu_req = {
+                "run_id": run_id,
+                "objective": instruction,  # raw objective for the reasoner; prompt wrapper is in artifacts
+                "mode": computer_use_mode or "ISOLATED",
+                "task_priority": computer_use_task_priority or "normal",
+                "budgets": computer_use_budgets,
+            }
+            h = adapter.start(cu_req)
+            output = f"computer-use:{h.status} run_id={h.run_id} events={h.events_path or ''}"
+            # workflow stays None (no quality ledger from cu yet)
+        else:
+            output, workflow = await _run_workflow(
+                mode, prompt,
+                generator_chain=generator_chain, critic_chain=critic_chain,
+                fallback=fallback, cycles=cycles, max_iterations=max_iterations,
+                branches=branches, verifier=verifier, codex_config=codex_config,
+                post_construct_hook=_post_construct_hook,
+                working_directory=str(work_dir),
+                mission_critical=mission_critical,
+            )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
         error = f"{type(exc).__name__}: {exc}"
@@ -593,6 +625,10 @@ def dispatch(
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    # Step 12: forwarded for computer-use adapter (see dispatch_async)
+    computer_use_mode: Optional[str] = None,
+    computer_use_task_priority: Optional[str] = None,
+    computer_use_budgets: Optional[Dict[str, Any]] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run. Synchronous entrypoint."""
     return asyncio.run(
@@ -613,5 +649,8 @@ def dispatch(
             spec=spec,
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
+            computer_use_mode=computer_use_mode,
+            computer_use_task_priority=computer_use_task_priority,
+            computer_use_budgets=computer_use_budgets,
         )
     )

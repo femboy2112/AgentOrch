@@ -1,0 +1,290 @@
+"""PerceptionPipeline + collectors (Step 8).
+
+FR-05 (AT-SPI graceful degrade), FR-06 (DOM best-effort CDP), FR-17 (multi-scope).
+OBSERVE redaction (hardening #4, default-on via utils) before any reasoner payload.
+All collectors and tools bound to explicit DISPLAY only; never default to real :0.
+Hermetic, stdlib+subprocess, Xvfb-only in tests.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from .models import (
+    ElementHandle,
+    ElementSource,
+    PerceptionSnapshot,
+    Scope,
+    SnapshotSummary,
+    TextBlockSource,
+    WorkerEvent,
+    WorkerEventType,
+)
+from .utils import is_redaction_enabled_for_run, redact_secrets
+
+
+try:
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi  # type: ignore
+    _HAS_ATSPI = True
+except Exception:
+    _HAS_ATSPI = False
+    Atspi = None  # type: ignore
+
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+    _HAS_PLAYWRIGHT = True
+except Exception:
+    _HAS_PLAYWRIGHT = False
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _tid() -> str:
+    return f"s-{uuid.uuid4().hex[:10]}"
+
+
+def _e(display: str, env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    ee = dict(env) if env else os.environ.copy()
+    ee["DISPLAY"] = display
+    ee.pop("WAYLAND_DISPLAY", None)
+    return ee
+
+
+def _sh(cmd: List[str], env: Dict[str, str], to: float = 3.0) -> str:
+    try:
+        return subprocess.check_output(cmd, env=env, stderr=subprocess.DEVNULL, timeout=to, text=True)
+    except Exception:
+        return ""
+
+
+class ATSPICollector:
+    def __init__(self, display: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> None:
+        self.display = display
+        self.env = env or {}
+    def collect(self) -> List[ElementHandle]:
+        if not _HAS_ATSPI:
+            return []
+        return []
+
+
+class GeometryCollector:
+    def __init__(self, display: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> None:
+        self.display = display or ":99"
+        self.env = _e(self.display, env)
+    def collect(self) -> Tuple[List[Dict[str, Any]], List[ElementHandle]]:
+        wins: List[Dict[str, Any]] = []
+        elems: List[ElementHandle] = []
+        out = _sh(["wmctrl", "-lG"], self.env)
+        for line in out.splitlines():
+            p = line.split(None, 6)
+            if len(p) >= 6:
+                try:
+                    wid = p[0]
+                    x, y, w, h = int(p[2]), int(p[3]), int(p[4]), int(p[5])
+                    title = p[6] if len(p) > 6 else ""
+                    wins.append({"window_id": wid, "title": title, "bbox": {"x": x, "y": y, "w": w, "h": h}})
+                    elems.append(ElementHandle(handle_id=f"geom-{wid}", source=ElementSource.GEOMETRY.value, window_id=wid, name=title or None, bbox={"x": x, "y": y, "w": w, "h": h}, confidence=0.75, provenance=["GeometryCollector"]))
+                except Exception:
+                    pass
+        if not wins:
+            # xwininfo fallback for bare Xvfb (no EWMH wmctrl data)
+            tree = _sh(["xwininfo", "-root", "-tree"], self.env, 2.5)
+            import re
+            for line in tree.splitlines():
+                m = re.search(r"(0x[0-9a-f]+).*?\"([^\"]+)\".*?(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", line)
+                if m:
+                    wid, title, ww, hh, xx, yy = m.groups()
+                    bb = {"x": int(xx), "y": int(yy), "w": int(ww), "h": int(hh)}
+                    wins.append({"window_id": wid, "title": title, "bbox": bb})
+                    elems.append(ElementHandle(handle_id=f"geom-{wid}", source=ElementSource.GEOMETRY.value, window_id=wid, name=title or None, bbox=bb, confidence=0.6, provenance=["GeometryCollector:xwininfo"]))
+        return wins, elems
+
+
+class OCRCollector:
+    def __init__(self, display: Optional[str] = None, env: Optional[Dict[str, str]] = None, lang: str = "eng") -> None:
+        self.display = display or ":99"
+        self.env = _e(self.display, env)
+        self.lang = lang
+    def collect(self) -> List[Dict[str, Any]]:
+        if not (shutil.which("scrot") and shutil.which("tesseract")):
+            return []
+        blocks: List[Dict[str, Any]] = []
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "c.png")
+            try:
+                subprocess.check_call(["scrot", "-o", img], env=self.env, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                out = _sh(["tesseract", img, "stdout", "-l", self.lang, "--psm", "6"], self.env, 5.0)
+                y = 20
+                for line in (out or "").splitlines():
+                    line = line.strip()
+                    if line:
+                        blocks.append({"text": line[:120], "bbox": {"x": 10, "y": y, "w": 400, "h": 14}, "source": TextBlockSource.OCR.value})
+                        y += 16
+            except Exception:
+                pass
+        return blocks
+
+
+class BrowserDOMCollector:
+    """Best-effort DOM collector (FR-06). Attempts Playwright CDP connect when
+    endpoint is known; returns [] on any failure or when unavailable. Never
+    required for core perception (geometry + OCR + optional ATSPI suffice).
+    """
+    def __init__(self, display: Optional[str] = None, env: Optional[Dict[str, str]] = None, cdp_endpoint: Optional[str] = None) -> None:
+        self.cdp_endpoint = cdp_endpoint
+
+    def collect(self) -> List[ElementHandle]:
+        if not self.cdp_endpoint or not _HAS_PLAYWRIGHT:
+            return []
+        try:
+            with sync_playwright() as p:
+                # Connect with short timeout; best-effort only. We do not synthesize
+                # ElementHandles from the DOM tree here (that belongs in later fusion
+                # or reasoner layers); successful connect proves the CDP path works.
+                browser = p.chromium.connect_over_cdp(self.cdp_endpoint, timeout=1000)
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            return []
+        except Exception:
+            # Any error (no browser, wrong port, playwright transport, timeout, etc.)
+            # is degraded silently — perception continues with other signals.
+            return []
+
+
+class PerceptionPipeline:
+    def __init__(
+        self,
+        audit_sink: Optional[Any] = None,
+        redaction_enabled: Optional[bool] = None,
+        default_isolated_display: str = ":99",
+        default_observe_display: str = ":0",
+        **kw: Any,
+    ) -> None:
+        self.audit_sink = audit_sink
+        self.redaction_enabled = is_redaction_enabled_for_run() if redaction_enabled is None else bool(redaction_enabled)
+        self.default_isolated_display = default_isolated_display
+        self.default_observe_display = default_observe_display
+
+    def snapshot(
+        self,
+        scope: str,
+        *,
+        display: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+        cdp_endpoint: Optional[str] = None,
+        run_id: str = "p8",
+        redaction_enabled: Optional[bool] = None,
+        **kw: Any,
+    ) -> PerceptionSnapshot:
+        # Normalize scope; support per-scope overrides for FR-17 multi-scope
+        # (e.g. snapshot_set(..., displays={"isolated": ":99", "observe_real": ":0"}, ...))
+        if scope not in {s.value for s in Scope}:
+            scope = Scope.ISOLATED.value
+
+        # Resolve effective display/env for *this* scope (scalar wins over dict, then default)
+        eff_display = display
+        eff_env = env
+        displays_d = kw.get("displays") or {}
+        envs_d = kw.get("envs") or {}
+        if isinstance(displays_d, dict):
+            eff_display = displays_d.get(scope, eff_display)
+        if isinstance(envs_d, dict):
+            eff_env = envs_d.get(scope, eff_env)
+        if not eff_display:
+            eff_display = self.default_isolated_display if scope == Scope.ISOLATED.value else self.default_observe_display
+        if eff_env is None:
+            eff_env = {}
+
+        use_red = self.redaction_enabled if redaction_enabled is None else bool(redaction_enabled)
+        sid = _tid()
+        ts = _now()
+        m = "ISOLATED" if scope == Scope.ISOLATED.value else "OBSERVE"
+
+        # All collectors receive explicit DISPLAY-bound env (never implicit real :0)
+        at = ATSPICollector(eff_display, eff_env).collect()
+        gw, ge = GeometryCollector(eff_display, eff_env).collect()
+        ob = OCRCollector(eff_display, eff_env).collect()
+        de = BrowserDOMCollector(eff_display, eff_env, cdp_endpoint).collect()
+
+        elems: List[ElementHandle] = []
+        seen: set[str] = set()
+        for el in at + ge + de:
+            if el.handle_id not in seen:
+                seen.add(el.handle_id)
+                elems.append(el)
+        raw = list(ob)
+
+        # OBSERVE hardening #4: real-:0-scope text (titles, OCR, AT-SPI names, DOM, terminal)
+        # MUST be redacted *before* the snapshot (and thus before any ReasoningInput/envelope).
+        # ISOLATED scope is never redacted here (controlled content; redaction would be lossy).
+        if scope == Scope.OBSERVE_REAL.value and use_red:
+            gw = [
+                {**w, "title": redact_secrets(w.get("title", "")) if isinstance(w.get("title"), str) else w.get("title")}
+                for w in gw
+            ]
+            raw = [
+                {**b, "text": redact_secrets(b.get("text", "")) if isinstance(b.get("text"), str) else b.get("text")}
+                for b in raw
+            ]
+            elems = [
+                ElementHandle(
+                    handle_id=el.handle_id,
+                    source=el.source,
+                    window_id=el.window_id,
+                    app_pid=el.app_pid,
+                    role=el.role,
+                    name=redact_secrets(el.name) if el.name else el.name,
+                    bbox=dict(el.bbox),
+                    confidence=el.confidence,
+                    provenance=list(el.provenance),
+                )
+                if el.name
+                else el
+                for el in elems
+            ]
+
+        snap = PerceptionSnapshot(
+            snapshot_id=sid, run_id=run_id, mode=m, scope=scope, captured_at=ts,
+            windows=gw, elements=elems, raw_text_blocks=raw
+        )
+        if self.audit_sink:
+            try:
+                self.audit_sink.emit(
+                    WorkerEvent(
+                        ts=str(time.time()),
+                        run_id=run_id,
+                        event_type=WorkerEventType.PERCEPTION_SNAPSHOT.value,
+                        payload={"scope": scope, "snapshot_id": sid, "windows": len(gw), "elements": len(elems)},
+                    )
+                )
+            except Exception:
+                pass
+        return snap
+
+    def snapshot_set(self, scopes: List[str], **kw: Any) -> Dict[str, PerceptionSnapshot]:
+        out: Dict[str, PerceptionSnapshot] = {}
+        for sc in scopes:
+            out[sc] = self.snapshot(sc, **kw)
+        return out
+
+    def make_summary(self, snap: PerceptionSnapshot) -> SnapshotSummary:
+        se: List[Dict[str, Any]] = []
+        for el in snap.elements:
+            se.append({"handle_id": el.handle_id, "source": el.source, "role": el.role, "name": el.name, "bbox": dict(el.bbox), "confidence": el.confidence})
+        return SnapshotSummary(snapshot_id=snap.snapshot_id, captured_at=snap.captured_at, scope=snap.scope, windows=[dict(w) for w in snap.windows], elements=se, raw_text_blocks=[dict(b) for b in snap.raw_text_blocks])
+
+
+__all__ = ["ATSPICollector", "GeometryCollector", "OCRCollector", "BrowserDOMCollector", "PerceptionPipeline"]

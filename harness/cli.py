@@ -78,6 +78,21 @@ def _cmd_do(args) -> int:
             print(f"{C_RED}no such spec file: {args.spec}{C_RESET}", file=sys.stderr)
             return 1
         spec_text = spec_path.read_text(encoding="utf-8")
+
+    # Step 12: parse computer-use config (only has effect when generator chain leads with computer-use)
+    cu_mode = getattr(args, "computer_use_mode", None)
+    cu_priority = getattr(args, "computer_use_task_priority", None)
+    cu_budgets = None
+    if getattr(args, "computer_use_budgets", None):
+        try:
+            import json as _json
+            cu_budgets = _json.loads(args.computer_use_budgets)
+            if not isinstance(cu_budgets, dict):
+                raise ValueError("budgets must be a JSON object")
+        except Exception as e:
+            print(f"{C_RED}bad --computer-use-budgets JSON: {e}{C_RESET}", file=sys.stderr)
+            return 1
+
     result = dispatch(
         args.instruction,
         mode=args.mode,
@@ -93,6 +108,9 @@ def _cmd_do(args) -> int:
         mission_critical=args.mission_critical,
         spec=spec_text,
         out_dir=args.out_dir,
+        computer_use_mode=cu_mode,
+        computer_use_task_priority=cu_priority,
+        computer_use_budgets=cu_budgets,
     )
     _print_result(result)
     return 0 if result.success else 1
@@ -202,10 +220,10 @@ def main(argv=None) -> int:
                     help="Extra context appended to the instruction")
     do.add_argument("--generator", type=str, default=None,
                     help=f"Comma-separated generator chain (default: {','.join(roles.GENERATOR_CHAIN)}). "
-                         f"Workers: codex, claude, agy, grok.")
+                         f"Workers: codex, claude, agy, grok, computer-use.")
     do.add_argument("--critic", type=str, default=None,
                     help=f"Comma-separated critic chain (default: {','.join(roles.CRITIC_CHAIN)}). "
-                         f"Workers: codex, claude, agy, grok.")
+                         f"Workers: codex, claude, agy, grok, computer-use.")
     do.add_argument("--fallback", action=argparse.BooleanOptionalAction, default=True,
                     help="Wrap roles in usage-exhaustion fallback (default on)")
     do.add_argument("--cycles", type=int, default=2,
@@ -227,6 +245,14 @@ def main(argv=None) -> int:
                          "Default: AgentOrch's own repo root. Set when invoking AgentOrch "
                          "from another repo so workers don't pollute AgentOrch. "
                          "Snapshot diff and changed-files list scope follow this path.")
+    # Step 12: computer-use config (forwarded only when --generator contains computer-use)
+    do.add_argument("--computer-use-mode", choices=["ISOLATED", "OBSERVE"], default=None,
+                    help="computer-use: ISOLATED (default: private Xvfb, full perceive+act) or "
+                         "OBSERVE (real :0 read-only perception; actions remain isolated-only per FR-03/04).")
+    do.add_argument("--computer-use-task-priority", choices=["normal", "high"], default=None,
+                    help="computer-use: 'high' routes reasoner claude→codex; 'normal' (default) codex→claude (FR-14/21).")
+    do.add_argument("--computer-use-budgets", type=str, default=None, metavar="JSON",
+                    help="computer-use: JSON dict overriding budgets (e.g. '{\"max_steps\": 50, \"max_actions\": 30}').")
     do.add_argument("--spec", type=str, default=None, metavar="PATH",
                     help="Path to an approved FloodSpec design doc (see `harness spec`). "
                          "Injected as the authoritative design the worker must implement; "

@@ -27,12 +27,21 @@ from agy_orchestrator.core.agents.fallback_agent import make_fallback_agent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
 from agy_orchestrator.core.calibration import CalibrationTable
 
+# Step 12: computer-use as selectable standard worker token (resolves to shim)
+from harness.computer_use_role import ComputerUseShim  # thin adapter delegate; no LLM impact
+
 AGENT_CLASSES: Dict[str, Type[AgentInstance]] = {
     "codex": CodexAgent,
     "agy": AgyAgent,
     "claude": ClaudeAgent,
     "grok": GrokAgent,
+    # Step 12: 'computer-use' resolves via special-case below (shim, not AgentInstance subclass)
 }
+
+# computer-use is a standard selectable worker token (Step 12 wiring).
+# It does not resolve to an LLM AgentInstance; dispatch short-circuits to
+# ComputerUseWorkerAdapter for --generator computer-use (direct mode).
+COMPUTER_USE_TOKEN = "computer-use"
 
 # Provider family for each worker — used by the cross-family verifier guard
 # (see check_chains_cross_family below). The literature on LLM-as-judge
@@ -47,6 +56,7 @@ WORKER_FAMILY: Dict[str, str] = {
     "claude": "anthropic",
     "agy": "google",
     "grok": "xai",
+    "computer-use": "computer-use",
 }
 
 # Per-provider model/effort. "best model" per provider, high effort.
@@ -57,6 +67,8 @@ AGENT_DEFAULTS: Dict[str, Dict[str, object]] = {
     # xAI Grok agentic CLI. Only `grok-build` exists today and it REJECTS the
     # reasoning-effort param, so effort is "n/a" and GrokAgent never sends it.
     "grok": {"model": "grok-build", "effort": "n/a"},
+    # Step 12: computer-use token (non-LLM); used by _cfg_for_token + describe_chain
+    "computer-use": {"model": "computer-use", "effort": "n/a"},
 }
 
 # Ordered fallback chains by role. Generator leads with codex (the code writer);
@@ -113,10 +125,14 @@ def _cfg_for_token(
 ) -> Tuple[str, Dict[str, object]]:
     """Resolve a chain token to ``(agent_name, config)``.
 
-    A token is a plain agent name (``codex``/``agy``/``claude``/``grok``). Codex
-    config overrides (e.g. ``tools.web_search=true``) are threaded onto codex."""
+    A token is a plain agent name (``codex``/``agy``/``claude``/``grok``) or
+    the special ``computer-use`` worker (Step 12). The latter returns a stub
+    config; dispatch routes it to the adapter instead of LLM path."""
     name = token
-    cfg = dict(AGENT_DEFAULTS[name])
+    if name == COMPUTER_USE_TOKEN:
+        cfg = {"model": "n/a", "effort": "n/a"}
+    else:
+        cfg = dict(AGENT_DEFAULTS[name])
     if name == "codex" and codex_config:
         cfg["config_overrides"] = list(codex_config)
     return name, cfg
@@ -128,6 +144,8 @@ def _configs_for(
     out: Dict[Type[AgentInstance], Dict[str, object]] = {}
     for token in chain:
         name, cfg = _cfg_for_token(token, codex_config)
+        if name == COMPUTER_USE_TOKEN:
+            continue  # Step 12: cu never participates in LLM fallback dicts
         out[AGENT_CLASSES[name]] = cfg
     return out
 
@@ -154,6 +172,16 @@ def build_role_agent(
         raise ValueError("role chain must be non-empty")
 
     lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config)
+
+    if lead_name == COMPUTER_USE_TOKEN:
+        # Step 12: return shim (no LLM class, no watchdog, hook still runs for cwd/run linkage)
+        agent = ComputerUseShim(prompt=prompt, **lead_cfg)
+        if post_construct_hook is not None:
+            try:
+                post_construct_hook(agent, lead_name, lead_cfg)
+            except Exception:
+                pass
+        return agent  # type: ignore[return-value]
 
     if not fallback or len(chain) == 1:
         cls = AGENT_CLASSES[lead_name]
@@ -211,6 +239,9 @@ def build_master_agent_class(
     if not chain:
         raise ValueError("role chain must be non-empty")
     lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config)
+    if lead_name == COMPUTER_USE_TOKEN:
+        # cu not supported in master workflows; return a stub class for graceful fail
+        return ComputerUseShim, lead_cfg["model"], lead_cfg["effort"]
     if not fallback or len(chain) == 1:
         cls = AGENT_CLASSES[lead_name]
         if post_construct_hook is None:
@@ -328,9 +359,14 @@ def check_agy_parallelism_warning(
 def describe_chain(chain: List[str], fallback: bool) -> str:
     if not fallback or len(chain) == 1:
         name, cfg = _cfg_for_token(chain[0])
+        if name == COMPUTER_USE_TOKEN:
+            return "computer-use:isolated:n/a"
         return f"{name}:{cfg['model']}:{cfg['effort']}"
     parts = []
     for token in chain:
         name, cfg = _cfg_for_token(token)
-        parts.append(f"{name}({cfg['model']}/{cfg['effort']})")
+        if name == COMPUTER_USE_TOKEN:
+            parts.append("computer-use(iso)")
+        else:
+            parts.append(f"{name}({cfg['model']}/{cfg['effort']})")
     return "->".join(parts) + " (cycled)"
