@@ -30,11 +30,30 @@ from typing import Any, Dict, List, Optional, TypedDict, Union
 class RunMode(str, Enum):
     ISOLATED = "ISOLATED"
     OBSERVE = "OBSERVE"
+    REAL = "REAL"
 
 
 class Scope(str, Enum):
     ISOLATED = "isolated"
     OBSERVE_REAL = "observe_real"
+    REAL_ACT = "real_act"
+
+
+class RealGuiPolicy(str, Enum):
+    FULL = "full"
+    CHILDREN = "children"
+
+
+class AskMode(str, Enum):
+    ON = "on"
+    OFF = "off"
+
+
+class GrantScope(str, Enum):
+    ACTION = "ACTION"
+    PROCESS_RUN = "PROCESS_RUN"
+    PROCESS_TTL = "PROCESS_TTL"
+    DENY = "DENY"
 
 
 class TaskPriority(str, Enum):
@@ -127,6 +146,12 @@ class WorkerEventType(str, Enum):
     SAFETY_VIOLATION = "safety.violation"
     RESOURCE_LIMIT = "resource.limit"
     SESSION_TERMINATED = "session.terminated"
+    BASELINE_CAPTURED = "baseline.captured"
+    PERMISSION_PROMPT_SHOWN = "permission.prompt_shown"
+    PERMISSION_GRANTED = "permission.granted"
+    PERMISSION_DENIED = "permission.denied"
+    FOREIGN_INTERACTION_BLOCKED = "foreign_interaction_blocked"
+    OPERATOR_NOTE_RECEIVED = "operator_note.received"
 
 
 class ViolationCode(str, Enum):
@@ -142,6 +167,11 @@ class ViolationCode(str, Enum):
     LAUNCH_APP_NOT_ALLOWLISTED = "launch_app_not_allowlisted"
     LAUNCH_APP_ARGS_INVALID = "launch_app_args_invalid"
     SPAWN_ENV_OVERRIDE_FORBIDDEN = "spawn_env_override_forbidden"
+    REAL_ACT_NOT_PERMITTED = "real_act_not_permitted"
+    ASK_MODE_DISABLED = "ask_mode_disabled"
+    GRANT_REQUIRED = "grant_required"
+    GRANT_EXPIRED = "grant_expired"
+    CLEARANCE_TOKEN_INVALID = "clearance_token_invalid"
 
 
 # =============================================================================
@@ -269,12 +299,20 @@ class RunRequest:
     task_priority: Optional[str] = None  # TaskPriority value
     budgets: Optional[Dict[str, Any]] = None  # Partial<WorkerSession["budgets"]>
     observe_display: Optional[str] = None  # ":0" default in OBSERVE
+    real_gui_policy: Optional[str] = None  # RealGuiPolicy value (validated only when mode==REAL)
+    ask_mode: Optional[str] = None  # AskMode value (validated only when mode==REAL)
 
     def __post_init__(self) -> None:
         if self.mode is not None and self.mode not in {m.value for m in RunMode}:
             raise ValueError(f"mode must be one of {[m.value for m in RunMode]}")
         if self.task_priority is not None and self.task_priority not in {p.value for p in TaskPriority}:
             raise ValueError(f"task_priority must be one of {[p.value for p in TaskPriority]}")
+        # real_gui_policy / ask_mode forwarded; validated only when mode==REAL (per Step 1 spec)
+        if self.mode == RunMode.REAL.value:
+            if self.real_gui_policy is not None and self.real_gui_policy not in {p.value for p in RealGuiPolicy}:
+                raise ValueError(f"real_gui_policy must be one of {[p.value for p in RealGuiPolicy]} when mode=REAL")
+            if self.ask_mode is not None and self.ask_mode not in {a.value for a in AskMode}:
+                raise ValueError(f"ask_mode must be one of {[a.value for a in AskMode]} when mode=REAL")
 
 
 @dataclass
@@ -286,6 +324,10 @@ class WorkerSession:
     budgets: Dict[str, int]  # full required shape
     displays: Dict[str, Any]  # {isolated_display, isolated_xvfb_root_pid?, observe_display?}
     capabilities: CapabilityReport  # forward ref resolved at runtime via string
+    real_gui_policy: Optional[str] = None  # RealGuiPolicy value (only for REAL mode)
+    ask_mode: Optional[str] = None  # AskMode value
+    baseline_pids: Optional[List[int]] = None
+    baseline_windows: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.mode not in {m.value for m in RunMode}:
@@ -443,14 +485,21 @@ class ActionSpec:
     rationale: str = ""
     risk_level: str = "low"  # RiskLevel
     confirmation_token: Optional[str] = None
+    clearance_token: Optional[str] = None  # REQUIRED for real_act (kernel-issued); absent for isolated
 
     def __post_init__(self) -> None:
-        # Hardening + FR-04: execution boundary rejects anything but isolated
-        if self.display_scope != "isolated":
+        # Relaxed for real_act (Step 1): accept "isolated" (byte-identical behavior) or "real_act" (kernel-gated only).
+        # Invalid scopes (e.g. observe_real) still rejected for safety.
+        if self.display_scope not in {"isolated", "real_act"}:
             raise ValueError(
-                f"ActionSpec.display_scope must be exactly 'isolated' (got {self.display_scope}); "
-                "real-display targeting is structurally forbidden (FR-04, C1)"
+                f"ActionSpec.display_scope must be exactly 'isolated' (got {self.display_scope}; real_act requires clearance_token)"
             )
+        if self.display_scope == "real_act":
+            if not self.clearance_token or not str(self.clearance_token).strip():
+                raise ValueError(
+                    "ActionSpec with display_scope='real_act' requires a non-empty clearance_token "
+                    "(SafetyKernel ownership gate only; reasoner cannot fabricate)"
+                )
         if self.type not in {a.value for a in ActionType}:
             raise ValueError("invalid ActionType")
         if self.risk_level not in {r.value for r in RiskLevel}:
@@ -566,6 +615,37 @@ class WorkerEvent:
             raise ValueError(f"invalid WorkerEventType: {self.event_type}")
 
 
+@dataclass
+class PromptContext:
+    """Context for GuiPrompter.ask (FR-33/34/37). Injected; no real GUI in tests."""
+    run_id: str
+    pid: int
+    action_type: str  # ActionType value
+    policy: str  # RealGuiPolicy value
+    ask_mode: str  # AskMode value
+    target_app_title: Optional[str] = None
+    window_id: Optional[str] = None
+    rationale: str = ""
+
+
+@dataclass
+class PromptResult:
+    """Result from operator via GUI prompter (or FakePrompter in CI)."""
+    decision: str
+    grant_scope: Optional[str] = None  # GrantScope value or None
+    operator_text: str = ""
+    granted: bool = False
+
+
+@dataclass
+class Grant:
+    """In-memory grant entry (per-run, never persisted)."""
+    pid: int
+    scope: str  # GrantScope value
+    expires_at: Optional[str] = None  # ISO-8601 or None for ACTION/PROCESS_RUN
+    run_id: str = ""
+
+
 # =============================================================================
 # Serialization helpers (roundtrip contract for tests + event sink + reasoner)
 # =============================================================================
@@ -676,6 +756,7 @@ _SERIALIZABLE = (
     PerceptionSnapshot, SnapshotSummary, ReasoningInput, ActionIntent, ActionSpec,
     SpawnSpec, IsolatedDisplaySpec, AppLaunchPolicy, ValidationResult, GateDecision,
     EngineHealth, ConfirmationOutcome, ActionResult, WorkerEvent,
+    PromptContext, PromptResult, Grant,
     RunHandle, StopResult, Ack,
 )
 

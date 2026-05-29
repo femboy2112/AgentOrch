@@ -17,7 +17,7 @@ Everything here is overridable per dispatch from the CLI; these are defaults.
 from __future__ import annotations
 
 import os
-from typing import Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
@@ -28,7 +28,7 @@ from agy_orchestrator.core.agents.grok_agent import GrokAgent
 from agy_orchestrator.core.calibration import CalibrationTable
 
 # Step 12: computer-use as selectable standard worker token (resolves to shim)
-from harness.computer_use_role import ComputerUseShim  # thin adapter delegate; no LLM impact
+from harness.computer_use_role import ComputerUseShim  # thin adapter delegate; no LLM impact (Step 10: forwards real_gui/ask via its config)
 
 AGENT_CLASSES: Dict[str, Type[AgentInstance]] = {
     "codex": CodexAgent,
@@ -68,6 +68,7 @@ AGENT_DEFAULTS: Dict[str, Dict[str, object]] = {
     # reasoning-effort param, so effort is "n/a" and GrokAgent never sends it.
     "grok": {"model": "grok-build", "effort": "n/a"},
     # Step 12: computer-use token (non-LLM); used by _cfg_for_token + describe_chain
+    # Step 10: real_gui_policy/ask_mode travel via shim.computer_use_config (not this defaults map)
     "computer-use": {"model": "computer-use", "effort": "n/a"},
 }
 
@@ -356,16 +357,19 @@ def check_agy_parallelism_warning(
     )
 
 
-def describe_chain(chain: List[str], fallback: bool) -> str:
+def describe_chain(chain: List[str], fallback: bool, **kwargs: Any) -> str:
+    """Describe for meta/logs; **kwargs accepts real_gui_policy/ask_mode (and computer_use_* variants) passed from dispatch for full wiring to shim/RunRequest paths (per Step 10); values deliberately ignored so all computer-use:isolated strings and outputs remain byte-identical (INVARIANT F, no behavior/output change for any run)."""
     if not fallback or len(chain) == 1:
         name, cfg = _cfg_for_token(chain[0])
         if name == COMPUTER_USE_TOKEN:
+            # Step 10: real-gui flags do not alter this string for non-real runs (INVARIANT F / byte-identical); default ISOLATED always here
             return "computer-use:isolated:n/a"
         return f"{name}:{cfg['model']}:{cfg['effort']}"
     parts = []
     for token in chain:
         name, cfg = _cfg_for_token(token)
         if name == COMPUTER_USE_TOKEN:
+            # keep "iso" output exactly for all non-real (and current) paths; real_gui only affects req/events
             parts.append("computer-use(iso)")
         else:
             parts.append(f"{name}({cfg['model']}/{cfg['effort']})")

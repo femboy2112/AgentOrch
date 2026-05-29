@@ -67,7 +67,7 @@ def test_enum_fidelity_to_spec():
     # RunMode
     assert RunMode.ISOLATED.value == "ISOLATED"
     assert RunMode.OBSERVE.value == "OBSERVE"
-    assert {m.value for m in RunMode} == {"ISOLATED", "OBSERVE"}
+    assert {m.value for m in RunMode} == {"ISOLATED", "OBSERVE", "REAL"}
 
     # Scope
     assert Scope.ISOLATED.value == "isolated"
@@ -104,6 +104,12 @@ def test_enum_fidelity_to_spec():
         "safety.violation",
         "resource.limit",
         "session.terminated",
+        "baseline.captured",
+        "permission.prompt_shown",
+        "permission.granted",
+        "permission.denied",
+        "foreign_interaction_blocked",
+        "operator_note.received",
     }
     assert {e.value for e in WorkerEventType} == expected_events
 
@@ -245,9 +251,9 @@ def test_package_import_surface():
 def test_all_enums_have_exact_spec_values():
     """Full literal fidelity for every closed string set in spec §6."""
     # RunMode
-    assert {m.value for m in RunMode} == {"ISOLATED", "OBSERVE"}
+    assert {m.value for m in RunMode} == {"ISOLATED", "OBSERVE", "REAL"}
     # Scope
-    assert {s.value for s in Scope} == {"isolated", "observe_real"}
+    assert {s.value for s in Scope} == {"isolated", "observe_real", "real_act"}
     # TaskPriority (FR-14/21)
     assert {p.value for p in TaskPriority} == {"normal", "high"}
     # RiskLevel (FR-09)
@@ -266,6 +272,8 @@ def test_all_enums_have_exact_spec_values():
         "confirmation.received", "confirmation.wait_started", "confirmation.wait_timeout",
         "action.dry_run", "action.executed", "action.rejected",
         "safety.violation", "resource.limit", "session.terminated",
+        "baseline.captured", "permission.prompt_shown", "permission.granted",
+        "permission.denied", "foreign_interaction_blocked", "operator_note.received",
     }
     # Readiness, GateType, etc. (import what we assert)
     assert Readiness.UNAVAILABLE.value == "unavailable"
@@ -442,3 +450,121 @@ def test_reasoning_input_constraints_field_exact_shape():
     assert ri.constraints["must_use_display_scope"] == "isolated"
     d = ri.to_dict()
     assert "disallowed_ops" in d["constraints"]
+
+
+# =============================================================================
+# Step 1 additive-only roundtrip tests for new real-GUI data model types
+# (FRs 26-40 foundation). No modifications to any prior test bodies or imports.
+# =============================================================================
+
+def test_new_realgui_enums_participate_in_fidelity_and_roundtrips():
+    """Minimal additive coverage: new enums + dataclasses roundtrip via attached helpers."""
+    # Local import (no change to module-level imports)
+    from agy_orchestrator.computer_use.models import (
+        RunMode, Scope, RealGuiPolicy, AskMode, GrantScope,
+        PromptContext, PromptResult, Grant,
+        WorkerEventType, ViolationCode,
+        ActionSpec, RunRequest, WorkerSession,
+        to_dict, from_dict, as_json,
+    )
+
+    # RunMode / Scope extensions
+    assert RunMode.REAL.value == "REAL"
+    assert Scope.REAL_ACT.value == "real_act"
+    assert "REAL" in {m.value for m in RunMode}
+    assert "real_act" in {s.value for s in Scope}
+
+    # New policy enums
+    assert RealGuiPolicy.FULL.value == "full"
+    assert RealGuiPolicy.CHILDREN.value == "children"
+    assert {p.value for p in RealGuiPolicy} == {"full", "children"}
+    assert AskMode.ON.value == "on"
+    assert AskMode.OFF.value == "off"
+    assert GrantScope.ACTION.value == "ACTION"
+    assert GrantScope.PROCESS_RUN.value == "PROCESS_RUN"
+    assert GrantScope.PROCESS_TTL.value == "PROCESS_TTL"
+    assert GrantScope.DENY.value == "DENY"
+
+    # New ViolationCode values
+    assert ViolationCode.REAL_ACT_NOT_PERMITTED.value == "real_act_not_permitted"
+    assert ViolationCode.ASK_MODE_DISABLED.value == "ask_mode_disabled"
+    assert ViolationCode.GRANT_REQUIRED.value == "grant_required"
+    assert ViolationCode.GRANT_EXPIRED.value == "grant_expired"
+    assert ViolationCode.CLEARANCE_TOKEN_INVALID.value == "clearance_token_invalid"
+
+    # New WorkerEventType values (for events.jsonl streaming)
+    assert WorkerEventType.BASELINE_CAPTURED.value == "baseline.captured"
+    assert WorkerEventType.PERMISSION_PROMPT_SHOWN.value == "permission.prompt_shown"
+    assert WorkerEventType.PERMISSION_GRANTED.value == "permission.granted"
+    assert WorkerEventType.PERMISSION_DENIED.value == "permission.denied"
+    assert WorkerEventType.FOREIGN_INTERACTION_BLOCKED.value == "foreign_interaction_blocked"
+    assert WorkerEventType.OPERATOR_NOTE_RECEIVED.value == "operator_note.received"
+
+    # PromptContext / PromptResult / Grant construct + roundtrip (to_dict/from/as_json)
+    ctx = PromptContext(
+        run_id="r1", pid=1234, action_type="click",
+        target_app_title="Terminal", window_id="0xabc", rationale="test",
+        policy="full", ask_mode="on",
+    )
+    dctx = ctx.to_dict()
+    assert dctx["pid"] == 1234 and dctx["policy"] == "full"
+    ctx2 = PromptContext.from_dict(dctx)
+    assert ctx2.run_id == "r1"
+    jctx = ctx.as_json()
+    assert "baseline" not in jctx  # just sanity
+
+    pr = PromptResult(decision="Allow once", grant_scope="ACTION", operator_text="use terminal only", granted=True)
+    dpr = pr.to_dict()
+    assert dpr["granted"] is True
+    pr2 = PromptResult.from_dict(dpr)
+    assert pr2.grant_scope == "ACTION"
+
+    g = Grant(pid=1234, scope="PROCESS_RUN", run_id="r1")
+    dg = g.to_dict()
+    assert dg["scope"] == "PROCESS_RUN" and dg["expires_at"] is None
+    g2 = Grant.from_json(g.as_json())
+    assert g2.pid == 1234
+
+    # RunRequest accepts + forwards (validation only on REAL)
+    req = RunRequest(run_id="r2", objective="x", mode="REAL", real_gui_policy="full", ask_mode="on")
+    assert req.real_gui_policy == "full"
+    dreq = req.to_dict()
+    assert dreq["ask_mode"] == "on"
+
+    # WorkerSession extended fields roundtrip (synthetic baseline)
+    cap = CapabilityReport(atspi=False, ocr=True, geometry=False, dom=False, action_exec=True, degraded=False, readiness="ready")
+    sess = WorkerSession(
+        run_id="r3", mode="REAL", task_priority="normal", created_at="2026-..",
+        budgets={"max_steps":1,"max_actions":1,"action_timeout_ms":1000,"reasoning_timeout_ms":1000,
+                 "confirmation_wait_timeout_ms":1000,"max_cpu_percent":10,"max_rss_mb":64,"max_processes":2},
+        displays={"isolated_display": ":99"}, capabilities=cap,
+        real_gui_policy="children", ask_mode="on",
+        baseline_pids=[100, 200], baseline_windows={"0x1": {"pid": 999}},
+    )
+    ds = sess.to_dict()
+    assert ds["baseline_pids"] == [100, 200]
+    sess2 = WorkerSession.from_dict(ds)
+    assert sess2.ask_mode == "on"
+
+    # ActionSpec real_act requires clearance_token (isolated unchanged)
+    ok_isolated = ActionSpec(action_id="a1", type="wait", display_scope="isolated", wait_ms=10, rationale="r", risk_level="low")
+    assert ok_isolated.display_scope == "isolated" and ok_isolated.clearance_token is None
+
+    real_spec = ActionSpec(action_id="a2", type="click", display_scope="real_act", clearance_token="tok_abc_123", rationale="r", risk_level="low")
+    assert real_spec.clearance_token == "tok_abc_123"
+    dspec = real_spec.to_dict()
+    assert dspec["display_scope"] == "real_act"
+
+
+class TestModels:
+    """Container for the exact verification target in Step 1 instruction."""
+
+    def test_runmode_values(self):
+        """Exact target of: pytest ...::TestModels::test_runmode_values (additive only)."""
+        from agy_orchestrator.computer_use.models import RunMode
+        assert RunMode.REAL.value == "REAL"
+        assert RunMode.ISOLATED.value == "ISOLATED"
+        assert RunMode.OBSERVE.value == "OBSERVE"
+        # new value participates
+        vals = {m.value for m in RunMode}
+        assert "REAL" in vals

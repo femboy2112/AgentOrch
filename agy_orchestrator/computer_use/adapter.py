@@ -57,6 +57,27 @@ from .safety import SafetyKernel
 from .action_executor import ActionExecutor
 from .process_supervisor import ProcessSupervisor
 
+# Step 9 real-GUI wiring (DI components for REAL mode only; defaults + test-aware Fake preserve
+# all prior ISOLATED/OBSERVE behavior byte-for-byte; REAL only when explicitly requested).
+from .ownership import OwnershipResolver
+from .grants import GrantCache
+from .gui_prompt import FakePrompter, GuiPrompter
+
+
+def _running_under_test() -> bool:
+    """Detect pytest/CI so adapter REAL path auto-selects FakePrompter (never spawns zenity/:0 in hermetic tests)."""
+    try:
+        import os
+        import sys
+
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return True
+        if any("pytest" in m or "_pytest" in m for m in sys.modules):
+            return True
+        return os.environ.get("AGY_REALGUI_TEST") == "1"
+    except Exception:
+        return False
+
 
 class ComputerUseWorkerAdapter:
     """Standard AgentOrch computer-use worker adapter (Step 11).
@@ -85,17 +106,33 @@ class ComputerUseWorkerAdapter:
         executor: Optional[ActionExecutor] = None,
         supervisor: Optional[ProcessSupervisor] = None,
         audit_sink_factory: Optional[Callable[[str], Optional[AuditEventSink]]] = None,
+        # Step 9 real-GUI DI (tests inject Fakes here; production REAL auto-constructs in start())
+        ownership_resolver: Optional[Any] = None,
+        gui_prompter: Optional[Any] = None,
+        grant_cache: Optional[Any] = None,
         **kw: Any,
     ) -> None:
-        self._controller = session_controller or SessionController(audit_sink_factory=audit_sink_factory)
         self._reasoner = reasoner
         self._perception = perception
         self._safety = safety
         self._executor = executor
         self._supervisor = supervisor
+        self._ownership_resolver = ownership_resolver
+        self._gui_prompter = gui_prompter
+        self._grant_cache = grant_cache
         self._audit_factory = audit_sink_factory or (lambda rid: AuditEventSink(run_id=rid))
         self._active_runs: Dict[str, Dict[str, Any]] = {}  # run_id -> {"thread": , "stop": Event, ...}
         self._lock = threading.RLock()
+        self._user_supplied_controller = bool(session_controller)
+
+        ctrl_kwargs: Dict[str, Any] = {"audit_sink_factory": audit_sink_factory}
+        if ownership_resolver is not None:
+            ctrl_kwargs["ownership_resolver"] = ownership_resolver
+        if gui_prompter is not None:
+            ctrl_kwargs["gui_prompter"] = gui_prompter
+        if grant_cache is not None:
+            ctrl_kwargs["grant_cache"] = grant_cache
+        self._controller = session_controller or SessionController(**ctrl_kwargs)
 
     # ------------------------------------------------------------------
     # Public AgentOrch worker surface (exact per spec §5)
@@ -126,8 +163,102 @@ class ComputerUseWorkerAdapter:
         run_id = req.run_id or f"cu-{int(time.time()*1000)}"
         objective = getattr(req, "objective", "") or (run_request.get("objective", "") if isinstance(run_request, dict) else "")
 
-        # Create the authoritative session (this also spawns Xvfb when action_exec possible)
-        sess = self._controller.create_session(req)
+        # Step 9: wire REAL-mode harness components (ownership + grant cache + prompter) to
+        # SafetyKernel (the gate) and SessionController (for baseline capture). Only for mode=REAL;
+        # ISOLATED/OBSERVE paths unchanged (INVARIANT F). Prompter wrapper (here) routes free-text
+        # results into orchestrator_messages as OperatorNoteMessageDict (FR-37). Perception remains
+        # isolated (+ observe_real only for OBSERVE mode). Constraints for REAL advertise the contract.
+        is_real_mode = False
+        m = getattr(req, "mode", None) or (req.get("mode") if isinstance(req, dict) else None)
+        if m is not None:
+            if hasattr(m, "value"):
+                m = m.value
+            is_real_mode = str(m).upper() == "REAL"
+
+        # Prefer ctor-injected (tests supply Fakes); construct only for REAL when absent.
+        # Prompter choice: Fake under test (hermetic, no zenity/:0 ever), GuiPrompter in prod.
+        ownership_resolver = self._ownership_resolver
+        grant_cache = self._grant_cache
+        prompter = self._gui_prompter
+        if is_real_mode:
+            if ownership_resolver is None:
+                try:
+                    ownership_resolver = OwnershipResolver()
+                except Exception:
+                    ownership_resolver = None
+            if grant_cache is None:
+                try:
+                    grant_cache = GrantCache(run_id=run_id)
+                except Exception:
+                    grant_cache = None
+            if prompter is None:
+                if _running_under_test():
+                    prompter = FakePrompter()
+                else:
+                    try:
+                        prompter = GuiPrompter()
+                    except Exception:
+                        prompter = None
+
+            # Route prompter free-text -> next orchestrator_messages as operator_note (FR-37).
+            # Wrap exactly once (supports both injected and constructed; Fake and Gui).
+            if prompter is not None and not getattr(prompter, "_note_routing_wrapped", False):
+                orig = prompter.prompt
+
+                def _note_routing_prompt(ctx: Any) -> Any:
+                    res = orig(ctx)
+                    try:
+                        txt = ""
+                        if isinstance(res, dict):
+                            txt = (res or {}).get("operator_text") or ""
+                        else:
+                            txt = getattr(res, "operator_text", "") or ""
+                        if txt and str(txt).strip():
+                            note: Dict[str, Any] = {
+                                "kind": "operator_note",
+                                "text": str(txt).strip(),
+                                "issued_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            self._controller.enqueue_orchestrator_message(run_id, note)
+                    except Exception:
+                        pass
+                    return res
+
+                prompter.prompt = _note_routing_prompt  # type: ignore[attr-defined]
+                try:
+                    setattr(prompter, "_note_routing_wrapped", True)
+                except Exception:
+                    pass
+
+            # Thread to SessionController for REAL baseline capture (FR-28) inside create_session.
+            # Save/restore keeps the (usually long-lived) controller instance clean for mixed runs.
+            if not self._user_supplied_controller:
+                old_own = getattr(self._controller, "_ownership_resolver", None)
+                old_p = getattr(self._controller, "_gui_prompter", None)
+                old_g = getattr(self._controller, "_grant_cache", None)
+                try:
+                    if ownership_resolver is not None:
+                        setattr(self._controller, "_ownership_resolver", ownership_resolver)
+                    if prompter is not None:
+                        setattr(self._controller, "_gui_prompter", prompter)
+                    if grant_cache is not None:
+                        setattr(self._controller, "_grant_cache", grant_cache)
+                    # Create the authoritative session (this also spawns Xvfb when action_exec possible)
+                    sess = self._controller.create_session(req)
+                finally:
+                    # Restore prior controller state (no cross-run pollution of REAL-only DI objects)
+                    try:
+                        setattr(self._controller, "_ownership_resolver", old_own)
+                        setattr(self._controller, "_gui_prompter", old_p)
+                        setattr(self._controller, "_grant_cache", old_g)
+                    except Exception:
+                        pass
+            else:
+                # user-supplied controller (advanced tests); assume it already has what it needs
+                sess = self._controller.create_session(req)
+        else:
+            # Create the authoritative session (this also spawns Xvfb when action_exec possible)
+            sess = self._controller.create_session(req)
 
         # Per-run audit sink (FR-13) — everything from here on goes through it
         sink = self._audit_factory(run_id) or AuditEventSink(run_id=run_id)
@@ -136,6 +267,13 @@ class ComputerUseWorkerAdapter:
             sink.events_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+
+        # FR-38 wiring: attach sink to prompter (for prompt_shown emit from gui_prompt site) and pass to SafetyKernel
+        if prompter is not None:
+            try:
+                setattr(prompter, "_audit_sink", sink)
+            except Exception:
+                pass
 
         # Wire (or build) all components for this run, passing the sink for event emission
         sup = self._supervisor or sess.supervisor
@@ -150,7 +288,16 @@ class ComputerUseWorkerAdapter:
             audit_sink=sink,
             auto_build_agents=False,  # tests and real harness always supply or let outer layer decide
         )
-        safety = self._safety or SafetyKernel(supervisor=sup)
+
+        # Step 9: SafetyKernel receives the (REAL-wired or None) components; non-REAL paths receive None
+        # for the harness objects (preserves every byte of ISOLATED/OBSERVE behavior + all prior tests).
+        safety = self._safety or SafetyKernel(
+            supervisor=sup,
+            ownership_resolver=ownership_resolver if is_real_mode else None,
+            gui_prompter=prompter if is_real_mode else None,
+            grant_cache=grant_cache if is_real_mode else None,
+            audit_sink=sink,
+        )
         executor = self._executor or ActionExecutor(
             isolated_display=sess.isolated_display,
             supervisor=sup,
@@ -322,23 +469,39 @@ class ComputerUseWorkerAdapter:
                     summaries[sc] = {"snapshot_id": getattr(snap, "snapshot_id", "s"), "scope": sc}
 
             # ------------------------------------------------------------------
-            # Build ReasoningInput (constraints enforce isolated actuation only)
+            # Build ReasoningInput (constraints advertise real_act + policy/ask_mode for REAL per Step 9;
+            # reasoner sees the contract; operator_notes from pending_messages already included)
             # ------------------------------------------------------------------
+            constraints = {
+                "must_use_display_scope": "real_act" if mode == "REAL" else "isolated",
+                "max_actions_remaining": max(0, max_actions - sess.current_actions),
+                "max_steps_remaining": max(0, max_steps - sess.current_step),
+                "disallowed_ops": [],
+            }
+            if mode == "REAL":
+                # Surface policy + ask mode so reasoner knows the exact harness contract (no prompt for owned, etc.)
+                constraints["real_gui_policy"] = getattr(sess.worker_session, "real_gui_policy", None) or "full"
+                constraints["ask_mode"] = getattr(sess.worker_session, "ask_mode", None) or "on"
             ri = {
                 "run_id": run_id,
                 "session_mode": mode,
                 "task_priority": task_priority,
                 "objective": objective,
-                "constraints": {
-                    "must_use_display_scope": "isolated",
-                    "max_actions_remaining": max(0, max_actions - sess.current_actions),
-                    "max_steps_remaining": max(0, max_steps - sess.current_step),
-                    "disallowed_ops": [],
-                },
+                "constraints": constraints,
                 "snapshots": summaries,
                 "orchestrator_messages": list(sess.pending_messages),
                 "output_contract": ACTION_INTENT_JSON_V1,
             }
+
+            # Emit operator_note.received (exact FR-38 shape) for free-text from GUI prompt (FR-37/38, Step 12)
+            for m in list(sess.pending_messages or []):
+                if isinstance(m, dict) and m.get("kind") == "operator_note":
+                    sink.emit(WorkerEvent(
+                        ts=datetime.now(timezone.utc).isoformat(),
+                        run_id=run_id,
+                        event_type=WorkerEventType.OPERATOR_NOTE_RECEIVED.value,
+                        payload={"run_id": run_id, "text": str(m.get("text", ""))[:200], "source": "gui_prompt"},
+                    ))
 
             # ------------------------------------------------------------------
             # Reason (FR-14/16/20/21/25 routing + safety already inside ReasonerBridge)

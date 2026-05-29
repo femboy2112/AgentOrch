@@ -31,6 +31,7 @@ markers = [
     "release_blocking: critical FR or hardening invariant tests (must pass for release)",
     "not_slow: tests suitable for the default -m 'not slow' gate (exclude heavy Xvfb or long-running)",
     "fr_release_blocking: one of FR-03/04/09/12/23/24",
+    "realgui: real-GUI harness (real_act executor + ownership/ask/grant) tests; hermetic fakes by default, @slow + AGY_REALGUI_E2E=1 for zenity/:0 e2e",
 ]
 
 [tool.ruff]

@@ -19,6 +19,13 @@ from agy_orchestrator.computer_use import DEFAULT_APP_LAUNCH_POLICY, SafetyKerne
 from agy_orchestrator.computer_use.models import AppLaunchPolicy, ViolationCode
 from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor, SpawnSpec
 
+# Step 5 realgui release-blocking additions (imports only; no existing test bodies touched)
+from agy_orchestrator.computer_use.grants import FakeClock, GrantCache
+from agy_orchestrator.computer_use.gui_prompt import FakePrompter
+from agy_orchestrator.computer_use.models import AskMode, RealGuiPolicy
+from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
+from agy_orchestrator.computer_use.safety import FakeOwnershipResolver as _FOR, FakePrompter as _FP  # via safety re-exports (Step 5 "export the new helpers")
+
 
 # Step 13: release-blocking FR markers applied to the exact FR-03/04/09/12/23/24 tests
 
@@ -223,3 +230,92 @@ def test_launch_app_metachar_still_caught_even_on_permissive_policy(kernel: Safe
     r = kernel.validate(i, mk_session())
     assert not r.valid
     assert any(v["code"] == ViolationCode.LAUNCH_APP_ARGS_INVALID.value for v in (r.violations or []))
+
+
+# (clean realgui release-blocking tests follow; original base tests above untouched)
+
+@pytest.mark.release_blocking
+@pytest.mark.realgui
+def test_fr30_owned_child_allow_no_prompt():
+    """FR-30: post-baseline owned child (ProcessSupervisor-registered descendant) -> OWNED -> ALLOW with no prompt call."""
+    fake_res = FakeOwnershipResolver(synthetic_baseline_pids={1001, 1002}, synthetic_owned={4242})
+    fake_prompter = FakePrompter()  # default Deny; must never be called
+    kernel = SafetyKernel(
+        ownership_resolver=fake_res,
+        gui_prompter=fake_prompter,
+        grant_cache=None,
+    )
+    # element target carries app_pid that resolver classifies OWNED
+    i = mk_intent(
+        type="click",
+        display_scope="real_act",
+        target={"kind": "element", "app_pid": 4242, "handle_id": "h_owned"},
+    )
+    sess = mk_session(mode="REAL", real_gui_policy="full", ask_mode="on", run_id="fr30")
+    r = kernel._real_act_gate(i, sess, snapshots={})
+    assert r.valid is True
+    assert r.normalized_action is not None
+    assert r.normalized_action.display_scope == "real_act"
+    assert r.normalized_action.clearance_token and r.normalized_action.clearance_token.startswith("clr:")
+    assert fake_prompter.call_count == 0  # prompter never consulted for owned (FR-30)
+
+
+@pytest.mark.release_blocking
+@pytest.mark.realgui
+def test_fr31_children_policy_foreign_deny_no_prompt():
+    """FR-31: foreign pid under real_children policy -> hard DENY (FOREIGN_PROCESS), prompter never called."""
+    fake_res = FakeOwnershipResolver(synthetic_baseline_pids={100}, synthetic_owned={999})  # 4242 is foreign
+    fake_prompter = FakePrompter()
+    cache = GrantCache(run_id="fr31")
+    kernel = SafetyKernel(ownership_resolver=fake_res, gui_prompter=fake_prompter, grant_cache=cache)
+    # coordinate target that _topmost will resolve (via shared helper) to a foreign pid
+    snap = {"r": {"windows": [{"pid": 4242, "bbox": {"x": 0, "y": 0, "w": 100, "h": 100}, "z_index": 5, "window_id": "w1"}]}}
+    i = mk_intent(type="click", display_scope="real_act", target={"kind": "coordinate", "x": 10, "y": 10})
+    sess = mk_session(mode="REAL", real_gui_policy="children", ask_mode="on", run_id="fr31")
+    r = kernel._real_act_gate(i, sess, snapshots=snap)
+    assert r.valid is False
+    codes = [v["code"] for v in (r.violations or [])]
+    assert ViolationCode.FOREIGN_PROCESS.value in codes
+    assert fake_prompter.call_count == 0  # children policy short-circuits before any prompt (INVARIANT D)
+
+
+@pytest.mark.release_blocking
+@pytest.mark.realgui
+def test_fr32_full_ask_off_foreign_deny_no_prompt():
+    """FR-32: foreign pid + full policy + ask_mode=off -> hard DENY (ASK_MODE_DISABLED), no prompt."""
+    fake_res = FakeOwnershipResolver(synthetic_baseline_pids={100}, synthetic_owned=set())
+    fake_prompter = FakePrompter()
+    kernel = SafetyKernel(ownership_resolver=fake_res, gui_prompter=fake_prompter, grant_cache=GrantCache(run_id="fr32"))
+    snap = {"r": {"windows": [{"pid": 7777, "bbox": {"x": 0, "y": 0, "w": 50, "h": 50}, "z_index": 1}]}}
+    i = mk_intent(type="double_click", display_scope="real_act", target={"kind": "coordinate", "x": 5, "y": 5})
+    sess = mk_session(mode="REAL", real_gui_policy="full", ask_mode="off", run_id="fr32")
+    r = kernel._real_act_gate(i, sess, snapshots=snap)
+    assert r.valid is False
+    codes = [v["code"] for v in (r.violations or [])]
+    assert ViolationCode.ASK_MODE_DISABLED.value in codes
+    assert fake_prompter.call_count == 0  # ask=off short-circuits (INVARIANT C)
+
+
+@pytest.mark.release_blocking
+@pytest.mark.realgui
+def test_fr40_baseline_foreign_always_denied_skeleton():
+    """FR-40 (mission-critical regression): baseline pid is FOREIGN forever; full+ask=on + auto-deny prompter -> DENIED.
+    Proves the prompter is consulted (default-deny path) and pid classified FOREIGN even for same-uid pre-existing 'terminal'.
+    """
+    op_term_pid = 9999  # simulated operator's other terminal / claude / orchestrator pid
+    fake_res = FakeOwnershipResolver(synthetic_baseline_pids={op_term_pid, 100}, synthetic_owned={4242})
+    fake_prompter = FakePrompter()  # defaults to decision=Deny, granted=False -> exercises fail-closed
+    cache = GrantCache(run_id="fr40")
+    kernel = SafetyKernel(ownership_resolver=fake_res, gui_prompter=fake_prompter, grant_cache=cache)
+    # coordinate target inside a window owned by the baseline pid
+    snap = {"r": {"windows": [{"pid": op_term_pid, "bbox": {"x": 0, "y": 0, "w": 800, "h": 600}, "z_index": 10, "window_id": "opwin"}]}}
+    i = mk_intent(type="click", display_scope="real_act", target={"kind": "coordinate", "x": 100, "y": 100})
+    sess = mk_session(mode="REAL", real_gui_policy="full", ask_mode="on", run_id="fr40-run")
+    r = kernel._real_act_gate(i, sess, snapshots=snap)
+    assert r.valid is False
+    codes = [v.get("code") for v in (r.violations or [])]
+    assert any(c in (ViolationCode.GRANT_REQUIRED.value, "grant_required") for c in codes)
+    assert fake_prompter.call_count >= 1  # prompter WAS consulted, proving no silent access to baseline pid (FR-40)
+    # classification truth: even though 9999 might pass naive uid check, baseline makes it FOREIGN
+    assert fake_res.classify(op_term_pid) == "FOREIGN"
+    assert fake_res.classify(4242) == "OWNED"

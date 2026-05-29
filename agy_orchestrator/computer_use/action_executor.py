@@ -1,26 +1,33 @@
-"""ActionExecutor (Step 9) — xdotool input injection strictly on isolated display.
+"""ActionExecutor (Step 9 + real_act Step 7) — xdotool on isolated or gated real_act.
 
 Implements the exact contract from COMPUTER_USE_DESIGN.md §5 and the
 release-blocking tests in tests/test_computer_use_action.py:
 - execute(ActionSpec|dict) hard-fails (returns rejected, *zero* side effects)
-  unless display_scope == "isolated" (FR-04). The check is first statement.
+  unless display_scope in {"isolated", "real_act"} (FR-04 extended). The ds
+  check is the first statement after normalize; for real_act a non-empty
+  clearance_token (issued only by SafetyKernel after ownership gate) is
+  required, else REJECTED with CLEARANCE_TOKEN_INVALID (INVARIANT E).
 - Spatial actions (click etc.) require target.kind == "coordinate".
 - Non-spatial (launch_app, navigate, hotkey, wait) accept target=None/absent.
-- Every xdotool and every delegated spawn uses the private XAUTHORITY+DISPLAY
-  produced by get_isolated_env (Step 4 hardening #1). Real ~/.Xauthority is
-  structurally absent; "cannot authenticate to :0" holds at same UID.
+- isolated paths: every xdotool uses private XAUTHORITY+DISPLAY from
+  get_isolated_env (hardening #1). real_act paths: use operator real :0 env
+  (DISPLAY/XAUTHORITY from os.environ, never the isolated cookie or
+  AGY_ISOLATED_X).
 - launch_app and navigate delegate exclusively to ProcessSupervisor.spawn
   (FR-24: no_shell, forced isolated env, rlimits, start_new_session).
 - Full ActionResult (status, executed_at, resolved_target, spawned_pids, ...).
 - Ctor accepts the kwargs the test suite uses: isolated_display, action_timeout_ms.
+- Private _verify_clearance(action) for the token gate (caller after kernel
+  guarantees validity; we enforce non-empty defensively).
 
-Ctor is side-effect free (lazy env materialization) so FR-04 rejection tests
-see zero subprocess calls even for bad-scope execute after construction.
-All actuation paths (tests + prod) use only temp isolated Xvfb.
+Ctor is side-effect free (lazy env materialization) so FR-04 / token-reject
+tests see zero subprocess calls even for bad execute after construction.
+All hermetic tests use mocks; zero real-:0 actuation or foreign input ever.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -62,6 +69,51 @@ class ActionExecutor:
             self._env.pop("WAYLAND_DISPLAY", None)
         return self._env
 
+    def _get_real_env(self) -> Dict[str, str]:
+        """Minimal equivalent for real_act: the operator's live :0 session env.
+
+        Returns DISPLAY + XAUTHORITY (or absent so X defaults to ~/.Xauthority)
+        from the caller's os.environ. Explicitly strips any AGY_ISOLATED_* and
+        WAYLAND_DISPLAY. NEVER returns or copies the isolated cookie produced
+        by get_isolated_env. Used only on the cleared real_act success path.
+        """
+        env: Dict[str, str] = {}
+        for k, v in os.environ.items():
+            if k in ("WAYLAND_DISPLAY",):
+                continue
+            if k.startswith("AGY_ISOLATED"):
+                continue
+            env[k] = v
+        # Force a real display (default :0); never the executor's isolated_display
+        disp = env.get("DISPLAY") or ":0"
+        if not (isinstance(disp, str) and disp.startswith(":")):
+            disp = ":0"
+        env["DISPLAY"] = disp
+        # Do not force an XAUTHORITY that points at an isolated file; leave
+        # absent or inherited so real X clients use the operator's authority.
+        # If a value containing an isolated marker somehow leaked in, drop it.
+        xa = env.get("XAUTHORITY", "")
+        if "agu-" in xa or "AGY_ISOLATED" in xa:
+            env.pop("XAUTHORITY", None)
+        env.pop("AGY_ISOLATED_X", None)
+        return env
+
+    def _verify_clearance(self, action: Union[ActionSpec, Dict[str, Any]]) -> bool:
+        """Private clearance gate for real_act.
+
+        The SafetyKernel (after _real_act_gate ownership/ask/grant decision)
+        is the ONLY code path that constructs an ActionSpec with
+        display_scope="real_act" + a matching clearance_token. This method
+        is the defensive check at the executor boundary (INVARIANT E).
+        We require non-empty token; full cryptographic validation of the
+        "clr:..." token is not performed here (kernel-issued guarantee).
+        """
+        if isinstance(action, dict):
+            tok = action.get("clearance_token")
+        else:
+            tok = getattr(action, "clearance_token", None)
+        return bool(tok and str(tok).strip())
+
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
@@ -80,12 +132,13 @@ class ActionExecutor:
             return False
 
     def execute(self, action: Union[ActionSpec, Dict[str, Any]]) -> ActionResult:
-        """Execute only on isolated. Reject real-scope *before* any tool call.
+        """Execute on isolated (existing) or real_act (token-gated only).
 
-        Accepts either ActionSpec (post-SafetyKernel, already display-validated)
-        or raw dict (test/FR-04 boundary paths that must never materialize env
-        or call tools for non-isolated scopes). The ds check is deliberately
-        the very first substantive statement.
+        Accepts either ActionSpec (post-SafetyKernel) or raw dict (tests).
+        The ds check ("isolated" or "real_act") is the first statement after
+        normalize; real_act then requires non-empty clearance_token (else
+        CLEARANCE_TOKEN_INVALID, zero side effects). Real env materialization
+        happens only after both gates; isolated lazy env untouched on real paths.
         """
         executed_at = self._now()
 
@@ -118,18 +171,27 @@ class ActionExecutor:
             app_args = getattr(a, "app_args", None)
             action_id = getattr(a, "action_id", "act-s")
 
-        # Coerce tgt to dict only for the convenience of the spatial branches;
-        # the "absent / wrong kind" check below sees the original.
-        tgt_d = tgt if isinstance(tgt, dict) else (tgt or {})
-
-        # FR-04 (release-blocking): hard gate first, no env materialization,
-        # no xdotool, no supervisor.spawn for anything but "isolated".
-        if ds != "isolated":
+        # The ds gate is the first statement after input normalization (per Step 7).
+        # FR-04 (release-blocking): hard-reject anything except "isolated" or
+        # "real_act" before any coerce, any spatial check, any env, any tool call.
+        if ds not in ("isolated", "real_act"):
             return ActionResult(
                 status=ActionStatus.REJECTED.value,
                 executed_at=executed_at,
                 error_code="display_scope_invalid",
             )
+
+        # Real-act token gate (INVARIANT E) immediately after ds allow.
+        if ds == "real_act" and not self._verify_clearance(action):
+            return ActionResult(
+                status=ActionStatus.REJECTED.value,
+                executed_at=executed_at,
+                error_code="clearance_token_invalid",
+            )
+
+        # Coerce tgt to dict only for the convenience of the spatial branches;
+        # the "absent / wrong kind" check below sees the original.
+        tgt_d = tgt if isinstance(tgt, dict) else (tgt or {})
 
         is_spatial = typ in self.SPATIAL
         if is_spatial and (not tgt_d or tgt_d.get("kind") != "coordinate"):
@@ -140,7 +202,14 @@ class ActionExecutor:
             )
 
         to = max(0.5, min(self.action_timeout_ms / 1000.0, 8.0))
-        env = self.env  # materialize only on success path
+        # Materialize env *only* on the allowed success path.
+        # isolated: lazy hardened private cookie (existing behavior, zero side
+        #   effects on construct+execute(bad) paths).
+        # real_act: real operator :0 env via _get_real_env (never isolated).
+        if ds == "real_act":
+            env = self._get_real_env()
+        else:
+            env = self.env  # existing lazy path
 
         resolved: Optional[Dict[str, int]] = None
         spawned: List[int] = []

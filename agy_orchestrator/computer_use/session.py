@@ -31,12 +31,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .models import (
     Ack,
+    AskMode,
     CapabilityReport,
     ConfirmationOutcome,
     ConfirmationOutcomeType,
     GateType,
     IsolatedDisplaySpec,
     OrchestratorMessage,
+    RealGuiPolicy,
     RunMode,
     RunRequest,
     Scope,
@@ -47,6 +49,7 @@ from .models import (
     WorkerSession,
 )
 from .capability import CapabilityBroker
+from .ownership import OwnershipResolver
 from .process_supervisor import ProcessSupervisor, SpawnedProc
 
 
@@ -86,6 +89,9 @@ class Session:
     # Tracked private cookie / home paths for deterministic cleanup (hardening #1)
     private_xauth_path: Optional[Path] = None
     private_home_dir: Optional[Path] = None
+    # Step 6: baseline stored on internal Session (mirrors WorkerSession for REAL runs)
+    baseline_pids: Optional[List[int]] = None
+    baseline_windows: Optional[Dict[str, Any]] = None
     # Mutable run state
     current_step: int = 0
     current_actions: int = 0
@@ -101,11 +107,22 @@ class Session:
 class SessionController:
     """Owns run lifecycle, mode policy, Xvfb bootstrap/teardown, and confirmation wait orchestration (FR-01/18/19/22)."""
 
-    def __init__(self, *, audit_sink_factory: Optional[Any] = None, audit_sink: Optional[Any] = None) -> None:
+    def __init__(
+        self, *, audit_sink_factory: Optional[Any] = None, audit_sink: Optional[Any] = None,
+        supervisor: Optional[ProcessSupervisor] = None,
+        ownership_resolver: Optional[Any] = None,
+        gui_prompter: Optional[Any] = None,
+        grant_cache: Optional[Any] = None,
+    ) -> None:
         self._sessions: Dict[str, Session] = {}
         self._audit_factory = audit_sink_factory  # callable(run_id) -> AuditEventSink or None
         self._audit_sink = audit_sink  # optional direct sink instance (used by tests)
         self._lock = threading.RLock()
+        # Injectable at controller level (Step 6); production paths construct inside create_session
+        self._supervisor = supervisor
+        self._ownership_resolver = ownership_resolver
+        self._gui_prompter = gui_prompter
+        self._grant_cache = grant_cache
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -127,6 +144,8 @@ class SessionController:
                 task_priority=config.get("task_priority") if isinstance(config, dict) else None,
                 budgets=config.get("budgets") if isinstance(config, dict) else None,
                 observe_display=config.get("observe_display") if isinstance(config, dict) else None,
+                real_gui_policy=config.get("real_gui_policy") if isinstance(config, dict) else None,
+                ask_mode=config.get("ask_mode") if isinstance(config, dict) else None,
             )
 
         run_id = config.run_id or f"cu-{int(time.time()*1000)}"
@@ -137,6 +156,20 @@ class SessionController:
         task_priority = (config.task_priority or TaskPriority.NORMAL.value).lower()
         if task_priority not in {p.value for p in TaskPriority}:
             task_priority = TaskPriority.NORMAL.value
+
+        # Step 6 refinement (finalize): normalize real_gui_policy/ask_mode from enum or str/cased input
+        # so RunRequest validation + WorkerSession storage always receive canonical lowercase values.
+        # (Loose dicts from adapter may vary; direct RunRequest already validated but getattr is defensive.)
+        real_gui_policy = config.real_gui_policy
+        ask_mode = config.ask_mode
+        if real_gui_policy is not None:
+            if hasattr(real_gui_policy, "value"):
+                real_gui_policy = real_gui_policy.value
+            real_gui_policy = str(real_gui_policy).lower()
+        if ask_mode is not None:
+            if hasattr(ask_mode, "value"):
+                ask_mode = ask_mode.value
+            ask_mode = str(ask_mode).lower()
 
         # Merge budgets (spec defaults + partial overrides)
         budgets = dict(DEFAULT_BUDGETS)
@@ -152,11 +185,38 @@ class SessionController:
         isolated_display = _pick_isolated_display(run_id)
         observe_display = config.observe_display or (":0" if mode == RunMode.OBSERVE.value else None)
 
+        # Step 6: make supervisor (and other harness components) injectable at controller level for tests.
+        # Production paths use fresh; injected ones (e.g. pre-populated registry for ownership tests) are used.
+        supervisor = self._supervisor or ProcessSupervisor()
+
+        # Step 6: real_gui_policy / ask_mode forwarding + REAL baseline capture (FR-28, INV A)
+        # ask_mode defaults to "on" ONLY for REAL (per spec INV C/F + D2). Normalization hoisted above
+        # guarantees canonical lowercase str (or None) regardless of enum/casing from caller or loose dict.
+        if mode == RunMode.REAL.value and not ask_mode:
+            ask_mode = AskMode.ON.value
+
+        # REAL baseline capture (FR-28) — BEFORE any Xvfb spawn when action_exec.
+        # Uses injected resolver (FakeOwnershipResolver in all hermetic tests) or fresh OwnershipResolver
+        # wired to the (possibly injected) supervisor so classify() will see live owned children.
+        # Never mutates baseline or spawns for ISOLATED/OBSERVE (INV F regression).
+        baseline_pids: Optional[List[int]] = None
+        baseline_windows: Optional[Dict[str, Any]] = None
+        if mode == RunMode.REAL.value and cap_report.action_exec:
+            try:
+                resolver: Any = getattr(self, "_ownership_resolver", None) or OwnershipResolver(supervisor=supervisor)
+                binfo = resolver.capture_baseline(observe_display or ":0")
+                bp = binfo.get("baseline_pids") or set()
+                baseline_pids = sorted(int(p) for p in bp if isinstance(p, (int, str)) and int(p) > 0)
+                baseline_windows = dict(binfo.get("baseline_windows") or {})
+            except Exception:
+                baseline_pids = []
+                baseline_windows = {}
+
         # Always provision an isolated display + Xvfb when we can act (supports
         # OBSERVE read-only on :0 + actuation on private X authority per FR-03/structural split).
         # FR-22 explicitly requires it for ISOLATED; we do the same for OBSERVE
         # actuation side so SafetyKernel/ActionExecutor never have a path to real :0.
-        supervisor = ProcessSupervisor()
+        # (supervisor already created above; spawn below registers under it for deterministic teardown)
         xvfb_root_id: Optional[str] = None
         xvfb_sp: Optional[SpawnedProc] = None
         xauth_path: Optional[Path] = None
@@ -203,6 +263,10 @@ class SessionController:
                 "observe_display": observe_display,
             },
             capabilities=cap_report,
+            real_gui_policy=real_gui_policy,
+            ask_mode=ask_mode,
+            baseline_pids=baseline_pids,
+            baseline_windows=baseline_windows,
         )
 
         sess = Session(
@@ -215,6 +279,8 @@ class SessionController:
             xvfb_spawned=xvfb_sp,
             private_xauth_path=xauth_path,
             private_home_dir=home_dir,
+            baseline_pids=baseline_pids,
+            baseline_windows=baseline_windows,
         )
         self._sessions[run_id] = sess
 
@@ -227,6 +293,15 @@ class SessionController:
             "isolated_display": isolated_display,
             "xvfb_registered": bool(xvfb_root_id),
         })
+
+        # Emit baseline capture (FR-38) for REAL runs (counts only; full sets in worker_session)
+        if baseline_pids is not None:
+            self._emit(sess, WorkerEventType.BASELINE_CAPTURED.value, {
+                "run_id": sess.run_id,
+                "baseline_pid_count": len(baseline_pids),
+                "baseline_window_count": len(baseline_windows or {}),
+                "display": observe_display or ":0",
+            })  # exact uniform FR-38 shape (includes run_id); counts only (full in WorkerSession)
         return sess
 
     def close_session(self, session_id: str) -> StopResult:

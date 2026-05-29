@@ -85,6 +85,21 @@ class GeometryCollector:
     def collect(self) -> Tuple[List[Dict[str, Any]], List[ElementHandle]]:
         wins: List[Dict[str, Any]] = []
         elems: List[ElementHandle] = []
+        # pid enrichment (wmctrl -lp third column after wid+host) for realgui use; absent on isolated Xvfb so callers unchanged
+        pid_map: Dict[str, Optional[int]] = {}
+        try:
+            lp = _sh(["wmctrl", "-lp"], self.env)
+            for line in (lp or "").splitlines():
+                p = line.split(None, 4)
+                if len(p) >= 3:
+                    try:
+                        pid = int(p[2])
+                        if pid > 0:
+                            pid_map[p[0]] = pid
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         out = _sh(["wmctrl", "-lG"], self.env)
         for line in out.splitlines():
             p = line.split(None, 6)
@@ -93,8 +108,12 @@ class GeometryCollector:
                     wid = p[0]
                     x, y, w, h = int(p[2]), int(p[3]), int(p[4]), int(p[5])
                     title = p[6] if len(p) > 6 else ""
-                    wins.append({"window_id": wid, "title": title, "bbox": {"x": x, "y": y, "w": w, "h": h}})
-                    elems.append(ElementHandle(handle_id=f"geom-{wid}", source=ElementSource.GEOMETRY.value, window_id=wid, name=title or None, bbox={"x": x, "y": y, "w": w, "h": h}, confidence=0.75, provenance=["GeometryCollector"]))
+                    win_d: Dict[str, Any] = {"window_id": wid, "title": title, "bbox": {"x": x, "y": y, "w": w, "h": h}}
+                    if wid in pid_map:
+                        win_d["pid"] = pid_map[wid]
+                    wins.append(win_d)
+                    app_pid = pid_map.get(wid)
+                    elems.append(ElementHandle(handle_id=f"geom-{wid}", source=ElementSource.GEOMETRY.value, window_id=wid, name=title or None, app_pid=app_pid, bbox={"x": x, "y": y, "w": w, "h": h}, confidence=0.75, provenance=["GeometryCollector"]))
                 except Exception:
                     pass
         if not wins:
@@ -106,8 +125,12 @@ class GeometryCollector:
                 if m:
                     wid, title, ww, hh, xx, yy = m.groups()
                     bb = {"x": int(xx), "y": int(yy), "w": int(ww), "h": int(hh)}
-                    wins.append({"window_id": wid, "title": title, "bbox": bb})
-                    elems.append(ElementHandle(handle_id=f"geom-{wid}", source=ElementSource.GEOMETRY.value, window_id=wid, name=title or None, bbox=bb, confidence=0.6, provenance=["GeometryCollector:xwininfo"]))
+                    win_d: Dict[str, Any] = {"window_id": wid, "title": title, "bbox": bb}
+                    if wid in pid_map:
+                        win_d["pid"] = pid_map[wid]
+                    wins.append(win_d)
+                    app_pid = pid_map.get(wid)
+                    elems.append(ElementHandle(handle_id=f"geom-{wid}", source=ElementSource.GEOMETRY.value, window_id=wid, name=title or None, app_pid=app_pid, bbox=bb, confidence=0.6, provenance=["GeometryCollector:xwininfo"]))
         return wins, elems
 
 

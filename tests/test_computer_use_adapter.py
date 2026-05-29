@@ -25,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -89,7 +89,8 @@ class FakeReasoner:
         self.calls.append({
             "priority": getattr(ri, "task_priority", None),
             "scopes": list(getattr(ri, "snapshots", {}).keys()),
-            "mode": getattr(ri, "session_mode", None),
+            "mode": getattr(ri, "session_mode", None) or (ri.get("session_mode") if isinstance(ri, dict) else None),
+            "constraints": getattr(ri, "constraints", None) or (ri.get("constraints") if isinstance(ri, dict) else None),
         })
         if self._i >= len(self.intents):
             self._i = 0
@@ -297,6 +298,68 @@ def test_adapter_stop_sets_stop_event_and_tears_down():
     assert isinstance(res, StopResult) or hasattr(res, "terminated")
     # idempotent second stop is fine
     adapter.stop("r-stop")
+
+
+# Step 9: tiny realgui assertions proving adapter wires REAL path to the new gate (and constraints)
+# without altering any ISOLATED/OBSERVE code paths or behavior. Patch + auto-Fake under test => zero
+# real zenity/:0, no LLM, full prior suite + this file stay green (INVARIANT F).
+@pytest.mark.realgui
+@pytest.mark.release_blocking
+def test_adapter_real_wires_new_gate_and_constraints(tmp_path: Path):
+    """Two tiny assertions: REAL reaches SafetyKernel with harness components (the gate);
+    and constraints dict advertises real_act + policy/ask (reasoner contract). No old paths touched.
+    """
+    sink = AuditEventSink("r-real9", events_path=tmp_path / "e.jsonl")
+    reasoner = FakeReasoner([_mk_intent()])
+    perception = FakePerception()
+
+    captured_cons: Dict[str, Any] = {}
+    orig_dec = reasoner.decide
+
+    def _capture(ri: Any, timeout_ms: int = 45000) -> Any:
+        if isinstance(ri, dict):
+            captured_cons["c"] = ri.get("constraints", {})
+        return orig_dec(ri, timeout_ms=timeout_ms)
+
+    reasoner.decide = _capture  # type: ignore[attr-defined]
+
+    with patch("agy_orchestrator.computer_use.adapter.SafetyKernel") as mock_safety:
+        adapter = ComputerUseWorkerAdapter(
+            audit_sink_factory=lambda rid: sink,
+            reasoner=reasoner,
+            perception=perception,
+            # no safety/ownership/gui/grant -> forces the Step-9 REAL construction branch (Fake under pytest)
+        )
+        try:
+            h = adapter.start(
+                {
+                    "run_id": "r-real9",
+                    "objective": "tiny real wire test",
+                    "mode": "REAL",
+                    "real_gui_policy": "full",
+                    "ask_mode": "on",
+                    "budgets": {"max_steps": 1, "max_actions": 1},
+                }
+            )
+        except Exception:
+            pass  # safety is mocked; executor may not handle the canned isolated intent under REAL; irrelevant
+        finally:
+            try:
+                adapter.stop("r-real9")
+            except Exception:
+                pass
+        reasoner.decide = orig_dec  # type: ignore[attr-defined]
+
+    # Tiny assertion 1 (FR-27/30 + INV E): REAL path constructed SafetyKernel passing the new harness gate pieces.
+    assert mock_safety.called, "REAL must reach SafetyKernel ctor (not early self._safety bypass)"
+    kwa = (mock_safety.call_args.kwargs or {}) if mock_safety.call_args else {}
+    assert kwa.get("ownership_resolver") is not None or kwa.get("grant_cache") is not None, "REAL must wire ownership/GrantCache to SafetyKernel gate"
+
+    # Tiny assertion 2 (reasoner contract): constraints for the REAL run used real_act scope + policy/ask keys.
+    cons = captured_cons.get("c", {})
+    assert cons.get("must_use_display_scope") == "real_act", "REAL must force must_use_display_scope=real_act (no old isolated default)"
+    assert cons.get("real_gui_policy") in ("full", "children"), "REAL must surface real_gui_policy to reasoner"
+    assert cons.get("ask_mode") in ("on", "off"), "REAL must surface ask_mode to reasoner"
 
 
 # Import surface test (must not raise)

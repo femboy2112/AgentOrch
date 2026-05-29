@@ -287,9 +287,13 @@ async def dispatch_async(
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
+    # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
     computer_use_task_priority: Optional[str] = None,
     computer_use_budgets: Optional[Dict[str, Any]] = None,
+    # real_gui_policy / ask_mode per instruction: bare names (match backend RunRequest/WorkerSession)
+    real_gui_policy: Optional[str] = None,
+    ask_mode: Optional[str] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run.
 
@@ -345,8 +349,8 @@ async def dispatch_async(
     prompt = _build_prompt(instruction, context, spec)
     (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
-    gen_desc = roles.describe_chain(generator_chain, fallback)
-    crit_desc = roles.describe_chain(critic_chain, fallback) if mode == "adversarial" else None
+    gen_desc = roles.describe_chain(generator_chain, fallback, real_gui_policy=real_gui_policy, ask_mode=ask_mode)
+    crit_desc = roles.describe_chain(critic_chain, fallback, real_gui_policy=real_gui_policy, ask_mode=ask_mode) if mode == "adversarial" else None
 
     # Cross-family verifier guard: warn (don't block) when the critic chain
     # leads with the same provider family as the generator. Only meaningful
@@ -461,6 +465,11 @@ async def dispatch_async(
                 "task_priority": computer_use_task_priority or "normal",
                 "budgets": computer_use_budgets,
             }
+            # Step 10: forward real_gui_policy / ask_mode (bare names) only when present; keeps non-real cu_req byte-identical
+            if real_gui_policy is not None:
+                cu_req["real_gui_policy"] = real_gui_policy
+            if ask_mode is not None:
+                cu_req["ask_mode"] = ask_mode
             h = adapter.start(cu_req)
             output = f"computer-use:{h.status} run_id={h.run_id} events={h.events_path or ''}"
             # workflow stays None (no quality ledger from cu yet)
@@ -626,9 +635,12 @@ def dispatch(
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
+    # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
     computer_use_task_priority: Optional[str] = None,
     computer_use_budgets: Optional[Dict[str, Any]] = None,
+    real_gui_policy: Optional[str] = None,
+    ask_mode: Optional[str] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run. Synchronous entrypoint."""
     return asyncio.run(
@@ -652,5 +664,7 @@ def dispatch(
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,
+            real_gui_policy=real_gui_policy,
+            ask_mode=ask_mode,
         )
     )

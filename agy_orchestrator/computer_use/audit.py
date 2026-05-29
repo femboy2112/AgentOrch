@@ -17,7 +17,17 @@ Contract:
   reasoner.*, action.*, confirmation.*, safety.*, resource.*, and session.*
   transitions MUST emit through an instance of this sink.
 
-Supports every value in WorkerEventType exactly as defined in models.py.
+Supports every value in WorkerEventType exactly as defined in models.py (including the real-gui permission.* and baseline.* events per FR-38).
+FR-38: baseline.captured, permission.prompt_shown/granted/denied,
+foreign_interaction_blocked, and operator_note.received are emitted at
+decision points (safety gate, prompter, session baseline, adapter note routing)
+with exact uniform payload shapes:
+  baseline.captured: {"run_id": r, "baseline_pid_count": n, "baseline_window_count": m, "display": ":0"}
+  permission.prompt_shown: {"run_id": r, "pid": p, "action_type": t, "policy": pol, "ask_mode": a}
+  permission.granted: {"run_id": r, "pid": p, "grant_scope": s, "operator_text"?: txt, "implicit"?: bool}
+  permission.denied: {"run_id": r, "pid"?: p, "reason": why}
+  foreign_interaction_blocked: {"run_id": r, "pid"?: p, "policy"?: pol, "reason": why}
+  operator_note.received: {"run_id": r, "pid"?: p, "text": txt, "source"?: "gui_prompt"}
 
 No X11, no GUI, no real-:0 side effects. Pure stdlib + models.
 """

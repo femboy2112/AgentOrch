@@ -3,7 +3,7 @@
 Exposes a thin shim that satisfies the AgentInstance surface used by --mode direct
 (and is safe no-op for other workflow shapes). Delegates the actual GUI loop to
 ComputerUseWorkerAdapter using harness run context (run_id, events.jsonl, out_dir cwd)
-and optional computer_use_config for mode/task_priority/budgets.
+and optional computer_use_config for mode/task_priority/budgets/real_gui_policy/ask_mode (Step 10).
 
 Does not alter any LLM worker code paths. All actuation stays on isolated Xvfb.
 """
@@ -63,7 +63,7 @@ class ComputerUseShim:
         self._harness_events_path: Optional[str] = kwargs.get("_harness_events_path") or kwargs.get("harness_events_path")
         self.computer_use_config: Optional[Dict[str, Any]] = kwargs.get("computer_use_config")
         # Also accept flat for convenience (CLI / dispatch forwarding)
-        for k in ("computer_use_mode", "task_priority", "budgets"):
+        for k in ("computer_use_mode", "task_priority", "budgets", "real_gui_policy", "ask_mode"):
             if k in kwargs and self.computer_use_config is None:
                 self.computer_use_config = {}
             if k in kwargs:
@@ -97,6 +97,11 @@ class ComputerUseShim:
             req["task_priority"] = cfg["task_priority"]
         if cfg.get("budgets"):
             req["budgets"] = cfg["budgets"]
+        # Step 10: forward the two new real-gui keys from computer_use_config into req (for RunRequest / adapter)
+        if cfg.get("real_gui_policy") is not None:
+            req["real_gui_policy"] = cfg["real_gui_policy"]
+        if cfg.get("ask_mode") is not None:
+            req["ask_mode"] = cfg["ask_mode"]
 
         # Confirmation tokens are submitted via adapter.submit_confirmation() by caller
         # when high-risk actions are gated; dispatch itself is fire-and-observe for cu.

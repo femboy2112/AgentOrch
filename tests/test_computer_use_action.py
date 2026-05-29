@@ -281,3 +281,106 @@ def test_executor_uses_private_xauth_env_for_xdotool(monkeypatch: pytest.MonkeyP
         real_x = os.environ.get("XAUTHORITY") or str(Path.home() / ".Xauthority")
         for v in env.values():
             assert real_x not in str(v)
+
+
+# ------------------------------------------------------------------
+# Step 7: real_act executor + clearance token gate (hermetic, mock-only)
+# @pytest.mark.realgui + @not_slow so they are excluded from default
+# `pytest -q -m "not slow"` and from INVARIANT F regression runs unless
+# explicitly selected. All use fakes/monkeypatch only; zero real :0 or
+# foreign input. Exactly two new tests per Step 7 contract.
+# ------------------------------------------------------------------
+
+@pytest.mark.release_blocking
+@pytest.mark.realgui
+@pytest.mark.not_slow
+def test_realgui_executor_rejects_real_act_without_clearance_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """real_act dict/spec without (or empty) clearance_token is REJECTED with
+    clearance_token_invalid *before* any env materialization or xdotool call.
+    Mirrors the FR-04 zero-side-effect contract for the new scope (INV E).
+    """
+    calls: list = []
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: calls.append(1) or type("C", (), {"returncode": 0, "stdout": b"", "stderr": b""})(),
+    )
+    ex = ActionExecutor(isolated_display=":99")
+
+    # absent token
+    bad1 = {"display_scope": "real_act", "type": "hotkey", "hotkey": ["Return"]}
+    res1 = ex.execute(bad1)
+    assert res1.status == ActionStatus.REJECTED.value
+    assert res1.error_code == "clearance_token_invalid"
+    assert not calls
+
+    # empty/whitespace token also rejected
+    bad2 = {"display_scope": "real_act", "type": "click", "target": {"kind": "coordinate", "x": 1, "y": 2}, "clearance_token": "   "}
+    res2 = ex.execute(bad2)
+    assert res2.status == ActionStatus.REJECTED.value
+    assert res2.error_code == "clearance_token_invalid"
+    assert not calls
+
+    # via ActionSpec (dataclass path) also
+    spec_bad = _mk_spec(type="hotkey", hotkey=["Escape"])
+    # force real_act + no token (bypass normal __post_init__ for boundary test)
+    object.__setattr__(spec_bad, "display_scope", "real_act")
+    object.__setattr__(spec_bad, "clearance_token", None)
+    res3 = ex.execute(spec_bad)
+    assert res3.status == ActionStatus.REJECTED.value
+    assert res3.error_code == "clearance_token_invalid"
+    assert not calls
+
+    # Laziness: the isolated _env must never have been touched
+    assert ex._env is None
+
+
+@pytest.mark.release_blocking
+@pytest.mark.realgui
+@pytest.mark.not_slow
+def test_realgui_executor_valid_token_uses_real_env_not_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a non-empty clearance_token, real_act is allowed; xdotool receives
+    the *real* operator :0 env (via minimal _get_real_env), never the isolated
+    cookie or AGY_ISOLATED_X marker. isolated lazy env remains unmaterialized.
+    """
+    captured_envs: list[Dict[str, str]] = []
+    real_run = subprocess.run
+
+    def spying_run(argv: Any, *, env: Dict[str, str] | None = None, **kw: Any) -> Any:
+        if argv and isinstance(argv, (list, tuple)) and "xdotool" in str(argv[0] if argv else ""):
+            captured_envs.append(dict(env or {}))
+        # Fake success so we don't actually need a display; the env capture is the assertion target
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    monkeypatch.setattr("subprocess.run", spying_run)
+
+    ex = ActionExecutor(isolated_display=":99")
+    good = {
+        "action_id": "act-real-tok-1",
+        "type": "hotkey",
+        "display_scope": "real_act",
+        "hotkey": ["Return"],
+        "clearance_token": "clr:run123:pid456:real_act:1710000000",
+        "rationale": "test real after kernel gate",
+        "risk_level": "low",
+    }
+    res = ex.execute(good)
+
+    # Must not be rejected by ds or token gates (may be OK/FAILED only on the fake xdotool result)
+    assert res.status in (ActionStatus.OK.value, ActionStatus.FAILED.value)
+    assert res.error_code not in ("display_scope_invalid", "clearance_token_invalid", "target_missing")
+
+    # Env assertions: used real path, not isolated
+    if captured_envs:
+        env = captured_envs[0]
+        assert env.get("AGY_ISOLATED_X") is None
+        xa = env.get("XAUTHORITY", "")
+        assert "agu-" not in xa and "isolated" not in xa.lower()
+        # DISPLAY must look like a real session display
+        assert isinstance(env.get("DISPLAY"), str) and env["DISPLAY"].startswith(":")
+    else:
+        # Even if xdotool binary absent, the gate passed (no early reject)
+        pass
+
+    # Critical laziness + isolation invariant: the executor's isolated _env slot
+    # was never populated by the real_act path.
+    assert ex._env is None

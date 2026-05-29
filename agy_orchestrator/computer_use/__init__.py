@@ -15,11 +15,11 @@ Full implementation through Step 11:
 See COMPUTER_USE_DESIGN.md for authoritative spec.
 
 Step 14 final pass (imports/exports/docs/verification only, no logic):
-- from agy_orchestrator.computer_use.adapter import ComputerUseWorkerAdapter works
+- from agy_orchestrator.computer_use import OwnershipResolver, FakeOwnershipResolver, Prompter, FakePrompter, GuiPrompter, GrantCache, FakeClock confirms clean surface (three new modules exported + __all__)
 - All public classes re-exported cleanly via this __init__
-- Minimal docs/computer_use.md added
-- Full test suite (143 new + 359 total) green; greps confirm zero real-:0 X11 ops; C1-C8 + must-never rules structurally enforced.
-- Grep verification + full test runs + constraint review completed
+- docs/computer_use.md has 6-line Real-GUI Security Harness summary at top
+- Full hermetic test suite (release_blocking + realgui + INV F) green on exact Step-13 commands; zero real-:0/zenity
+- Grep verification + full test runs + constraint review completed (operator review next)
 """
 
 # Re-exports for Step 1 (models + utils only)
@@ -46,6 +46,10 @@ from .adapter import (  # noqa: F401  # Step 11: public contract + core run loop
     RunHandle,
     StopResult,
 )
+# Step 14: Real-GUI Security Harness (exports for the three new modules; zero functional change)
+from .ownership import OwnershipResolver, FakeOwnershipResolver  # noqa: F401
+from .gui_prompt import Prompter, FakePrompter, GuiPrompter  # noqa: F401
+from .grants import GrantCache, FakeClock  # noqa: F401
 # Make the Step-2 SpawnedProc the canonical one on the package namespace
 # (the "from .models import *" above must not shadow it).
 globals()["SpawnedProc"] = SpawnedProc
@@ -133,4 +137,12 @@ __all__ = [  # explicit for clean surface (Step 1)
     "StopResult",
     "Ack",
     "ComputerUseWorkerAdapter",
+    # Step 14: Real-GUI Security Harness (ownership+baseline, prompter, grants — clean re-exports)
+    "OwnershipResolver",
+    "FakeOwnershipResolver",
+    "Prompter",
+    "FakePrompter",
+    "GuiPrompter",
+    "GrantCache",
+    "FakeClock",
 ]
