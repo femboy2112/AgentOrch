@@ -53,8 +53,13 @@ DEFAULT_GRID = [
     ("claude", "opus", "high"),
 ]
 
+# Bench aliases pin bare names to a dated model for reproducibility. Full version
+# strings (e.g. "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6") pass
+# through unchanged via .get(model, model), so `--grid claude:claude-opus-4-8:high`
+# sweeps a specific version. "opus" tracks the current CLI default tier (4.8 as of
+# 2026-05-28); pin the full id when you need a fixed version across releases.
 CLAUDE_ALIAS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6",
-                "opus": "claude-opus-4-7", "standard": "claude-sonnet-4-6"}
+                "opus": "claude-opus-4-8", "standard": "claude-sonnet-4-6"}
 
 
 def _run(cmd: list[str], stdin: str, timeout: float,
