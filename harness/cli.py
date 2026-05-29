@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 from harness import roles
 from harness.dispatch import RUNS_DIR, dispatch
@@ -70,6 +71,13 @@ def _print_result(result) -> None:
 def _cmd_do(args) -> int:
     gen_chain = args.generator.split(",") if args.generator else None
     crit_chain = args.critic.split(",") if args.critic else None
+    spec_text = None
+    if args.spec:
+        spec_path = Path(args.spec).expanduser()
+        if not spec_path.exists():
+            print(f"{C_RED}no such spec file: {args.spec}{C_RESET}", file=sys.stderr)
+            return 1
+        spec_text = spec_path.read_text(encoding="utf-8")
     result = dispatch(
         args.instruction,
         mode=args.mode,
@@ -83,9 +91,46 @@ def _cmd_do(args) -> int:
         test_cmd=args.test_cmd,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
+        spec=spec_text,
         out_dir=args.out_dir,
     )
     _print_result(result)
+    return 0 if result.success else 1
+
+
+def _cmd_spec(args) -> int:
+    from harness.spec import generate_spec
+
+    arch_chain = args.architect.split(",") if args.architect else None
+    crit_chain = args.critic.split(",") if args.critic else None
+    result = generate_spec(
+        args.goal,
+        constraints=args.constraint,
+        architect_chain=arch_chain,
+        critic_chain=crit_chain,
+        fallback=args.fallback,
+        cycles=args.cycles,
+        max_iterations=args.max_iterations,
+        output_path=args.output,
+    )
+    ok = f"{C_GREEN}OK{C_RESET}" if result.success else f"{C_RED}FAILED{C_RESET}"
+    print(f"\n{C_BOLD}── floodspec {result.run_id} [{ok}] ──{C_RESET}")
+    print(f"  architect : {result.generator}")
+    print(f"  critic    : {result.critic}")
+    print(f"  duration  : {result.duration_s}s")
+    conf = "approved" if result.approved else ("stalled" if result.stalled else "max-iter")
+    col = C_GREEN if result.approved else C_YELLOW
+    print(f"  outcome   : {col}{conf}{C_RESET} ({result.iterations_used} iter, {result.chars} chars)")
+    if result.constraints:
+        print(f"  {C_BOLD}constraints:{C_RESET} {len(result.constraints)}")
+        for c in result.constraints:
+            print(f"    - {c}")
+    if result.error:
+        print(f"  {C_RED}error     : {result.error}{C_RESET}")
+    print(f"  {C_BOLD}spec      : {result.spec_path}{C_RESET}")
+    print(f"  artifacts : {result.run_dir}/")
+    print(f"\n  {C_CYAN}review it, then build:{C_RESET}")
+    print(f"    python -m harness do \"<instruction>\" --mode master --spec {result.spec_path}")
     return 0 if result.success else 1
 
 
@@ -182,7 +227,38 @@ def main(argv=None) -> int:
                          "Default: AgentOrch's own repo root. Set when invoking AgentOrch "
                          "from another repo so workers don't pollute AgentOrch. "
                          "Snapshot diff and changed-files list scope follow this path.")
+    do.add_argument("--spec", type=str, default=None, metavar="PATH",
+                    help="Path to an approved FloodSpec design doc (see `harness spec`). "
+                         "Injected as the authoritative design the worker must implement; "
+                         "in master mode the planner decomposes THIS design instead of "
+                         "re-inventing one from the instruction.")
     do.set_defaults(func=_cmd_do)
+
+    spec = sub.add_parser(
+        "spec",
+        help="FloodSpec: turn a short goal + constraints into a complete design doc",
+    )
+    spec.add_argument("goal", type=str, help="The short goal to design a system for")
+    spec.add_argument("-c", "--constraint", action="append", default=[], metavar="TEXT",
+                      help="A constraint the design must honor (repeatable)")
+    spec.add_argument("--architect", type=str, default=None,
+                      help=f"Comma-separated architect (author) chain "
+                           f"(default: {','.join(roles.GENERATOR_CHAIN)}).")
+    spec.add_argument("--critic", type=str, default=None,
+                      help=f"Comma-separated design-critic chain "
+                           f"(default: {','.join(roles.CRITIC_CHAIN)}). Cross-provider "
+                           f"from the architect gives stronger gates.")
+    spec.add_argument("--fallback", action=argparse.BooleanOptionalAction, default=True,
+                      help="Wrap roles in usage-exhaustion fallback (default on)")
+    spec.add_argument("--cycles", type=int, default=2,
+                      help="Times the fallback chain is cycled before giving up")
+    spec.add_argument("--max-iterations", type=int, default=3,
+                      help="Max architect/critic refinement rounds (default 3; gains "
+                           "flatten fast)")
+    spec.add_argument("-o", "--output", type=str, default=None, metavar="PATH",
+                      help="Also write the doc here (e.g. a target repo's DESIGN.md). "
+                           "The runs/<id>/spec.md artifact is always written regardless.")
+    spec.set_defaults(func=_cmd_spec)
 
     runs = sub.add_parser("runs", help="List recent runs")
     runs.add_argument("--limit", type=int, default=20)
