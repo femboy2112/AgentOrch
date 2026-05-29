@@ -8,8 +8,15 @@ from agy_orchestrator.core.agent import AgentInstance
 logger = logging.getLogger(__name__)
 
 # Map orchestrator-internal names to claude --model values. "opus"/"sonnet"/
-# "haiku" pass through unchanged — the CLI resolves them to the latest dated model
-# (opus->claude-opus-4-7, sonnet->claude-sonnet-4-6, haiku->claude-haiku-4-5).
+# "haiku" pass through unchanged — the CLI resolves them to its CURRENT default
+# dated model (as of 2026-05-28: opus->claude-opus-4-8, sonnet->claude-sonnet-4-6,
+# haiku->claude-haiku-4-5). To PIN a specific version, pass the full hyphenated id
+# as the model (e.g. "claude-opus-4-7", "claude-opus-4-8", with an optional "[1m]"
+# suffix for the 1M-context variant on opus 4.7+): it falls through
+# MODEL_ALIASES.get(model, model) unchanged to `claude --model`.
+# VERIFIED 2026-05-28: the `--model` FLAG accepts only bare "opus"/"sonnet"/"haiku"
+# or the full "claude-opus-4-N" form. The interactive Claude Code `/model` aliases
+# ("opus4.8", "opus4.7") do NOT work as `--model` values — they error.
 MODEL_ALIASES = {
     "standard": "sonnet",
 }
