@@ -75,10 +75,16 @@ class CodexAgent(AgentInstance):
                     usage = row
         if not usage:
             import re
-            m = re.search(r"tokens used(?:[:\s]+)([\d,]+)", raw_stdout, re.IGNORECASE)
-            if m:
+            # codex prints the "tokens used\n<N>" summary on STDERR, not stdout;
+            # scan both and take the last match (the final per-call total).
+            matches = re.findall(
+                r"tokens used(?:[:\s]+)([\d,]+)",
+                f"{raw_stdout}\n{raw_stderr}",
+                re.IGNORECASE,
+            )
+            if matches:
                 try:
-                    total = int(m.group(1).replace(",", ""))
+                    total = int(matches[-1].replace(",", ""))
                     return {
                         "token_source": "cli",
                         "input_tokens": None,

@@ -77,6 +77,15 @@ def test_codex_extract_usage_fallback() -> None:
     assert res2["token_source"] == "cli"
     assert res2["total_tokens"] == 1234
     
+    # Real codex prints "tokens used\n<N>" on STDERR, not stdout — must be parsed.
+    res_err = agent._extract_usage("hi", "session id: x\ncodex\nhi\ntokens used\n257\n")
+    assert res_err["token_source"] == "cli"
+    assert res_err["total_tokens"] == 257
+
+    # Multiple "tokens used" lines: take the last (final per-call total).
+    res_multi = agent._extract_usage("", "tokens used\n10\nmore\ntokens used\n42\n")
+    assert res_multi["total_tokens"] == 42
+
     # Test unavailable when no match and no JSON
     res3 = agent._extract_usage("just some output", "")
     assert res3["token_source"] == "unavailable"
