@@ -203,6 +203,7 @@ class GrokAgent(AgentInstance):
                 "input_tokens": None,
                 "output_tokens": None,
                 "cache_read_tokens": None,
+                "total_tokens": None,
             }
         return {
             "token_source": "cli",
@@ -213,4 +214,5 @@ class GrokAgent(AgentInstance):
                 or usage.get("cache_read_input_tokens")
                 or usage.get("cached_input_tokens")
             ),
+            "total_tokens": usage.get("total_tokens"),
         }

@@ -74,11 +74,26 @@ class CodexAgent(AgentInstance):
                 if isinstance(row, dict):
                     usage = row
         if not usage:
+            import re
+            m = re.search(r"tokens used(?:[:\s]+)([\d,]+)", raw_stdout, re.IGNORECASE)
+            if m:
+                try:
+                    total = int(m.group(1).replace(",", ""))
+                    return {
+                        "token_source": "cli",
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "cache_read_tokens": None,
+                        "total_tokens": total,
+                    }
+                except Exception:
+                    pass
             return {
                 "token_source": "unavailable",
                 "input_tokens": None,
                 "output_tokens": None,
                 "cache_read_tokens": None,
+                "total_tokens": None,
             }
         return {
             "token_source": "cli",
@@ -89,6 +104,7 @@ class CodexAgent(AgentInstance):
                 or usage.get("cached_input_tokens")
                 or usage.get("cached_tokens")
             ),
+            "total_tokens": usage.get("total_tokens"),
         }
 
     def build_command(self, piped_input: Optional[str] = None) -> List[str]:

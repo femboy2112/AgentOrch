@@ -112,9 +112,11 @@ def _summarize_token_usage(events_path: Path) -> dict:
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cache_read_tokens": 0,
+                "total_tokens": 0,
                 "has_input": False,
                 "has_output": False,
                 "has_cache": False,
+                "has_total": False,
                 "models": set(),
             },
         )
@@ -126,6 +128,7 @@ def _summarize_token_usage(events_path: Path) -> dict:
         input_tokens = _as_int(data.get("input_tokens"))
         output_tokens = _as_int(data.get("output_tokens"))
         cache_read_tokens = _as_int(data.get("cache_read_tokens"))
+        total_tokens = _as_int(data.get("total_tokens"))
         if input_tokens is not None:
             row["input_tokens"] += input_tokens
             row["has_input"] = True
@@ -135,14 +138,19 @@ def _summarize_token_usage(events_path: Path) -> dict:
         if cache_read_tokens is not None:
             row["cache_read_tokens"] += cache_read_tokens
             row["has_cache"] = True
+        if total_tokens is not None:
+            row["total_tokens"] += total_tokens
+            row["has_total"] = True
 
     out_per_worker: Dict[str, Dict[str, Any]] = {}
     total_input = 0
     total_output = 0
     total_cache = 0
+    total_total = 0
     has_total_input = False
     has_total_output = False
     has_total_cache = False
+    has_total_total = False
     for worker in sorted(per_worker):
         row = per_worker[worker]
         calls = int(row["calls"])
@@ -155,6 +163,7 @@ def _summarize_token_usage(events_path: Path) -> dict:
         input_tokens = row["input_tokens"] if row["has_input"] else None
         output_tokens = row["output_tokens"] if row["has_output"] else None
         cache_read_tokens = row["cache_read_tokens"] if row["has_cache"] else None
+        total_tokens = row["total_tokens"] if row["has_total"] else None
         if input_tokens is not None:
             total_input += int(input_tokens)
             has_total_input = True
@@ -164,6 +173,9 @@ def _summarize_token_usage(events_path: Path) -> dict:
         if cache_read_tokens is not None:
             total_cache += int(cache_read_tokens)
             has_total_cache = True
+        if total_tokens is not None:
+            total_total += int(total_tokens)
+            has_total_total = True
         out_per_worker[worker] = {
             "calls": calls,
             "token_source": token_source,
@@ -171,6 +183,7 @@ def _summarize_token_usage(events_path: Path) -> dict:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_tokens": cache_read_tokens,
+            "total_tokens": total_tokens,
         }
 
     return {
@@ -180,6 +193,7 @@ def _summarize_token_usage(events_path: Path) -> dict:
             "input_tokens": total_input if has_total_input else None,
             "output_tokens": total_output if has_total_output else None,
             "cache_read_tokens": total_cache if has_total_cache else None,
+            "total_tokens": total_total if has_total_total else None,
         },
     }
 

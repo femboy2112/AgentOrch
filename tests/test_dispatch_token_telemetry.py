@@ -1,6 +1,7 @@
 import json
 
 from harness.dispatch import _summarize_token_usage
+from agy_orchestrator.core.agents.codex_agent import CodexAgent
 
 
 def test_summarize_token_usage_rolls_up_cli_and_unavailable(tmp_path) -> None:
@@ -16,6 +17,7 @@ def test_summarize_token_usage_rolls_up_cli_and_unavailable(tmp_path) -> None:
                 "input_tokens": 100,
                 "output_tokens": 40,
                 "cache_read_tokens": 7,
+                "total_tokens": 254,
             },
         },
         {
@@ -28,6 +30,7 @@ def test_summarize_token_usage_rolls_up_cli_and_unavailable(tmp_path) -> None:
                 "input_tokens": None,
                 "output_tokens": None,
                 "cache_read_tokens": None,
+                "total_tokens": None,
             },
         },
         {
@@ -50,7 +53,31 @@ def test_summarize_token_usage_rolls_up_cli_and_unavailable(tmp_path) -> None:
     assert summary["per_worker"]["codex"]["token_source"] == "cli"
     assert summary["per_worker"]["codex"]["input_tokens"] == 100
     assert summary["per_worker"]["codex"]["output_tokens"] == 40
+    assert summary["per_worker"]["codex"]["total_tokens"] == 254
     assert summary["per_worker"]["agy"]["token_source"] == "unavailable"
     assert summary["per_worker"]["agy"]["input_tokens"] is None
+    assert summary["per_worker"]["agy"]["total_tokens"] is None
     assert summary["grand_total"]["input_tokens"] == 100
     assert summary["grand_total"]["output_tokens"] == 40
+    assert summary["grand_total"]["total_tokens"] == 254
+
+
+def test_codex_extract_usage_fallback() -> None:
+    agent = CodexAgent(prompt="test")
+    
+    # Test plain newline format
+    res1 = agent._extract_usage("...assistant text...\ntokens used\n254\n", "")
+    assert res1["token_source"] == "cli"
+    assert res1["total_tokens"] == 254
+    assert res1["input_tokens"] is None
+    assert res1["output_tokens"] is None
+
+    # Test inline format with comma
+    res2 = agent._extract_usage("...assistant text...\ntokens used: 1,234\n", "")
+    assert res2["token_source"] == "cli"
+    assert res2["total_tokens"] == 1234
+    
+    # Test unavailable when no match and no JSON
+    res3 = agent._extract_usage("just some output", "")
+    assert res3["token_source"] == "unavailable"
+    assert res3["total_tokens"] is None

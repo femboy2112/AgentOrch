@@ -203,6 +203,7 @@ class AgentInstance(ABC):
             "input_tokens": None,
             "output_tokens": None,
             "cache_read_tokens": None,
+            "total_tokens": None,
         }
 
     def _emit_usage_event(self, raw_stdout: str, raw_stderr: str, *,
@@ -223,6 +224,7 @@ class AgentInstance(ABC):
                 "input_tokens": self._to_int_token(usage.get("input_tokens")),
                 "output_tokens": self._to_int_token(usage.get("output_tokens")),
                 "cache_read_tokens": self._to_int_token(usage.get("cache_read_tokens")),
+                "total_tokens": self._to_int_token(usage.get("total_tokens")),
                 "attempt": attempt,
                 "success": bool(success),
                 "worker": self._worker_name(),
