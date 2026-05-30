@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import inspect
 import json
 import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import append_live_row
@@ -116,6 +117,46 @@ def _derive_verifier_delta(
     return "unchanged"
 
 
+def _build_role_agent_compat(
+    chain: List[str],
+    *,
+    prompt: str,
+    fallback: bool,
+    cycles: int,
+    codex_config: Optional[List[str]],
+    computer_use_config: Optional[Dict[str, Any]],
+    post_construct_hook: Optional[roles.RolePostConstructHook],
+) -> AgentInstance:
+    """Call roles.build_role_agent while staying compatible with patched tests.
+
+    Some unit tests monkeypatch ``roles.build_role_agent`` with a legacy
+    signature that predates ``computer_use_config``. Pass that kwarg only when
+    the callee can accept it.
+    """
+    kwargs: Dict[str, Any] = {
+        "prompt": prompt,
+        "fallback": fallback,
+        "cycles": cycles,
+        "codex_config": codex_config,
+        "post_construct_hook": post_construct_hook,
+    }
+    accepts_computer_use_config = False
+    try:
+        sig = inspect.signature(roles.build_role_agent)
+        accepts_computer_use_config = (
+            "computer_use_config" in sig.parameters
+            or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+        )
+    except (TypeError, ValueError):
+        accepts_computer_use_config = False
+    if accepts_computer_use_config:
+        kwargs["computer_use_config"] = computer_use_config
+    return roles.build_role_agent(chain, **kwargs)
+
+
 async def _run_workflow(
     mode: str,
     prompt: str,
@@ -128,6 +169,7 @@ async def _run_workflow(
     branches: int,
     verifier: Optional[QualityVerifier],
     codex_config: Optional[List[str]],
+    computer_use_config: Optional[Dict[str, Any]] = None,
     post_construct_hook: Optional[roles.RolePostConstructHook] = None,
     working_directory: str = ".",
     mission_critical: bool = False,
@@ -135,22 +177,34 @@ async def _run_workflow(
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
     if mode == "direct":
-        gen = roles.build_role_agent(
-            generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
+        gen = _build_role_agent_compat(
+            generator_chain,
+            prompt=prompt,
+            fallback=fallback,
+            cycles=cycles,
             codex_config=codex_config,
+            computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
         )
         return await gen.run_async(), None
 
     if mode == "adversarial":
-        gen = roles.build_role_agent(
-            generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
+        gen = _build_role_agent_compat(
+            generator_chain,
+            prompt=prompt,
+            fallback=fallback,
+            cycles=cycles,
             codex_config=codex_config,
+            computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
         )
-        critic = roles.build_role_agent(
-            critic_chain, prompt="", fallback=fallback, cycles=cycles,
+        critic = _build_role_agent_compat(
+            critic_chain,
+            prompt="",
+            fallback=fallback,
+            cycles=cycles,
             codex_config=codex_config,
+            computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
         )
         wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations,
@@ -163,9 +217,13 @@ async def _run_workflow(
         # --test-cmd (the strong oracle) to gate quality on real test results.
         if verifier is None:
             raise ValueError("feedback mode requires --test-cmd (the verifier oracle)")
-        gen = roles.build_role_agent(
-            generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
+        gen = _build_role_agent_compat(
+            generator_chain,
+            prompt=prompt,
+            fallback=fallback,
+            cycles=cycles,
             codex_config=codex_config,
+            computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
         )
         wf = TestFeedbackWorkflow(gen, verifier, max_iterations=max_iterations,
@@ -179,9 +237,15 @@ async def _run_workflow(
         if verifier is None:
             raise ValueError("cascade mode requires --test-cmd (the escalation gate)")
         stages = [
-            roles.build_role_agent([token], prompt=prompt, fallback=False,
-                                   cycles=cycles, codex_config=codex_config,
-                                   post_construct_hook=post_construct_hook)
+            _build_role_agent_compat(
+                [token],
+                prompt=prompt,
+                fallback=False,
+                cycles=cycles,
+                codex_config=codex_config,
+                computer_use_config=computer_use_config,
+                post_construct_hook=post_construct_hook,
+            )
             for token in generator_chain
         ]
         wf = CascadeWorkflow(stages, verifier, max_iterations_per_stage=max_iterations,
@@ -220,9 +284,13 @@ async def _run_workflow(
             # Each slot is its own single-worker agent (no fallback chain
             # inside a slot — diversity comes from different slots, not
             # from fallback within one slot).
-            slot_agent = roles.build_role_agent(
-                [token], prompt=prompt, fallback=False, cycles=cycles,
+            slot_agent = _build_role_agent_compat(
+                [token],
+                prompt=prompt,
+                fallback=False,
+                cycles=cycles,
                 codex_config=codex_config,
+                computer_use_config=computer_use_config,
                 post_construct_hook=post_construct_hook,
             )
             vote_generators.append(slot_agent)
@@ -238,9 +306,13 @@ async def _run_workflow(
         # on failure, escalate to master mode. Verifier is mandatory.
         if verifier is None:
             raise ValueError("pat mode requires --test-cmd (the Stage 1 verifier gate)")
-        direct_gen = roles.build_role_agent(
-            generator_chain, prompt=prompt, fallback=fallback, cycles=cycles,
+        direct_gen = _build_role_agent_compat(
+            generator_chain,
+            prompt=prompt,
+            fallback=fallback,
+            cycles=cycles,
             codex_config=codex_config,
+            computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
         )
         agent_class, model, effort = roles.build_master_agent_class(
@@ -286,6 +358,16 @@ async def dispatch_async(
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
+    # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
+    computer_use_mode: Optional[str] = None,
+    computer_use_task_priority: Optional[str] = None,
+    computer_use_budgets: Optional[Dict[str, Any]] = None,
+    # real_gui_policy / ask_mode per instruction: bare names (match backend RunRequest/WorkerSession)
+    real_gui_policy: Optional[str] = None,
+    ask_mode: Optional[str] = None,
+    browser_engine: Optional[str] = None,
+    browser_display: Optional[str] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run.
 
@@ -304,6 +386,21 @@ async def dispatch_async(
     generator_chain = generator_chain or list(roles.GENERATOR_CHAIN)
     critic_chain = critic_chain or list(roles.CRITIC_CHAIN)
     codex_config = ["tools.web_search=true"] if web_search else None
+    cu_config: Dict[str, Any] = {
+        "mode": computer_use_mode or "ISOLATED",
+        "task_priority": computer_use_task_priority or "normal",
+        "budgets": computer_use_budgets,
+    }
+    if real_gui_policy is not None:
+        cu_config["real_gui_policy"] = real_gui_policy
+    if ask_mode is not None:
+        cu_config["ask_mode"] = ask_mode
+    if browser_engine is not None:
+        cu_config["browser_engine"] = browser_engine
+    if browser_display is not None:
+        cu_config["browser_display"] = browser_display
+    # Step 12: recognize computer-use as standard worker token (no LLM path)
+    _is_cu = bool(generator_chain) and generator_chain[0] == roles.COMPUTER_USE_TOKEN
     if mode == "auto":
         from agy_orchestrator.routing.policy import RoutingPolicy, from_dispatch_args
         task = from_dispatch_args(
@@ -339,8 +436,26 @@ async def dispatch_async(
     prompt = _build_prompt(instruction, context, spec)
     (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
-    gen_desc = roles.describe_chain(generator_chain, fallback)
-    crit_desc = roles.describe_chain(critic_chain, fallback) if mode == "adversarial" else None
+    gen_desc = roles.describe_chain(
+        generator_chain,
+        fallback,
+        real_gui_policy=real_gui_policy,
+        ask_mode=ask_mode,
+        browser_engine=browser_engine,
+        browser_display=browser_display,
+    )
+    crit_desc = (
+        roles.describe_chain(
+            critic_chain,
+            fallback,
+            real_gui_policy=real_gui_policy,
+            ask_mode=ask_mode,
+            browser_engine=browser_engine,
+            browser_display=browser_display,
+        )
+        if mode == "adversarial"
+        else None
+    )
 
     # Cross-family verifier guard: warn (don't block) when the critic chain
     # leads with the same provider family as the generator. Only meaningful
@@ -374,6 +489,14 @@ async def dispatch_async(
         # inherit-parent-cwd behaviour for the default case.
         if work_dir != PROJECT_ROOT:
             agent.cwd = str(work_dir)
+        # Forward the full computer-use config for shim-based execution paths.
+        # This keeps direct adapter short-circuiting unchanged while ensuring
+        # --mode workflows that construct ComputerUseShim still receive all
+        # CLI-forwarded RunRequest keys.
+        if worker == roles.COMPUTER_USE_TOKEN and hasattr(agent, "computer_use_config"):
+            setattr(agent, "computer_use_config", dict(cu_config))
+            setattr(agent, "_harness_run_id", run_id)
+            setattr(agent, "_harness_events_path", str(events_path))
 
     EVENT_BUS.add_sink(run_id, _sink)
     dispatch_pub = EVENT_BUS.publisher_for(
@@ -433,15 +556,40 @@ async def dispatch_async(
     output = ""
     workflow = None
     try:
-        output, workflow = await _run_workflow(
-            mode, prompt,
-            generator_chain=generator_chain, critic_chain=critic_chain,
-            fallback=fallback, cycles=cycles, max_iterations=max_iterations,
-            branches=branches, verifier=verifier, codex_config=codex_config,
-            post_construct_hook=_post_construct_hook,
-            working_directory=str(work_dir),
-            mission_critical=mission_critical,
-        )
+        if _is_cu:
+            # Step 12 minimal glue: exercise the real adapter (writes events.jsonl under runs/<id>/,
+            # respects --out-dir via harness snapshot scope, supports cu params).
+            # Only direct-style runs are exercised here; complex workflows stay LLM-only.
+            from agy_orchestrator.computer_use.adapter import ComputerUseWorkerAdapter
+            from agy_orchestrator.computer_use.audit import AuditEventSink as CUAuditSink
+
+            def _cu_sink(rid: str):
+                # Append to the harness-prepared events.jsonl and fan out to bus for dashboard.
+                s = CUAuditSink(run_id=rid, events_path=events_path)
+                pub = EVENT_BUS.publisher_for(rid, worker="computer-use", model="n/a", effort="n/a")
+                s.add_callback(lambda d: pub({"kind": "computer_use_event", "data": d}) or None)
+                return s
+
+            adapter = ComputerUseWorkerAdapter(audit_sink_factory=_cu_sink)
+            cu_req = {
+                "run_id": run_id,
+                "objective": instruction,  # raw objective for the reasoner; prompt wrapper is in artifacts
+                **cu_config,
+            }
+            h = adapter.start(cu_req)
+            output = f"computer-use:{h.status} run_id={h.run_id} events={h.events_path or ''}"
+            # workflow stays None (no quality ledger from cu yet)
+        else:
+            output, workflow = await _run_workflow(
+                mode, prompt,
+                generator_chain=generator_chain, critic_chain=critic_chain,
+                fallback=fallback, cycles=cycles, max_iterations=max_iterations,
+                branches=branches, verifier=verifier, codex_config=codex_config,
+                computer_use_config=cu_config,
+                post_construct_hook=_post_construct_hook,
+                working_directory=str(work_dir),
+                mission_critical=mission_critical,
+            )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
         error = f"{type(exc).__name__}: {exc}"
@@ -593,6 +741,15 @@ def dispatch(
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    # Step 12: forwarded for computer-use adapter (see dispatch_async)
+    # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
+    computer_use_mode: Optional[str] = None,
+    computer_use_task_priority: Optional[str] = None,
+    computer_use_budgets: Optional[Dict[str, Any]] = None,
+    real_gui_policy: Optional[str] = None,
+    ask_mode: Optional[str] = None,
+    browser_engine: Optional[str] = None,
+    browser_display: Optional[str] = None,
 ) -> DispatchResult:
     """Execute one instruction and capture the run. Synchronous entrypoint."""
     return asyncio.run(
@@ -613,5 +770,12 @@ def dispatch(
             spec=spec,
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
+            computer_use_mode=computer_use_mode,
+            computer_use_task_priority=computer_use_task_priority,
+            computer_use_budgets=computer_use_budgets,
+            real_gui_policy=real_gui_policy,
+            ask_mode=ask_mode,
+            browser_engine=browser_engine,
+            browser_display=browser_display,
         )
     )

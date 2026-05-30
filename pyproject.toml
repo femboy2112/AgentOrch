@@ -24,6 +24,16 @@ include = ["agy_orchestrator*", "dashboard*", "harness*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "hardening: release-blocking hardening invariants (XAUTH, killable tree, rlimits, redaction)",
+    "fr: functional requirement tests per spec Testing Strategy",
+    "slow: tests requiring live Xvfb + real components or longer timeouts; excluded from -m 'not slow'",
+    "release_blocking: critical FR or hardening invariant tests (must pass for release)",
+    "not_slow: tests suitable for the default -m 'not slow' gate (exclude heavy Xvfb or long-running)",
+    "fr_release_blocking: one of FR-03/04/09/12/23/24",
+    "realgui: real-GUI harness (real_act executor + ownership/ask/grant) tests; hermetic fakes by default, @slow + AGY_REALGUI_E2E=1 for zenity/:0 e2e",
+    "browser: browser-controller and DOM-actuation tests (hermetic FakeBrowserController by default, @slow + AGY_BROWSER_E2E=1 for autonomous e2e)",
+]
 
 [tool.ruff]
 line-length = 100

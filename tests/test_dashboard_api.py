@@ -13,8 +13,8 @@ from fastapi.testclient import TestClient
 
 from dashboard.server import create_app
 from harness import dispatch as dispatch_mod
-from harness.dispatch import DispatchResult
 from harness import roles
+from harness.dispatch import DispatchResult
 
 
 def _parse_sse(body: str) -> list[dict]:
