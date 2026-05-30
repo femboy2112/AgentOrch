@@ -77,6 +77,7 @@ class AgentInstance(ABC):
         # only when streaming). Sinks (ledger, calibration) read these.
         self.last_wall_ms: Optional[float] = None
         self.last_out_bytes: Optional[int] = None
+        self.last_usage: Optional[Dict[str, object]] = None
         # Optional dashboard/event-bus callback. Best-effort only: failures in
         # observability must never affect execution.
         self.event_callback: Optional[Callable[[dict], None]] = None
@@ -216,21 +217,20 @@ class AgentInstance(ABC):
         token_source = str(usage.get("token_source") or "unavailable")
         if token_source not in {"cli", "unavailable"}:
             token_source = "unavailable"
-        self._emit_event({
-            "kind": "usage",
-            "data": {
-                "usage_kind": "call",
-                "token_source": token_source,
-                "input_tokens": self._to_int_token(usage.get("input_tokens")),
-                "output_tokens": self._to_int_token(usage.get("output_tokens")),
-                "cache_read_tokens": self._to_int_token(usage.get("cache_read_tokens")),
-                "total_tokens": self._to_int_token(usage.get("total_tokens")),
-                "attempt": attempt,
-                "success": bool(success),
-                "worker": self._worker_name(),
-                "model": self.model,
-            },
-        })
+        usage_data = {
+            "usage_kind": "call",
+            "token_source": token_source,
+            "input_tokens": self._to_int_token(usage.get("input_tokens")),
+            "output_tokens": self._to_int_token(usage.get("output_tokens")),
+            "cache_read_tokens": self._to_int_token(usage.get("cache_read_tokens")),
+            "total_tokens": self._to_int_token(usage.get("total_tokens")),
+            "attempt": attempt,
+            "success": bool(success),
+            "worker": self._worker_name(),
+            "model": self.model,
+        }
+        self.last_usage = dict(usage_data)
+        self._emit_event({"kind": "usage", "data": usage_data})
 
     async def _stream_communicate(self, process, stdin_bytes: Optional[bytes] = None,
                                   *, max_output_bytes: int = 0,

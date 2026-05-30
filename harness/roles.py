@@ -157,6 +157,8 @@ def build_role_agent(
     chain: List[str],
     *,
     prompt: str = "",
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
     fallback: bool = True,
     cycles: int = 2,
     codex_config: Optional[List[str]] = None,
@@ -176,6 +178,10 @@ def build_role_agent(
         raise ValueError("role chain must be non-empty")
 
     lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config)
+    if model is not None:
+        lead_cfg["model"] = model
+    if effort is not None:
+        lead_cfg["effort"] = effort
 
     if lead_name == COMPUTER_USE_TOKEN:
         # Step 12: return shim (no LLM class, no watchdog, hook still runs for cwd/run linkage)
