@@ -13,6 +13,7 @@ Pure stdlib, no Pydantic, no GUI/X11 code. Matches style of core/agent.py
 (typing imports, dataclasses like routing/policy.py and execution/verifier.py).
 
 Release-blocking FRs and hardening #4 redaction tests depend on these shapes.
+Phase 1.x (design addendum): DOMTargetDict(TypedDict) + extended IntentTarget union (dom kind) + browser_engine/browser_display on RunRequest/WorkerSession + BROWSER_NOT_OPEN (additive only; zero behavior change; INV F / B4 preserved).
 """
 
 from __future__ import annotations
@@ -172,6 +173,7 @@ class ViolationCode(str, Enum):
     GRANT_REQUIRED = "grant_required"
     GRANT_EXPIRED = "grant_expired"
     CLEARANCE_TOKEN_INVALID = "clearance_token_invalid"
+    BROWSER_NOT_OPEN = "browser_not_open"
 
 
 # =============================================================================
@@ -222,8 +224,18 @@ class CoordinateTargetDict(TypedDict, total=False):
     tolerance_px: Optional[int]
 
 
-# IntentTarget is a union in TS; we represent as dict at runtime for simplicity
-IntentTarget = Union[ElementTargetDict, CoordinateTargetDict, Dict[str, Any]]
+class DOMTargetDict(TypedDict, total=False):
+    """Target for browser/DOM actuation (click/type on agent-owned Chromium via CDP).
+    kind="dom"; index is 1-based (matches prototype and reasoner plans).
+    A dom target with no open browser yields REJECTED browser_not_open (fail-closed).
+    """
+    kind: str  # "dom"
+    selector: Optional[str]
+    index: Optional[int]  # 1-based
+
+
+# IntentTarget union (Step 1 extended): Element|Coordinate|DOMTargetDict (kind="dom", selector, 1-based index for browser/DOM click/type). Dict fallback for forward compat.
+IntentTarget = Union[ElementTargetDict, CoordinateTargetDict, DOMTargetDict, Dict[str, Any]]
 
 
 class ConfirmationTokenMessageDict(TypedDict, total=False):
@@ -249,7 +261,9 @@ class PriorStepContextDict(TypedDict, total=False):
 
 
 class ActionPayloadDict(TypedDict, total=False):
-    """Inline 'action' object inside ActionIntent (and mirrored in ActionSpec)."""
+    """Inline 'action' object inside ActionIntent (and mirrored in ActionSpec).
+    target may be ElementTargetDict | CoordinateTargetDict | DOMTargetDict (kind="dom" for browser).
+    """
     type: str
     display_scope: str
     target: Optional[IntentTarget]
@@ -301,6 +315,8 @@ class RunRequest:
     observe_display: Optional[str] = None  # ":0" default in OBSERVE
     real_gui_policy: Optional[str] = None  # RealGuiPolicy value (validated only when mode==REAL)
     ask_mode: Optional[str] = None  # AskMode value (validated only when mode==REAL)
+    browser_engine: Optional[str] = None  # "bing" | "duckduckgo" | "google" (default bing for bot tolerance)
+    browser_display: Optional[str] = None  # ":0" in REAL else isolated Xvfb; forwarded to BrowserController
 
     def __post_init__(self) -> None:
         if self.mode is not None and self.mode not in {m.value for m in RunMode}:
@@ -308,6 +324,7 @@ class RunRequest:
         if self.task_priority is not None and self.task_priority not in {p.value for p in TaskPriority}:
             raise ValueError(f"task_priority must be one of {[p.value for p in TaskPriority]}")
         # real_gui_policy / ask_mode forwarded; validated only when mode==REAL (per Step 1 spec)
+        # browser_* allowed unconditionally (no validation here; used by adapter + BrowserController)
         if self.mode == RunMode.REAL.value:
             if self.real_gui_policy is not None and self.real_gui_policy not in {p.value for p in RealGuiPolicy}:
                 raise ValueError(f"real_gui_policy must be one of {[p.value for p in RealGuiPolicy]} when mode=REAL")
@@ -326,6 +343,8 @@ class WorkerSession:
     capabilities: CapabilityReport  # forward ref resolved at runtime via string
     real_gui_policy: Optional[str] = None  # RealGuiPolicy value (only for REAL mode)
     ask_mode: Optional[str] = None  # AskMode value
+    browser_engine: Optional[str] = None  # echoed from RunRequest for the run
+    browser_display: Optional[str] = None  # echoed; ":0" or isolated Xvfb for agent-owned browser
     baseline_pids: Optional[List[int]] = None
     baseline_windows: Optional[Dict[str, Any]] = None
 
@@ -472,7 +491,7 @@ class ActionSpec:
     action_id: str
     type: str  # ActionType value
     display_scope: str  # must be "isolated" at execution boundary (FR-04)
-    target: Optional[Dict[str, Any]] = None  # CoordinateTargetDict or None for non-spatial
+    target: Optional[Dict[str, Any]] = None  # Element|Coordinate|DOMTargetDict or None for non-spatial
     source_handle_id: Optional[str] = None
     text: Optional[str] = None
     hotkey: Optional[List[str]] = None
@@ -648,6 +667,7 @@ class Grant:
 
 # =============================================================================
 # Serialization helpers (roundtrip contract for tests + event sink + reasoner)
+# __all__ updated minimally in package surface (DOMTargetDict etc. listed in __init__.py); no __all__ here to preserve from .models import * semantics (additive Phase 1.x, INV F).
 # =============================================================================
 
 def _normalize_for_dict(obj: Any) -> Any:

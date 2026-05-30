@@ -17,6 +17,12 @@ GUI app has no path (in env or cookie bytes) to the operator's real
 enforce_limits(session) now actively polls budgets (max_processes, max_rss_mb,
 max_cpu_percent) and terminates over-limit trees (secondary to the rlimits).
 
+Phase 1.x (design addendum): adopt_owned_process(pid) registers externally-
+launched processes (proc=None, arbitrary display_scope) under the same registry
+shape so is_owned/terminate_tree (with pgid-leader guard) work for agent-owned
+CDP browsers (B1/B3). Additive only; zero behavior change to spawn/terminate/
+is_owned paths for all prior callers; INV F / B4 preserved exactly.
+
 Strict scope (per task):
 - All Xvfb/app spawns remain bound to isolated displays only.
 - Real-:0 paths are structurally impossible for any action execution path.
@@ -266,6 +272,68 @@ class ProcessSupervisor:
         # private XAUTHORITY cookie + sanitized HOME into the Xvfb process env.
         return self.spawn(sp, isolated_display=spec.display)
 
+    def adopt_owned_process(
+        self,
+        pid: int,
+        *,
+        root_id: Optional[str] = None,
+        display_scope: Optional[str] = None,
+        argv: Optional[List[str]] = None,
+        source: str = "browser",
+    ) -> SpawnedProc:
+        """Adopt an externally-launched process (e.g. Playwright Chromium) as owned tree root.
+
+        Phase 1.x Step 2 (additive only; zero behavior change; INV F / B4 preserved):
+        computes pgid=os.getpgid(pid) safely (OSError -> pid, exactly as spawn),
+        stores in _registry under identical core keys as spawn (root_pid, pgid,
+        spec=None, proc=None, started_at), returns SpawnedProc. The optional
+        display_scope/argv live only on the returned handle (roots() tolerant via
+        its existing "if sp is not None" path; no SpawnSpec constructed to avoid
+        its "must be isolated" validator for :0/REAL browsers).
+
+        terminate_tree/is_owned/enforce_limits continue to work for adopted pids
+        (killpg guarded for non-leader pgids + psutil sweep + waitpid already
+        tolerate proc=None and arbitrary pgid sharing from external launchers).
+
+        Enables B1 (owned CDP browser has no prompt under full/children),
+        B3 (reaped on session close + watchdog/timeout, no leak), B2 (controller
+        drives only its own via CDP; foreign stays SafetyKernel-gated).
+
+        Tiny docstring example (never executed, zero launches):
+            sup = ProcessSupervisor()
+            h = sup.adopt_owned_process(browser_pid, display_scope=":0", source="browser")
+            assert sup.is_owned(browser_pid)
+            sup.terminate_tree(h.root_id)
+        """
+        if not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"pid must be positive int, got {pid!r}")
+
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            pgid = pid
+
+        if root_id is None:
+            root_id = f"{source}-{pid}"
+
+        entry: Dict[str, Any] = {
+            "pgid": pgid,
+            "root_pid": pid,
+            "spec": None,  # no SpawnSpec: REAL/:0 browsers forbidden by SpawnSpec.__post_init__
+            "proc": None,
+            "started_at": time.time(),
+        }
+        self._registry[root_id] = entry
+
+        return SpawnedProc(
+            pid=pid,
+            pgid=pgid,
+            root_id=root_id,
+            argv=list(argv) if argv is not None else [],
+            display_scope=display_scope,
+            started_at=entry["started_at"],
+        )
+
     # ---------------- terminate / ownership ----------------
     def terminate_tree(self, root_id: str) -> None:
         """Kill the whole owned process tree (root + grandchildren + daemons in pgid).
@@ -284,13 +352,21 @@ class ProcessSupervisor:
         root_pid = entry.get("root_pid")
 
         # 1. group kill (the hardening #2 mechanism)
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(pgid, sig)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            if sig == signal.SIGTERM:
-                time.sleep(0.08)
+        # Guard: only killpg when this root *is* the pgid leader (pgid == root_pid).
+        # All spawn() roots satisfy this (start_new_session=True makes the child leader).
+        # Adopted externals (Playwright Chromium etc.) often inherit the launcher's pgid;
+        # killpg on that would signal the caller's own group (self-termination risk).
+        # For non-leader roots we skip killpg; the psutil ppid ancestry sweep + waitpid
+        # below still fully reaps the browser subtree (B3). Zero behavior change for
+        # all prior spawn paths (they always have pgid == root_pid).
+        if root_pid and pgid == root_pid:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(pgid, sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                if sig == signal.SIGTERM:
+                    time.sleep(0.08)
 
         # 2. reap via the Popen we kept (turns the leader into a real exit)
         if proc is not None:

@@ -12,6 +12,7 @@ dedicated computer_use_* test modules.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,8 @@ from agy_orchestrator.computer_use.models import (
     WorkerEventType,
 )
 from harness import roles
+from harness import cli as harness_cli
+from harness import computer_use_role
 
 
 def _mk_intent() -> ActionIntent:
@@ -242,3 +245,95 @@ def test_roles_recognizes_computer_use_token():
 
     # Token constant present
     assert roles.COMPUTER_USE_TOKEN == "computer-use"
+
+
+def test_cli_forwards_real_gui_and_browser_flags(monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    def _fake_dispatch(instruction: str, **kwargs: Any) -> Any:
+        captured["instruction"] = instruction
+        captured.update(kwargs)
+        return SimpleNamespace(
+            success=True,
+            run_id="r-cli",
+            mode=kwargs.get("mode", "adversarial"),
+            generator="computer-use",
+            critic=None,
+            duration_s=0.0,
+            quality=None,
+            error=None,
+            changed_files=[],
+            added=[],
+            modified=[],
+            deleted=[],
+            run_dir="/tmp/r-cli",
+        )
+
+    monkeypatch.setattr(harness_cli, "dispatch", _fake_dispatch)
+    monkeypatch.setattr(harness_cli, "_print_result", lambda _: None)
+
+    rc = harness_cli.main(
+        [
+            "do",
+            "search and click",
+            "--generator",
+            "computer-use",
+            "--computer-use-mode",
+            "REAL",
+            "--real-gui-policy",
+            "children",
+            "--ask-mode",
+            "off",
+            "--browser-engine",
+            "duckduckgo",
+            "--browser-display",
+            ":0",
+        ]
+    )
+    assert rc == 0
+    assert captured["computer_use_mode"] == "REAL"
+    assert captured["real_gui_policy"] == "children"
+    assert captured["ask_mode"] == "off"
+    assert captured["browser_engine"] == "duckduckgo"
+    assert captured["browser_display"] == ":0"
+
+
+def test_computer_use_shim_forwards_browser_config(monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    class _FakeAuditSink:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+    class _FakeAdapter:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def start(self, req: Dict[str, Any]) -> Any:
+            captured.update(req)
+            return SimpleNamespace(run_id=req["run_id"], status="completed", events_path=None)
+
+    monkeypatch.setattr(
+        computer_use_role,
+        "_get_cu_imports",
+        lambda: (_FakeAdapter, object, _FakeAuditSink),
+    )
+
+    shim = computer_use_role.ComputerUseShim(
+        prompt="search objective",
+        harness_run_id="cu-shim-browser",
+        computer_use_config={
+            "mode": "REAL",
+            "real_gui_policy": "children",
+            "ask_mode": "off",
+            "browser_engine": "bing",
+            "browser_display": ":0",
+        },
+    )
+    asyncio.run(shim.run_async())
+
+    assert captured["mode"] == "REAL"
+    assert captured["real_gui_policy"] == "children"
+    assert captured["ask_mode"] == "off"
+    assert captured["browser_engine"] == "bing"
+    assert captured["browser_display"] == ":0"

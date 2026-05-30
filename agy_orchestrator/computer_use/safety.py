@@ -208,6 +208,7 @@ class SafetyKernel:
         coord = None
         sh = None
         kind = tgt.get("kind")
+        is_dom_spatial = typ in {"click", "type"} and kind == "dom"
         if kind == "coordinate":
             try:
                 coord = CoordinateTarget(x=int(tgt.get("x", 0)), y=int(tgt.get("y", 0)))
@@ -219,13 +220,16 @@ class SafetyKernel:
                 sh = tgt.get("handle_id")
             except Exception as e:
                 return ValidationResult(valid=False, violations=[{"code": ViolationCode.TARGET_UNRESOLVABLE.value, "message": str(e)}])
+        elif kind == "dom" and typ in {"click", "type"}:
+            # DOM targets are resolved by BrowserController via selector/index, not coordinates.
+            coord = None
         else:
             # Unknown target kind on a spatial action that passed the "tgt present" pre-check
             if typ in spatial:
                 return ValidationResult(valid=False, violations=[{"code": ViolationCode.TARGET_UNRESOLVABLE.value, "message": f"invalid target kind for spatial action: {kind}"}])
 
         # Final guard: spatial actions must have a resolved coordinate target at the gate
-        if typ in spatial and coord is None:
+        if typ in spatial and coord is None and not is_dom_spatial:
             return ValidationResult(valid=False, violations=[{"code": ViolationCode.TARGET_UNRESOLVABLE.value, "message": "spatial action missing resolved coordinate target"}])
 
         try:
@@ -233,7 +237,7 @@ class SafetyKernel:
                 action_id=f"act-{int(time.time()*1000)}",
                 type=typ,
                 display_scope="isolated",
-                target=asdict(coord) if coord else None,
+                target=asdict(coord) if coord else (dict(tgt) if is_dom_spatial else None),
                 source_handle_id=sh,
                 text=a.get("text"),
                 hotkey=a.get("hotkey"),
@@ -281,13 +285,15 @@ class SafetyKernel:
             return GateDecision(gate=GateType.ALLOW.value, reason="token present")
         return GateDecision(gate=GateType.ALLOW.value, reason="low risk")
 
-    def resolve_target(self, intent: Union[ActionIntent, Dict[str, Any]], snapshots: Dict[str, Any]) -> CoordinateTarget:
+    def resolve_target(self, intent: Union[ActionIntent, Dict[str, Any]], snapshots: Dict[str, Any]) -> Union[CoordinateTarget, Dict[str, Any], None]:
         """Element handle → center coordinate (FR-07). Stale/missing handle → ValueError (caught as TARGET_UNRESOLVABLE)."""
         d = _to_dict(intent)
         a = d.get("action") or {}
         tgt = (a.get("target") if isinstance(a, dict) else {}) or {}
         if tgt.get("kind") == "coordinate":
             return CoordinateTarget(x=int(tgt.get("x", 0)), y=int(tgt.get("y", 0)))
+        if tgt.get("kind") == "dom":
+            return dict(tgt) if isinstance(tgt, dict) else None
         if tgt.get("kind") == "element":
             hid = tgt.get("handle_id")
             for _s, sn in (snapshots or {}).items():

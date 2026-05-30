@@ -13,8 +13,11 @@ release-blocking tests in tests/test_computer_use_action.py:
   get_isolated_env (hardening #1). real_act paths: use operator real :0 env
   (DISPLAY/XAUTHORITY from os.environ, never the isolated cookie or
   AGY_ISOLATED_X).
-- launch_app and navigate delegate exclusively to ProcessSupervisor.spawn
-  (FR-24: no_shell, forced isolated env, rlimits, start_new_session).
+- launch_app delegates to ProcessSupervisor.spawn (FR-24: no_shell, forced
+  isolated env, rlimits, start_new_session). navigate can optionally route to
+  an injected BrowserController and otherwise preserves the legacy spawn stub.
+- click/type support additive DOM targets (`kind="dom"`) through an injected
+  BrowserController; coordinate/real_act/xdotool paths are unchanged.
 - Full ActionResult (status, executed_at, resolved_target, spawned_pids, ...).
 - Ctor accepts the kwargs the test suite uses: isolated_display, action_timeout_ms.
 - Private _verify_clearance(action) for the token gate (caller after kernel
@@ -39,7 +42,11 @@ from .xauth import get_isolated_env
 
 
 class ActionExecutor:
-    """Isolated-display-only action executor (xdotool + supervisor spawns)."""
+    """Isolated-display-only action executor (xdotool + supervisor spawns).
+
+    Additive Phase 1.x wiring: optional browser_controller for navigate + DOM
+    click/type targets, with legacy spawn stub fallback when absent.
+    """
 
     SPATIAL: set[str] = {"click", "double_click", "type", "scroll", "drag"}
 
@@ -47,11 +54,13 @@ class ActionExecutor:
         self,
         isolated_display: str = ":99",
         supervisor: Optional[ProcessSupervisor] = None,
+        browser_controller: Optional[Any] = None,
         **kw: Any,
     ) -> None:
         disp = isolated_display or ":99"
         self.isolated_display = disp if (isinstance(disp, str) and disp.startswith(":")) else ":99"
         self.supervisor = supervisor or ProcessSupervisor()
+        self.browser_controller = browser_controller
         self.action_timeout_ms = int(kw.get("action_timeout_ms", 10000))
         # Lazy: do not call get_isolated_env here (FR-04 tests construct then
         # execute(bad_scope) and must observe zero subprocess side effects).
@@ -149,6 +158,7 @@ class ActionExecutor:
             typ = a.get("type")
             ds = a.get("display_scope")
             tgt = a.get("target")
+            url = a.get("url")
             text = a.get("text")
             hotkey = a.get("hotkey")
             scroll_delta = a.get("scroll_delta")
@@ -162,6 +172,7 @@ class ActionExecutor:
             typ = getattr(a, "type", None)
             ds = getattr(a, "display_scope", None)
             tgt = getattr(a, "target", None)
+            url = getattr(a, "url", None)
             text = getattr(a, "text", None)
             hotkey = getattr(a, "hotkey", None)
             scroll_delta = getattr(a, "scroll_delta", None)
@@ -192,13 +203,22 @@ class ActionExecutor:
         # Coerce tgt to dict only for the convenience of the spatial branches;
         # the "absent / wrong kind" check below sees the original.
         tgt_d = tgt if isinstance(tgt, dict) else (tgt or {})
+        tgt_kind = tgt_d.get("kind")
+        is_dom_target = typ in ("click", "type") and tgt_kind == "dom"
 
         is_spatial = typ in self.SPATIAL
-        if is_spatial and (not tgt_d or tgt_d.get("kind") != "coordinate"):
+        if is_spatial and not is_dom_target and (not tgt_d or tgt_kind != "coordinate"):
             return ActionResult(
                 status=ActionStatus.REJECTED.value,
                 executed_at=executed_at,
                 error_code="target_missing",
+            )
+        bc = self.browser_controller
+        if is_dom_target and bc is None:
+            return ActionResult(
+                status=ActionStatus.REJECTED.value,
+                executed_at=executed_at,
+                error_code="browser_not_open",
             )
 
         to = max(0.5, min(self.action_timeout_ms / 1000.0, 8.0))
@@ -213,10 +233,54 @@ class ActionExecutor:
 
         resolved: Optional[Dict[str, int]] = None
         spawned: List[int] = []
+        artifacts: Optional[List[str]] = None
         ok = False
 
         try:
-            if typ in ("click", "double_click"):
+            if typ == "click" and tgt_kind == "dom":
+                selector = tgt_d.get("selector")
+                index = int(tgt_d.get("index", 1))
+                out = bc.click_dom(selector=selector, index=index)
+                ok = bool(out.get("ok"))
+                if ok:
+                    resolved = {"index": int(out.get("index", index))}
+                    landed_url = out.get("landed_url")
+                    child_url = out.get("child_page_url")
+                    art = []
+                    if landed_url:
+                        art.append(f"landed_url:{landed_url}")
+                    if child_url:
+                        art.append(f"child_page_url:{child_url}")
+                    artifacts = art or None
+                elif out.get("error_code") == "browser_not_open":
+                    return ActionResult(
+                        status=ActionStatus.REJECTED.value,
+                        executed_at=executed_at,
+                        error_code="browser_not_open",
+                    )
+                else:
+                    ok = False
+
+            elif typ == "type" and tgt_kind == "dom":
+                selector = tgt_d.get("selector")
+                index = int(tgt_d.get("index", 1))
+                txt = str(text or "")
+                out = bc.type_dom(selector=selector, index=index, text=txt)
+                ok = bool(out.get("ok"))
+                if ok:
+                    resolved = {"index": int(out.get("index", index))}
+                    landed_url = out.get("landed_url")
+                    artifacts = [f"landed_url:{landed_url}"] if landed_url else None
+                elif out.get("error_code") == "browser_not_open":
+                    return ActionResult(
+                        status=ActionStatus.REJECTED.value,
+                        executed_at=executed_at,
+                        error_code="browser_not_open",
+                    )
+                else:
+                    ok = False
+
+            elif typ in ("click", "double_click"):
                 x = int(tgt_d.get("x", 0))
                 y = int(tgt_d.get("y", 0))
                 self._run(["xdotool", "mousemove", x, y, "click", "1"], env, to)
@@ -277,9 +341,15 @@ class ActionExecutor:
                     ok = False
 
             elif typ == "navigate":
-                # Delegate (browser stub) via supervisor per test contract + FR-24
-                sp = self.supervisor.spawn(argv=["true"], display_scope="isolated", no_shell=True, source_action_id=action_id)
-                spawned = [sp.pid]
+                if bc is not None:
+                    landed_url, pid = bc.navigate(str(url or "about:blank"))
+                    spawned = [int(pid)] if pid else []
+                    resolved = {"browser_pid": int(pid or 0)}
+                    artifacts = [f"landed_url:{landed_url}"] if landed_url else None
+                else:
+                    # Delegate (browser stub) via supervisor per test contract + FR-24
+                    sp = self.supervisor.spawn(argv=["true"], display_scope="isolated", no_shell=True, source_action_id=action_id)
+                    spawned = [sp.pid]
                 ok = True
 
             else:
@@ -295,4 +365,5 @@ class ActionExecutor:
             resolved_target=resolved,
             spawned_process_ids=spawned or None,
             error_code=None if ok else "execution_failed",
+            artifacts=artifacts,
         )

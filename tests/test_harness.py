@@ -64,6 +64,19 @@ class _BoomAgent:
         raise RuntimeError("provider walled")
 
 
+class _FakeCUAdapter:
+    """Captures the cu request payload forwarded by harness.dispatch."""
+
+    last_req = None
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def start(self, req):
+        _FakeCUAdapter.last_req = dict(req)
+        return type("RunHandle", (), {"status": "completed", "run_id": req["run_id"], "events_path": None})()
+
+
 def _point_harness_at(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatch_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(dispatch_mod, "RUNS_DIR", tmp_path / "runs")
@@ -97,3 +110,31 @@ def test_dispatch_failure_is_graceful(tmp_path, monkeypatch):
     run_dir = Path(result.run_dir)
     assert (run_dir / "stderr.log").exists()
     assert "no file changes" in (run_dir / "changed-files.diff").read_text()
+
+
+def test_dispatch_forwards_computer_use_real_gui_and_browser_fields(tmp_path, monkeypatch):
+    _point_harness_at(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "agy_orchestrator.computer_use.adapter.ComputerUseWorkerAdapter",
+        _FakeCUAdapter,
+    )
+
+    res = dispatch_mod.dispatch(
+        "cu objective",
+        mode="direct",
+        generator_chain=["computer-use"],
+        computer_use_mode="REAL",
+        real_gui_policy="children",
+        ask_mode="off",
+        browser_engine="bing",
+        browser_display=":0",
+    )
+
+    assert res.success is True
+    req = _FakeCUAdapter.last_req
+    assert req is not None
+    assert req["mode"] == "REAL"
+    assert req["real_gui_policy"] == "children"
+    assert req["ask_mode"] == "off"
+    assert req["browser_engine"] == "bing"
+    assert req["browser_display"] == ":0"

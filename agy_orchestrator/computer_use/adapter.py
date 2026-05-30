@@ -110,6 +110,7 @@ class ComputerUseWorkerAdapter:
         ownership_resolver: Optional[Any] = None,
         gui_prompter: Optional[Any] = None,
         grant_cache: Optional[Any] = None,
+        browser_controller: Optional[Any] = None,
         **kw: Any,
     ) -> None:
         self._reasoner = reasoner
@@ -120,6 +121,7 @@ class ComputerUseWorkerAdapter:
         self._ownership_resolver = ownership_resolver
         self._gui_prompter = gui_prompter
         self._grant_cache = grant_cache
+        self._browser_controller = browser_controller
         self._audit_factory = audit_sink_factory or (lambda rid: AuditEventSink(run_id=rid))
         self._active_runs: Dict[str, Dict[str, Any]] = {}  # run_id -> {"thread": , "stop": Event, ...}
         self._lock = threading.RLock()
@@ -132,6 +134,8 @@ class ComputerUseWorkerAdapter:
             ctrl_kwargs["gui_prompter"] = gui_prompter
         if grant_cache is not None:
             ctrl_kwargs["grant_cache"] = grant_cache
+        if browser_controller is not None:
+            ctrl_kwargs["browser_controller"] = browser_controller
         self._controller = session_controller or SessionController(**ctrl_kwargs)
 
     # ------------------------------------------------------------------
@@ -301,6 +305,7 @@ class ComputerUseWorkerAdapter:
         executor = self._executor or ActionExecutor(
             isolated_display=sess.isolated_display,
             supervisor=sup,
+            browser_controller=getattr(sess, "browser_controller", None) or self._browser_controller,
             action_timeout_ms=sess.worker_session.budgets.get("action_timeout_ms", 10000),
         )
 
@@ -444,12 +449,19 @@ class ComputerUseWorkerAdapter:
                 "isolated": sess.isolated_display,
                 "observe_real": sess.observe_display or ":0",
             }
+            cdp = (
+                getattr(sess, "browser_cdp_endpoint", None)
+                or getattr(sess, "current_cdp_endpoint", None)
+                or getattr(getattr(sess, "browser_controller", None), "cdp_endpoint", None)
+                or getattr(self._browser_controller, "cdp_endpoint", None)
+            )
 
             try:
                 raw_snaps = perception.snapshot_set(
                     scopes,
                     run_id=run_id,
                     displays=displays_map,
+                    cdp_endpoint=cdp,
                 )
             except Exception as e:
                 # Degrade gracefully; emit and continue with whatever we have (or empty)

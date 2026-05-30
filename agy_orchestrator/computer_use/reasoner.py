@@ -107,6 +107,8 @@ REASONER_HEADER = """You are a precise, safety-first GUI computer-use reasoning 
 MISSION
 Analyze the structured perception snapshots (windows, AT-SPI elements, geometry, OCR text blocks, optional DOM) from the current session and output exactly one next ActionIntent that advances the operator objective while obeying all hard constraints.
 
+navigate opens an agent-owned CDP browser (registered via ProcessSupervisor); use target {kind:'dom', selector:'...', index:N (1-based)} on click/type to actuate DOM elements and auto-follow new tabs (ctx.pages[-1]). The browser is always the agent's child — no real_act prompt required.
+
 HARD SAFETY CONSTRAINTS (VIOLATIONS ARE NEVER ACCEPTABLE)
 - action.display_scope MUST be the literal string "isolated". Never target real :0 or any other display.
 - For spatial actions (click, double_click, type, scroll, drag) a target is REQUIRED: either a valid element handle_id from the current snapshots or explicit {kind:"coordinate", x, y, ...}.

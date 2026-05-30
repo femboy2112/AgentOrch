@@ -50,6 +50,8 @@ from .adapter import (  # noqa: F401  # Step 11: public contract + core run loop
 from .ownership import OwnershipResolver, FakeOwnershipResolver  # noqa: F401
 from .gui_prompt import Prompter, FakePrompter, GuiPrompter  # noqa: F401
 from .grants import GrantCache, FakeClock  # noqa: F401
+# Phase 1.x Step 3: BrowserController + FakeBrowserController (additive export only; INV F / B4 preserved exactly)
+from .browser import BrowserController, FakeBrowserController  # noqa: F401  # Step 3: new module (real + Fake double; refined+finalized)
 # Make the Step-2 SpawnedProc the canonical one on the package namespace
 # (the "from .models import *" above must not shadow it).
 globals()["SpawnedProc"] = SpawnedProc
@@ -94,6 +96,7 @@ __all__ = [  # explicit for clean surface (Step 1)
     "WorkerEvent",
     "OrchestratorMessage",
     "IntentTarget",
+    "DOMTargetDict",  # Phase 1.x (addendum): DOM target kind for autonomous browser/DOM actuation (additive; B4 INV F)
     # Serialization (deterministic, used by events.jsonl + reasoner envelope)
     "to_dict",
     "from_dict",
@@ -145,4 +148,7 @@ __all__ = [  # explicit for clean surface (Step 1)
     "GuiPrompter",
     "GrantCache",
     "FakeClock",
+    # Phase 1.x Step 3: BrowserController + Fake (additive only; hermetic double for all browser tests; finalized)
+    "BrowserController",
+    "FakeBrowserController",
 ]

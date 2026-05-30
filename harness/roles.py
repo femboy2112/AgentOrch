@@ -158,6 +158,7 @@ def build_role_agent(
     fallback: bool = True,
     cycles: int = 2,
     codex_config: Optional[List[str]] = None,
+    computer_use_config: Optional[Dict[str, Any]] = None,
     post_construct_hook: Optional[RolePostConstructHook] = None,
 ) -> AgentInstance:
     """Instantiate a single agent for a role.
@@ -176,7 +177,7 @@ def build_role_agent(
 
     if lead_name == COMPUTER_USE_TOKEN:
         # Step 12: return shim (no LLM class, no watchdog, hook still runs for cwd/run linkage)
-        agent = ComputerUseShim(prompt=prompt, **lead_cfg)
+        agent = ComputerUseShim(prompt=prompt, computer_use_config=computer_use_config, **lead_cfg)
         if post_construct_hook is not None:
             try:
                 post_construct_hook(agent, lead_name, lead_cfg)
@@ -358,7 +359,7 @@ def check_agy_parallelism_warning(
 
 
 def describe_chain(chain: List[str], fallback: bool, **kwargs: Any) -> str:
-    """Describe for meta/logs; **kwargs accepts real_gui_policy/ask_mode (and computer_use_* variants) passed from dispatch for full wiring to shim/RunRequest paths (per Step 10); values deliberately ignored so all computer-use:isolated strings and outputs remain byte-identical (INVARIANT F, no behavior/output change for any run)."""
+    """Describe for meta/logs; **kwargs accepts real_gui_policy/ask_mode/browser_engine/browser_display (and computer_use_* variants) passed from dispatch for full wiring to shim/RunRequest paths (per Step 10+8); values deliberately ignored so all computer-use:isolated strings and outputs remain byte-identical (INVARIANT F, no behavior/output change for any run)."""
     if not fallback or len(chain) == 1:
         name, cfg = _cfg_for_token(chain[0])
         if name == COMPUTER_USE_TOKEN:

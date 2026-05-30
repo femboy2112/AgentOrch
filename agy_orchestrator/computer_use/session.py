@@ -102,6 +102,11 @@ class Session:
     _confirm_events: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # intent_id -> {event, token, ...}
     # Last known status
     status: str = "active"
+    # Phase 1.x Step 4 (additive): browser_controller ownership + B3 lifecycle; current_cdp_endpoint exposure for perception/actuation
+    browser_controller: Optional[Any] = None
+    browser_display: Optional[str] = None
+    browser_engine: Optional[str] = None
+    current_cdp_endpoint: Optional[str] = None
 
 
 class SessionController:
@@ -113,6 +118,7 @@ class SessionController:
         ownership_resolver: Optional[Any] = None,
         gui_prompter: Optional[Any] = None,
         grant_cache: Optional[Any] = None,
+        browser_controller: Optional[Any] = None,
     ) -> None:
         self._sessions: Dict[str, Session] = {}
         self._audit_factory = audit_sink_factory  # callable(run_id) -> AuditEventSink or None
@@ -123,6 +129,7 @@ class SessionController:
         self._ownership_resolver = ownership_resolver
         self._gui_prompter = gui_prompter
         self._grant_cache = grant_cache
+        self._browser_controller = browser_controller  # Phase 1.x Step 4: optional injected for tests (else construct per-run)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -146,6 +153,8 @@ class SessionController:
                 observe_display=config.get("observe_display") if isinstance(config, dict) else None,
                 real_gui_policy=config.get("real_gui_policy") if isinstance(config, dict) else None,
                 ask_mode=config.get("ask_mode") if isinstance(config, dict) else None,
+                browser_engine=config.get("browser_engine") if isinstance(config, dict) else None,
+                browser_display=config.get("browser_display") if isinstance(config, dict) else None,
             )
 
         run_id = config.run_id or f"cu-{int(time.time()*1000)}"
@@ -250,6 +259,45 @@ class SessionController:
                 xvfb_root_id = None
                 xvfb_sp = None
 
+        # Phase 1.x Step 4: BrowserController ownership (lifecycle + B3). After supervisor + xvfb setup (per spec).
+        # eff display: REAL uses :0 (agent child, visible, no prompt B1); else the run's isolated Xvfb.
+        # Injected wins; else Fake under test (hermetic, never launches real or touches :0); else real if playwright present.
+        # Engine defaults to "bing" (bot-tolerant; Google/DDG block automated). Stored on sess + echoed to ws.
+        eff_browser_display = getattr(config, "browser_display", None) or (":0" if mode == RunMode.REAL.value else isolated_display)
+        engine = getattr(config, "browser_engine", None) or "bing"
+        bc = None
+        if getattr(self, "_browser_controller", None) is not None:
+            bc = self._browser_controller
+        else:
+            under_test = False
+            try:
+                import os as _os
+                import sys as _sys
+                pytesty = _os.environ.get("PYTEST_CURRENT_TEST") or any("_pytest" in m or "pytest" in m for m in _sys.modules) or _os.environ.get("AGY_REALGUI_TEST") == "1"
+                browser_e2e = _os.environ.get("AGY_BROWSER_E2E") == "1"
+                if pytesty and not browser_e2e:
+                    under_test = True
+            except Exception:
+                under_test = True  # safe default for hermetic
+            from .browser import FakeBrowserController as _FakeBC
+            if under_test:
+                _BC = _FakeBC
+            else:
+                try:
+                    from playwright.sync_api import sync_playwright as _sp  # type: ignore  # probe only; no launch here
+                    del _sp
+                    from .browser import BrowserController as _BC
+                except Exception:
+                    _BC = _FakeBC
+            try:
+                bc = _BC(supervisor=supervisor, display=eff_browser_display, engine=engine)
+            except Exception:
+                # Fail-closed but never absent: fall back to Fake for deterministic/session-safe behavior.
+                try:
+                    bc = _FakeBC(supervisor=supervisor, display=eff_browser_display, engine=engine)
+                except Exception:
+                    bc = None
+
         # Assemble the immutable WorkerSession snapshot (persisted in meta / events)
         ws = WorkerSession(
             run_id=run_id,
@@ -265,6 +313,8 @@ class SessionController:
             capabilities=cap_report,
             real_gui_policy=real_gui_policy,
             ask_mode=ask_mode,
+            browser_engine=engine,
+            browser_display=eff_browser_display,
             baseline_pids=baseline_pids,
             baseline_windows=baseline_windows,
         )
@@ -281,6 +331,10 @@ class SessionController:
             private_home_dir=home_dir,
             baseline_pids=baseline_pids,
             baseline_windows=baseline_windows,
+            browser_controller=bc,
+            browser_display=eff_browser_display,
+            browser_engine=engine,
+            current_cdp_endpoint=(getattr(bc, "cdp_endpoint", None) if bc is not None else None),
         )
         self._sessions[run_id] = sess
 
@@ -315,6 +369,21 @@ class SessionController:
         if sess.xvfb_root_id:
             try:
                 sess.supervisor.terminate_tree(sess.xvfb_root_id)
+            except Exception:
+                pass
+
+        # Phase 1.x Step 4 B3 (additive): reap agent-owned browser tree via controller.close() (which calls supervisor.terminate_tree on its root_id).
+        # Idempotent; covers close_session, adapter.stop, and all finally/exit paths. Watchdog (enforce_limits) reaps via supervisor registry (browser adopted).
+        bc = getattr(sess, "browser_controller", None)
+        if bc is not None:
+            try:
+                if hasattr(bc, "close"):
+                    bc.close()
+            except Exception:
+                pass
+            try:
+                if hasattr(sess, "current_cdp_endpoint"):
+                    sess.current_cdp_endpoint = None
             except Exception:
                 pass
 

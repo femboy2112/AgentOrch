@@ -82,6 +82,10 @@ def _cmd_do(args) -> int:
     # Step 12: parse computer-use config (only has effect when generator chain leads with computer-use)
     cu_mode = getattr(args, "computer_use_mode", None)
     cu_priority = getattr(args, "computer_use_task_priority", None)
+    real_gui_policy = getattr(args, "real_gui_policy", None)
+    ask_mode = getattr(args, "ask_mode", None)
+    browser_engine = getattr(args, "browser_engine", None)
+    browser_display = getattr(args, "browser_display", None)
     cu_budgets = None
     if getattr(args, "computer_use_budgets", None):
         try:
@@ -111,6 +115,10 @@ def _cmd_do(args) -> int:
         computer_use_mode=cu_mode,
         computer_use_task_priority=cu_priority,
         computer_use_budgets=cu_budgets,
+        real_gui_policy=real_gui_policy,
+        ask_mode=ask_mode,
+        browser_engine=browser_engine,
+        browser_display=browser_display,
     )
     _print_result(result)
     return 0 if result.success else 1
@@ -246,9 +254,19 @@ def main(argv=None) -> int:
                          "from another repo so workers don't pollute AgentOrch. "
                          "Snapshot diff and changed-files list scope follow this path.")
     # Step 12: computer-use config (forwarded only when --generator contains computer-use)
-    do.add_argument("--computer-use-mode", choices=["ISOLATED", "OBSERVE"], default=None,
+    do.add_argument("--computer-use-mode", choices=["ISOLATED", "OBSERVE", "REAL"], default=None,
                     help="computer-use: ISOLATED (default: private Xvfb, full perceive+act) or "
-                         "OBSERVE (real :0 read-only perception; actions remain isolated-only per FR-03/04).")
+                         "OBSERVE (real :0 read-only perception; actions remain isolated-only per FR-03/04) or "
+                         "REAL (real :0 perception and owned-child real_act under SafetyKernel policy gates).")
+    do.add_argument("--real-gui-policy", choices=["full", "children"], default=None,
+                    help="computer-use REAL mode: foreign-target policy ('full' allows prompt-gated foreign act; "
+                         "'children' only allows owned-child direct actuation).")
+    do.add_argument("--ask-mode", choices=["on", "off"], default=None,
+                    help="computer-use REAL mode: GUI confirmation prompting for foreign-target actions.")
+    do.add_argument("--browser-engine", choices=["bing", "duckduckgo", "google"], default="bing",
+                    help="computer-use browser engine for autonomous navigate/search flows (default: bing).")
+    do.add_argument("--browser-display", type=str, default=None,
+                    help="computer-use browser display override. Default: :0 in REAL mode, isolated Xvfb otherwise.")
     do.add_argument("--computer-use-task-priority", choices=["normal", "high"], default=None,
                     help="computer-use: 'high' routes reasoner claude→codex; 'normal' (default) codex→claude (FR-14/21).")
     do.add_argument("--computer-use-budgets", type=str, default=None, metavar="JSON",

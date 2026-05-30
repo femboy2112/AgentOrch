@@ -172,15 +172,99 @@ class BrowserDOMCollector:
             return []
         try:
             with sync_playwright() as p:
-                # Connect with short timeout; best-effort only. We do not synthesize
-                # ElementHandles from the DOM tree here (that belongs in later fusion
-                # or reasoner layers); successful connect proves the CDP path works.
                 browser = p.chromium.connect_over_cdp(self.cdp_endpoint, timeout=1000)
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-            return []
+                contexts = list(browser.contexts)
+                if not contexts:
+                    return []
+                pages = list(contexts[0].pages)
+                if not pages:
+                    return []
+                page = pages[0]
+                selectors = [
+                    "#b_results h2 a",
+                    "#search h3 a",
+                    "#search a h3",
+                    "[data-testid*='result'] a",
+                    "a[href]",
+                    "button",
+                    "input",
+                    "[role='link']",
+                    "[role='button']",
+                    "[role='textbox']",
+                    "[role]",
+                ]
+                out: List[ElementHandle] = []
+                seen: set[Tuple[str, str, str]] = set()
+                idx = 1
+                max_items = 200
+                max_per_selector = 80
+                for selector in selectors:
+                    if len(out) >= max_items:
+                        break
+                    try:
+                        loc = page.locator(selector)
+                        count = loc.count()
+                    except Exception:
+                        continue
+                    for i in range(min(count, max_per_selector)):
+                        if len(out) >= max_items:
+                            break
+                        try:
+                            item = loc.nth(i)
+                            tag = ""
+                            try:
+                                v = item.evaluate("node => (node.tagName || '').toLowerCase()")
+                                if isinstance(v, str):
+                                    tag = v.strip()
+                            except Exception:
+                                tag = ""
+                            text = ""
+                            for getter in (
+                                lambda: item.inner_text(timeout=250),
+                                lambda: item.get_attribute("aria-label"),
+                                lambda: item.get_attribute("title"),
+                                lambda: item.get_attribute("placeholder"),
+                                lambda: item.get_attribute("value"),
+                                lambda: item.get_attribute("href"),
+                            ):
+                                try:
+                                    raw = getter()
+                                except Exception:
+                                    raw = None
+                                if isinstance(raw, str) and raw.strip():
+                                    text = raw.strip()
+                                    break
+                            bbox_d: Dict[str, int] = {}
+                            try:
+                                bb = item.bounding_box()
+                                if isinstance(bb, dict):
+                                    x = int(round(float(bb.get("x", 0))))
+                                    y = int(round(float(bb.get("y", 0))))
+                                    w = int(round(float(bb.get("width", 0))))
+                                    h = int(round(float(bb.get("height", 0))))
+                                    if w > 0 and h > 0:
+                                        bbox_d = {"x": x, "y": y, "w": w, "h": h}
+                            except Exception:
+                                bbox_d = {}
+                            key = ((tag or "")[:48], text[:120], str(bbox_d))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            out.append(
+                                ElementHandle(
+                                    source=ElementSource.DOM.value,
+                                    handle_id=f"dom-{idx}",
+                                    name=text or None,
+                                    role=tag or None,
+                                    bbox=bbox_d,
+                                    confidence=0.9,
+                                    provenance=[f"BrowserDOMCollector:{selector}"],
+                                )
+                            )
+                            idx += 1
+                        except Exception:
+                            continue
+                return out
         except Exception:
             # Any error (no browser, wrong port, playwright transport, timeout, etc.)
             # is degraded silently — perception continues with other signals.
