@@ -17,13 +17,6 @@ from dataclasses import asdict
 
 import pytest
 
-# Ensure the new public helpers are importable in tests
-from agy_orchestrator.computer_use.models import (
-    make_reasoning_input_envelope,
-    from_dict,
-    as_json,
-)  # noqa: F401  (used by new tests)
-
 from agy_orchestrator.computer_use import (
     ActionType,
     ElementSource,
@@ -37,6 +30,8 @@ from agy_orchestrator.computer_use import (
     is_redaction_enabled_for_run,
     redact_secrets,
 )
+
+# Ensure the new public helpers are importable in tests
 from agy_orchestrator.computer_use.models import (
     ActionIntent,
     ActionResult,
@@ -58,7 +53,7 @@ from agy_orchestrator.computer_use.models import (
     WorkerEvent,
     WorkerSession,
     make_reasoning_input_envelope,
-)
+)  # noqa: F401  (used by new tests)
 from agy_orchestrator.computer_use.utils import redact_secrets as redact_direct
 
 
@@ -390,7 +385,7 @@ def test_redaction_never_leaks_in_reasoning_input_or_envelope():
     assert "supersecret123" not in envelope
     assert "MY_AWS_SECRET_ACCESS_KEY=" in envelope or "***REDACTED***" in envelope  # structure preserved
     # explicit opt-out path still works but is not default
-    raw_envelope = make_reasoning_input_envelope(ri)  # already redacted at source
+    make_reasoning_input_envelope(ri)  # already redacted at source
     # If caller forgot to redact the block before putting into RI, the test above still enforces the contract
 
 
@@ -461,11 +456,19 @@ def test_new_realgui_enums_participate_in_fidelity_and_roundtrips():
     """Minimal additive coverage: new enums + dataclasses roundtrip via attached helpers."""
     # Local import (no change to module-level imports)
     from agy_orchestrator.computer_use.models import (
-        RunMode, Scope, RealGuiPolicy, AskMode, GrantScope,
-        PromptContext, PromptResult, Grant,
-        WorkerEventType, ViolationCode,
-        ActionSpec, RunRequest, WorkerSession,
-        to_dict, from_dict, as_json,
+        ActionSpec,
+        AskMode,
+        Grant,
+        GrantScope,
+        PromptContext,
+        PromptResult,
+        RealGuiPolicy,
+        RunMode,
+        RunRequest,
+        Scope,
+        ViolationCode,
+        WorkerEventType,
+        WorkerSession,
     )
 
     # RunMode / Scope extensions

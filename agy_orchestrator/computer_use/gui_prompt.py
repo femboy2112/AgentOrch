@@ -132,8 +132,9 @@ class FakePrompter:
         try:
             sink = getattr(self, "_audit_sink", None)
             if sink and hasattr(sink, "emit"):
-                from .models import WorkerEvent, WorkerEventType
                 from datetime import datetime, timezone
+
+                from .models import WorkerEvent, WorkerEventType
                 sink.emit(WorkerEvent(ts=datetime.now(timezone.utc).isoformat(), run_id=str(getattr(ctx, "run_id", "r")), event_type=WorkerEventType.PERMISSION_PROMPT_SHOWN.value, payload={"run_id": str(getattr(ctx, "run_id", "r")), "pid": getattr(ctx, "pid", None), "action_type": getattr(ctx, "action_type", None), "policy": getattr(ctx, "policy", None), "ask_mode": getattr(ctx, "ask_mode", None)}))
         except Exception:
             pass
@@ -197,8 +198,9 @@ class GuiPrompter:
         try:
             sink = getattr(self, "_audit_sink", None)
             if sink and hasattr(sink, "emit"):
-                from .models import WorkerEvent, WorkerEventType
                 from datetime import datetime, timezone
+
+                from .models import WorkerEvent, WorkerEventType
                 sink.emit(WorkerEvent(ts=datetime.now(timezone.utc).isoformat(), run_id=str(getattr(ctx, "run_id", "r")), event_type=WorkerEventType.PERMISSION_PROMPT_SHOWN.value, payload={"run_id": str(getattr(ctx, "run_id", "r")), "pid": getattr(ctx, "pid", None), "action_type": getattr(ctx, "action_type", None), "policy": getattr(ctx, "policy", None), "ask_mode": getattr(ctx, "ask_mode", None)}))
         except Exception:
             pass

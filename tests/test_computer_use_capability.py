@@ -23,9 +23,7 @@ from __future__ import annotations
 import builtins
 import shutil
 import sys
-from typing import Any, Dict
-
-import pytest
+from typing import Any
 
 from agy_orchestrator.computer_use import (
     CapabilityBroker,

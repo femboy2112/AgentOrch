@@ -34,10 +34,8 @@ Matches style of safety.py / process_supervisor.py / utils.py.
 
 from __future__ import annotations
 
-import builtins
 import shutil
-import sys
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .models import CapabilityReport, Readiness
 

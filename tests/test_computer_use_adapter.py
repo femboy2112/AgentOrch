@@ -20,7 +20,6 @@ All Xvfb usage is via the isolated allocator (high :99+). Zero real-:0 GUI actio
 from __future__ import annotations
 
 import json
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,26 +29,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agy_orchestrator.computer_use import (
-    Ack,
     AuditEventSink,
     ComputerUseWorkerAdapter,
     RunRequest,
     StopResult,
-    WorkerEventType,
 )
 from agy_orchestrator.computer_use.adapter import RunHandle
 from agy_orchestrator.computer_use.models import (
     ActionIntent,
-    ActionStatus,
-    ConfirmationOutcome,
-    ConfirmationOutcomeType,
     GateDecision,
     GateType,
     PerceptionSnapshot,
-    RunMode,
     SnapshotSummary,
     ValidationResult,
-    WorkerEvent,
 )
 from agy_orchestrator.computer_use.session import SessionController
 
@@ -152,7 +144,7 @@ def test_full_event_stream_for_minimal_run(tmp_path: Path):
     )
     h = adapter.start({"run_id": "r-ev", "objective": "press button"})
 
-    lines = [json.loads(l) for l in events.read_text().strip().splitlines()] if events.exists() else []
+    lines = [json.loads(line) for line in events.read_text().strip().splitlines()] if events.exists() else []
     types = [e["event_type"] for e in lines]
     assert "capability.probe" in types
     # perception.snapshot may be skipped on very fast mock paths; action.* proves the loop ran
@@ -233,7 +225,7 @@ def test_high_risk_confirmation_gate_suspend_and_unblock(tmp_path: Path):
         # Force-kill is not required for the test to prove the safety property.
 
         # Check events for gate + confirmation lifecycle
-        lines = [json.loads(l) for l in events.read_text().strip().splitlines()] if events.exists() else []
+        lines = [json.loads(line) for line in events.read_text().strip().splitlines()] if events.exists() else []
         et = [e["event_type"] for e in lines]
         assert "action.dry_run" in et
         assert "confirmation.wait_started" in et
@@ -260,7 +252,7 @@ def test_budget_stops_loop_quickly(tmp_path: Path):
         reasoner=reasoner,
         perception=perception,
     )
-    h = adapter.start({
+    adapter.start({
         "run_id": "r-bud",
         "objective": "lots",
         "budgets": {"max_actions": 1, "max_steps": 5},
@@ -283,8 +275,7 @@ def test_teardown_cleans_xvfb_and_artifacts():
     # assert that close_session on a session that recorded an xvfb_root_id calls terminate_tree)
     ctrl = SessionController()
     req = RunRequest(run_id="r-td", objective="td")
-    sess = ctrl.create_session(req)
-    root = getattr(sess, "xvfb_root_id", None)
+    ctrl.create_session(req)
     ctrl.close_session("r-td")
     # If a root was allocated the supervisor for that session was asked to terminate it
     # (the real sup inside create_session did the spawn; our assertion is that teardown path executed cleanly)
@@ -296,7 +287,7 @@ def test_adapter_stop_sets_stop_event_and_tears_down(tmp_path: Path):
     # run does not write runs/r-stop/ into the real repo runs/ dir.
     sink = AuditEventSink("r-stop", events_path=tmp_path / "e.jsonl")
     adapter = ComputerUseWorkerAdapter(audit_sink_factory=lambda rid: sink)
-    h = adapter.start({"run_id": "r-stop", "objective": "stop test", "budgets": {"max_steps": 1}})
+    adapter.start({"run_id": "r-stop", "objective": "stop test", "budgets": {"max_steps": 1}})
     res = adapter.stop("r-stop")
     assert isinstance(res, StopResult) or hasattr(res, "terminated")
     # idempotent second stop is fine
@@ -334,7 +325,7 @@ def test_adapter_real_wires_new_gate_and_constraints(tmp_path: Path):
             # no safety/ownership/gui/grant -> forces the Step-9 REAL construction branch (Fake under pytest)
         )
         try:
-            h = adapter.start(
+            adapter.start(
                 {
                     "run_id": "r-real9",
                     "objective": "tiny real wire test",

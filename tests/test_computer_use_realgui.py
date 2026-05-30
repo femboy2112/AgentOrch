@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from unittest.mock import patch
 
 import pytest
@@ -16,7 +16,10 @@ import pytest
 from agy_orchestrator.computer_use.action_executor import ActionExecutor
 from agy_orchestrator.computer_use.grants import FakeClock, GrantCache
 from agy_orchestrator.computer_use.gui_prompt import FakePrompter, GuiPrompter, PromptContext
-from agy_orchestrator.computer_use.models import AskMode, PromptResult, ReasoningInput, ViolationCode
+from agy_orchestrator.computer_use.models import (
+    ReasoningInput,
+    ViolationCode,
+)
 from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
 from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
 from agy_orchestrator.computer_use.safety import SafetyKernel

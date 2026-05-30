@@ -39,7 +39,6 @@ from .models import (
     CoordinateTarget,
     GateDecision,
     GateType,
-    GrantScope,
     PromptContext,
     PromptResult,
     RealGuiPolicy,
@@ -51,11 +50,7 @@ from .models import (
     WorkerEvent,
     WorkerEventType,
 )
-from .grants import GrantCache
-from .gui_prompt import FakePrompter, Prompter
-from .ownership import FakeOwnershipResolver, OwnershipResolver
 from .process_supervisor import ProcessSupervisor
-from .audit import AuditEventSink  # optional, for permission event streaming at decision points (FR-38)
 
 
 def get_default_app_launch_policy() -> AppLaunchPolicy:

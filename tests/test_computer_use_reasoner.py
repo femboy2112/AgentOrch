@@ -18,7 +18,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any, Dict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -28,9 +28,8 @@ from agy_orchestrator.computer_use import (
     ReasonerError,
     ReasoningInput,
     SnapshotSummary,
-    WorkerEventType,
 )
-from agy_orchestrator.computer_use.models import ActionIntent, TaskPriority
+from agy_orchestrator.computer_use.models import ActionIntent
 
 
 def _mk_ri(task_priority: str = "normal", objective: str = "click the button") -> ReasoningInput:

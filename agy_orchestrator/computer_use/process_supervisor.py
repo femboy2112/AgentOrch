@@ -46,7 +46,9 @@ from typing import Any, Dict, List, Optional
 import psutil
 
 from .models import IsolatedDisplaySpec, SpawnSpec
-from .xauth import generate_private_xauthority, get_isolated_env  # hardening #1 XAUTHORITY ISOLATION
+from .xauth import (  # hardening #1 XAUTHORITY ISOLATION
+    get_isolated_env,
+)
 
 
 @dataclass

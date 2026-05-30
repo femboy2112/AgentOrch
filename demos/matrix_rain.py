@@ -1,7 +1,7 @@
 import curses
 import random
-import time
 import sys
+import time
 
 # Constants
 MAX_COLUMNS = 100
@@ -38,7 +38,7 @@ def main(stdscr):
     # Hide cursor
     stdscr.nodelay(True)
     curses.curs_set(0)
-    
+
     # Set up colors
     try:
         curses.start_color()
@@ -46,7 +46,7 @@ def main(stdscr):
         curses.init_pair(2, curses.COLOR_GREEN, 0)  # Bright green
         curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Dim green
         curses.init_pair(4, curses.COLOR_BLACK, 0)  # Black
-    except:
+    except Exception:
         # Fallback if color support is missing
         pass
 
@@ -179,7 +179,7 @@ def main(stdscr):
                         # Draw character
                         try:
                             stdscr.addstr(y, x, char, curses.color_pair(color_pair))
-                        except:
+                        except Exception:
                             pass
 
                 # Refresh screen

@@ -230,11 +230,11 @@ def test_explicit_events_path_overrides_runs_root(tmp_path: Path) -> None:
 @pytest.mark.realgui
 def test_realgui_real_run_one_foreign_prompt_produces_new_event_kinds(tmp_path: Path) -> None:
     """5-line: REAL foreign prompt emits the new WorkerEventTypes (FR-38)."""
-    from agy_orchestrator.computer_use.safety import SafetyKernel
     from agy_orchestrator.computer_use.grants import GrantCache
-    from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
     from agy_orchestrator.computer_use.gui_prompt import FakePrompter
+    from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
     from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
+    from agy_orchestrator.computer_use.safety import SafetyKernel
     sink = AuditEventSink("rg-audit", runs_root=tmp_path)
     k = SafetyKernel(ownership_resolver=FakeOwnershipResolver(synthetic_baseline_pids={42}, synthetic_owned=set()), gui_prompter=FakePrompter().queue(grant_scope="PROCESS_RUN", granted=True, operator_text="n"), grant_cache=GrantCache(run_id="rg"), supervisor=ProcessSupervisor(), audit_sink=sink)
     k._real_act_gate({"action": {"type": "click", "target": {"kind": "element", "app_pid": 42}}}, {"run_id": "rg", "mode": "REAL", "real_gui_policy": "full", "ask_mode": "on"})

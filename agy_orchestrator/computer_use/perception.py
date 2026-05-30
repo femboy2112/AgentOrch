@@ -29,7 +29,6 @@ from .models import (
 )
 from .utils import is_redaction_enabled_for_run, redact_secrets
 
-
 try:
     import gi
     gi.require_version("Atspi", "2.0")
@@ -164,10 +163,28 @@ class BrowserDOMCollector:
     endpoint is known; returns [] on any failure or when unavailable. Never
     required for core perception (geometry + OCR + optional ATSPI suffice).
     """
-    def __init__(self, display: Optional[str] = None, env: Optional[Dict[str, str]] = None, cdp_endpoint: Optional[str] = None) -> None:
+    def __init__(self, display: Optional[str] = None, env: Optional[Dict[str, str]] = None, cdp_endpoint: Optional[str] = None, live_page: Optional[Any] = None) -> None:
         self.cdp_endpoint = cdp_endpoint
+        # Phase 1.x: when the owned BrowserController is driving the run, it hands us its
+        # already-open Playwright page. We must read DOM from THAT page — opening a second
+        # sync_playwright()/connect_over_cdp in the same thread raises ("Sync API inside the
+        # asyncio loop"), which is why the CDP-reconnect path silently returned []. The live
+        # page is the authoritative source; CDP reconnect is only the no-controller fallback.
+        self.live_page = live_page
 
     def collect(self) -> List[ElementHandle]:
+        # Preferred path: scan the controller's already-open live page directly (no reconnect).
+        if self.live_page is not None:
+            collect_dom = getattr(self.live_page, "collect_dom_elements", None)
+            if callable(collect_dom):
+                try:
+                    return collect_dom(self._scan_page)
+                except Exception:
+                    return []
+            try:
+                return self._scan_page(self.live_page)
+            except Exception:
+                return []
         if not self.cdp_endpoint or not _HAS_PLAYWRIGHT:
             return []
         try:
@@ -179,96 +196,79 @@ class BrowserDOMCollector:
                 pages = list(contexts[0].pages)
                 if not pages:
                     return []
-                page = pages[0]
-                selectors = [
-                    "#b_results h2 a",
-                    "#search h3 a",
-                    "#search a h3",
-                    "[data-testid*='result'] a",
-                    "a[href]",
-                    "button",
-                    "input",
-                    "[role='link']",
-                    "[role='button']",
-                    "[role='textbox']",
-                    "[role]",
-                ]
-                out: List[ElementHandle] = []
-                seen: set[Tuple[str, str, str]] = set()
-                idx = 1
-                max_items = 200
-                max_per_selector = 80
-                for selector in selectors:
-                    if len(out) >= max_items:
-                        break
-                    try:
-                        loc = page.locator(selector)
-                        count = loc.count()
-                    except Exception:
-                        continue
-                    for i in range(min(count, max_per_selector)):
-                        if len(out) >= max_items:
-                            break
-                        try:
-                            item = loc.nth(i)
-                            tag = ""
-                            try:
-                                v = item.evaluate("node => (node.tagName || '').toLowerCase()")
-                                if isinstance(v, str):
-                                    tag = v.strip()
-                            except Exception:
-                                tag = ""
-                            text = ""
-                            for getter in (
-                                lambda: item.inner_text(timeout=250),
-                                lambda: item.get_attribute("aria-label"),
-                                lambda: item.get_attribute("title"),
-                                lambda: item.get_attribute("placeholder"),
-                                lambda: item.get_attribute("value"),
-                                lambda: item.get_attribute("href"),
-                            ):
-                                try:
-                                    raw = getter()
-                                except Exception:
-                                    raw = None
-                                if isinstance(raw, str) and raw.strip():
-                                    text = raw.strip()
-                                    break
-                            bbox_d: Dict[str, int] = {}
-                            try:
-                                bb = item.bounding_box()
-                                if isinstance(bb, dict):
-                                    x = int(round(float(bb.get("x", 0))))
-                                    y = int(round(float(bb.get("y", 0))))
-                                    w = int(round(float(bb.get("width", 0))))
-                                    h = int(round(float(bb.get("height", 0))))
-                                    if w > 0 and h > 0:
-                                        bbox_d = {"x": x, "y": y, "w": w, "h": h}
-                            except Exception:
-                                bbox_d = {}
-                            key = ((tag or "")[:48], text[:120], str(bbox_d))
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            out.append(
-                                ElementHandle(
-                                    source=ElementSource.DOM.value,
-                                    handle_id=f"dom-{idx}",
-                                    name=text or None,
-                                    role=tag or None,
-                                    bbox=bbox_d,
-                                    confidence=0.9,
-                                    provenance=[f"BrowserDOMCollector:{selector}"],
-                                )
-                            )
-                            idx += 1
-                        except Exception:
-                            continue
-                return out
+                page = pages[-1]
+                return self._scan_page(page)
         except Exception:
             # Any error (no browser, wrong port, playwright transport, timeout, etc.)
             # is degraded silently — perception continues with other signals.
             return []
+
+    def _scan_page(self, page: Any) -> List[ElementHandle]:
+        """Extract DOM ElementHandles from a live Playwright page (shared by the live-page
+        and CDP-reconnect paths). Bounded + dedup'd; never raises past the caller."""
+        # ONE evaluate() round-trip. A per-element Playwright scan (locator.nth +
+        # inner_text/evaluate/bounding_box per node) is hundreds of CDP round-trips on a
+        # heavy SERP — minutes of wall time, which hung the perceive->reason->act loop.
+        # A single in-page JS pass is fast, deterministic, and bounded to 120 elements.
+        js = """
+        () => {
+          const sels = ["#b_results h2 a", "#b_results a", "#search h3 a",
+            "#search a h3", "[data-testid*='result'] a", "a[href]", "button",
+            "input", "textarea", "[role='link']", "[role='button']", "[role='textbox']"];
+          const out = [];
+          const seen = new Set();
+          for (const sel of sels) {
+            let nodes;
+            try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
+            for (const n of nodes) {
+              if (out.length >= 120) break;
+              const r = n.getBoundingClientRect();
+              const tag = (n.tagName || "").toLowerCase();
+              let text = (n.innerText || n.getAttribute("aria-label") ||
+                n.getAttribute("title") || n.getAttribute("placeholder") ||
+                n.value || n.getAttribute("href") || "").trim();
+              const key = tag + "|" + text.slice(0,120) + "|" +
+                Math.round(r.x) + "," + Math.round(r.y);
+              if (seen.has(key)) continue;
+              seen.add(key);
+              out.push({tag: tag, text: text.slice(0,200), sel: sel,
+                x: Math.round(r.x), y: Math.round(r.y),
+                w: Math.round(r.width), h: Math.round(r.height)});
+            }
+          }
+          return out;
+        }
+        """
+        try:
+            rows = page.evaluate(js)
+        except Exception:
+            return []
+        out: List[ElementHandle] = []
+        for i, row in enumerate(rows or [], start=1):
+            if i > 120:
+                break
+            try:
+                w = int(row.get("w", 0) or 0)
+                h = int(row.get("h", 0) or 0)
+                bbox_d: Dict[str, int] = {}
+                if w > 0 and h > 0:
+                    bbox_d = {"x": int(row.get("x", 0) or 0), "y": int(row.get("y", 0) or 0), "w": w, "h": h}
+                text = (row.get("text") or "").strip()
+                tag = (row.get("tag") or "").strip()
+                out.append(
+                    ElementHandle(
+                        source=ElementSource.DOM.value,
+                        handle_id=f"dom-{i}",
+                        name=text or None,
+                        role=tag or None,
+                        bbox=bbox_d,
+                        confidence=0.9,
+                        provenance=[f"BrowserDOMCollector:{row.get('sel', '')}"],
+                    )
+                )
+            except Exception:
+                continue
+        return out
 
 
 class PerceptionPipeline:
@@ -324,7 +324,9 @@ class PerceptionPipeline:
         at = ATSPICollector(eff_display, eff_env).collect()
         gw, ge = GeometryCollector(eff_display, eff_env).collect()
         ob = OCRCollector(eff_display, eff_env).collect()
-        de = BrowserDOMCollector(eff_display, eff_env, cdp_endpoint).collect()
+        # Phase 1.x: prefer the owned BrowserController's live page (passed by the adapter)
+        # so DOM perception works in-process; cdp_endpoint is the no-controller fallback.
+        de = BrowserDOMCollector(eff_display, eff_env, cdp_endpoint, live_page=kw.get("dom_page")).collect()
 
         elems: List[ElementHandle] = []
         seen: set[str] = set()
@@ -390,7 +392,12 @@ class PerceptionPipeline:
     def make_summary(self, snap: PerceptionSnapshot) -> SnapshotSummary:
         se: List[Dict[str, Any]] = []
         for el in snap.elements:
-            se.append({"handle_id": el.handle_id, "source": el.source, "role": el.role, "name": el.name, "bbox": dict(el.bbox), "confidence": el.confidence})
+            # Serialize element source in the lowercase wire convention the reasoner
+            # contract uses (matching DOM-actuation `kind == "dom"`). ElementSource enum
+            # values are uppercase ("DOM"/"GEOMETRY"/...); the reasoner-facing snapshot
+            # dict expects "dom"/"geometry"/... so the loop can select DOM elements.
+            src = el.source.lower() if isinstance(el.source, str) else el.source
+            se.append({"handle_id": el.handle_id, "source": src, "role": el.role, "name": el.name, "bbox": dict(el.bbox), "confidence": el.confidence})
         return SnapshotSummary(snapshot_id=snap.snapshot_id, captured_at=snap.captured_at, scope=snap.scope, windows=[dict(w) for w in snap.windows], elements=se, raw_text_blocks=[dict(b) for b in snap.raw_text_blocks])
 
 

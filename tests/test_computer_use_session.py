@@ -125,7 +125,7 @@ def test_worker_session_echoes_browser_fields(monkeypatch: pytest.MonkeyPatch):
 # B4 guard: importing this module + running under pytest never constructs real BrowserController
 def test_no_real_browser_in_hermetic_session_tests(monkeypatch: pytest.MonkeyPatch):
     _force_fake_env(monkeypatch)
-    from agy_orchestrator.computer_use.browser import FakeBrowserController, BrowserController
+    from agy_orchestrator.computer_use.browser import FakeBrowserController
 
     # BrowserController class is importable (lazy), but constructing under test forces Fake path in SessionController
     # (explicit construction of real is forbidden in hermetic tests per spec)

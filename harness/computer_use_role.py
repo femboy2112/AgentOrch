@@ -10,7 +10,6 @@ Does not alter any LLM worker code paths. All actuation stays on isolated Xvfb.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,8 +23,8 @@ def _get_cu_imports():
     global _ComputerUseWorkerAdapter, _RunRequest, _AuditEventSink
     if _ComputerUseWorkerAdapter is None:
         from agy_orchestrator.computer_use.adapter import ComputerUseWorkerAdapter
-        from agy_orchestrator.computer_use.models import RunRequest
         from agy_orchestrator.computer_use.audit import AuditEventSink
+        from agy_orchestrator.computer_use.models import RunRequest
         _ComputerUseWorkerAdapter = ComputerUseWorkerAdapter
         _RunRequest = RunRequest
         _AuditEventSink = AuditEventSink

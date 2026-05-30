@@ -35,7 +35,7 @@ import psutil
 import pytest
 
 from agy_orchestrator.computer_use.models import IsolatedDisplaySpec, SpawnSpec
-from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
+from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor, SpawnedProc
 
 
 @pytest.fixture
@@ -408,12 +408,13 @@ def test_executor_env_has_no_path_to_real_x_cookie() -> None:
     import shutil
     from pathlib import Path
 
+    from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
+
     # Import via the package so we also validate __init__.py re-exports
     from agy_orchestrator.computer_use.xauth import (
         generate_private_xauthority,
         get_isolated_env,
     )
-    from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
 
     # High display number (never actually opened in this test)
     display = f":{90 + (os.getpid() % 40)}"
@@ -549,9 +550,9 @@ def test_executor_env_has_no_path_to_real_x_cookie() -> None:
 
 def test_session_controller_baseline_captured_only_for_real() -> None:
     """Minimal Step-6 test: baseline only on REAL; ISOLATED/OBSERVE untouched; immutable capture."""
-    from agy_orchestrator.computer_use.session import SessionController
+    from agy_orchestrator.computer_use.models import RunMode, RunRequest
     from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
-    from agy_orchestrator.computer_use.models import RunRequest, RunMode
+    from agy_orchestrator.computer_use.session import SessionController
 
     # Synthetic baseline proving the "operator other terminal" case (FR-40 shape)
     fake = FakeOwnershipResolver(synthetic_baseline_pids={4242, 4243}, synthetic_owned=set())
@@ -567,8 +568,9 @@ def test_session_controller_baseline_captured_only_for_real() -> None:
 
     # REAL + force action_exec=True via patch so baseline capture branch is *always* exercised
     # (regardless of whether xdotool present in this env). ask_mode defaults to "on" only for REAL.
-    from agy_orchestrator.computer_use.capability import CapabilityBroker, CapabilityReport
     from unittest import mock
+
+    from agy_orchestrator.computer_use.capability import CapabilityBroker, CapabilityReport
 
     fake_cap = CapabilityReport(
         atspi=False, ocr=False, geometry=False, dom=False,
@@ -604,4 +606,4 @@ def test_session_controller_baseline_captured_only_for_real() -> None:
     ctrl.close_session("s6-iso")
     ctrl.close_session("s6-real")
 
-    # Step 6 complete: baseline wiring + injectable harness components + hermetic test (no real :0) 
+    # Step 6 complete: baseline wiring + injectable harness components + hermetic test (no real :0)

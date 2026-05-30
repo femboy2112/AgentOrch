@@ -19,10 +19,9 @@ Phase 1.x (design addendum): DOMTargetDict(TypedDict) + extended IntentTarget un
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, TypedDict, Union
-
 
 # =============================================================================
 # Enums (string literal fidelity — every value matches the spec exactly)

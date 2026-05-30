@@ -14,7 +14,6 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Optional, Pattern
 
-
 # Pre-compiled patterns (case-insensitive where appropriate)
 # Order matters: more specific first.
 _REDACTION_PATTERNS: list[tuple[Pattern[str], str]] = [

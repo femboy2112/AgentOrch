@@ -23,11 +23,14 @@ from agy_orchestrator.computer_use import (
     PerceptionPipeline,
     ProcessSupervisor,
     Scope,
-    WorkerEventType,
     get_isolated_env,
     redact_secrets,
 )
-from agy_orchestrator.computer_use.models import IsolatedDisplaySpec, PerceptionSnapshot, SnapshotSummary
+from agy_orchestrator.computer_use.models import (
+    IsolatedDisplaySpec,
+    PerceptionSnapshot,
+    SnapshotSummary,
+)
 
 
 def _has_tools() -> bool:

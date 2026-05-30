@@ -16,7 +16,6 @@ import pytest
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import (
     DEFAULT_MAX_BYTES,
-    DEFAULT_STALL_SECONDS,
     DEFAULT_STALL_SECONDS_BY_WORKER,
 )
 from harness import roles

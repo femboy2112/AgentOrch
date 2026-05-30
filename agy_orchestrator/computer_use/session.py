@@ -19,39 +19,32 @@ Emits session.* and confirmation.* lifecycle events when an AuditEventSink is su
 
 from __future__ import annotations
 
-import os
 import shutil
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+from .capability import CapabilityBroker
 from .models import (
-    Ack,
     AskMode,
     CapabilityReport,
     ConfirmationOutcome,
     ConfirmationOutcomeType,
-    GateType,
     IsolatedDisplaySpec,
     OrchestratorMessage,
-    RealGuiPolicy,
     RunMode,
     RunRequest,
-    Scope,
     StopResult,
     TaskPriority,
     WorkerEvent,
     WorkerEventType,
     WorkerSession,
 )
-from .capability import CapabilityBroker
 from .ownership import OwnershipResolver
 from .process_supervisor import ProcessSupervisor, SpawnedProc
-
 
 DEFAULT_BUDGETS: Dict[str, int] = {
     "max_steps": 200,
@@ -252,7 +245,7 @@ class SessionController:
                 )
                 xvfb_sp = supervisor.spawn_isolated_display(spec)
                 xvfb_root_id = xvfb_sp.root_id
-            except Exception as e:
+            except Exception:
                 # Fail-closed: if we cannot own an Xvfb we cannot safely act on an isolated display.
                 # The caller (adapter) will see action_exec still True in caps but will
                 # hit spawn failures later; we still record the attempt.
@@ -284,7 +277,9 @@ class SessionController:
                 _BC = _FakeBC
             else:
                 try:
-                    from playwright.sync_api import sync_playwright as _sp  # type: ignore  # probe only; no launch here
+                    from playwright.sync_api import (
+                        sync_playwright as _sp,  # type: ignore  # probe only; no launch here
+                    )
                     del _sp
                     from .browser import BrowserController as _BC
                 except Exception:

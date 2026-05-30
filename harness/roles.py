@@ -28,7 +28,9 @@ from agy_orchestrator.core.agents.grok_agent import GrokAgent
 from agy_orchestrator.core.calibration import CalibrationTable
 
 # Step 12: computer-use as selectable standard worker token (resolves to shim)
-from harness.computer_use_role import ComputerUseShim  # thin adapter delegate; no LLM impact (Step 10: forwards real_gui/ask via its config)
+from harness.computer_use_role import (
+    ComputerUseShim,  # thin adapter delegate; no LLM impact (Step 10: forwards real_gui/ask via its config)
+)
 
 AGENT_CLASSES: Dict[str, Type[AgentInstance]] = {
     "codex": CodexAgent,

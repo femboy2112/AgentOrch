@@ -19,7 +19,6 @@ from agy_orchestrator.computer_use.adapter import ComputerUseWorkerAdapter
 from agy_orchestrator.computer_use.audit import AuditEventSink
 from agy_orchestrator.computer_use.models import ActionIntent, RunRequest
 
-
 QUERY = "programmatic browser actuation test"
 RANK = 3
 RESULT_SELECTOR = "li.b_algo h2 a"

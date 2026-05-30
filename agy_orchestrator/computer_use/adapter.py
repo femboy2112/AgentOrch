@@ -28,10 +28,15 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
 
+from .action_executor import ActionExecutor
+from .audit import AuditEventSink
+from .capability import is_available as cap_is_available
+from .grants import GrantCache
+from .gui_prompt import FakePrompter, GuiPrompter
 from .models import (
     ACTION_INTENT_JSON_V1,
     Ack,
@@ -46,22 +51,12 @@ from .models import (
     WorkerEventType,
     from_dict,
 )
-from .audit import AuditEventSink
-from .capability import is_available as cap_is_available
-from .session import SessionController, DEFAULT_BUDGETS
-
-# Component imports (all previous steps)
+from .ownership import OwnershipResolver
 from .perception import PerceptionPipeline
+from .process_supervisor import ProcessSupervisor
 from .reasoner import ReasonerBridge, ReasonerError
 from .safety import SafetyKernel
-from .action_executor import ActionExecutor
-from .process_supervisor import ProcessSupervisor
-
-# Step 9 real-GUI wiring (DI components for REAL mode only; defaults + test-aware Fake preserve
-# all prior ISOLATED/OBSERVE behavior byte-for-byte; REAL only when explicitly requested).
-from .ownership import OwnershipResolver
-from .grants import GrantCache
-from .gui_prompt import FakePrompter, GuiPrompter
+from .session import SessionController
 
 
 def _running_under_test() -> bool:
@@ -332,7 +327,7 @@ class ComputerUseWorkerAdapter:
                 stop_event=self._active_runs[run_id]["stop_event"],
             )
             final_status = "completed"
-        except Exception as exc:
+        except Exception:
             # Never leak exceptions that would destabilize the caller; always close owned trees.
             # The close_session path (finally) is the single source of the session.terminated event.
             try:
@@ -456,12 +451,20 @@ class ComputerUseWorkerAdapter:
                 or getattr(self._browser_controller, "cdp_endpoint", None)
             )
 
+            # Phase 1.x: hand perception the owned browser controller so DOM scanning
+            # can be marshaled onto the Playwright owner thread when needed.
+            dom_page = None
+            _bc = getattr(sess, "browser_controller", None) or self._browser_controller
+            if _bc is not None:
+                dom_page = _bc
+
             try:
                 raw_snaps = perception.snapshot_set(
                     scopes,
                     run_id=run_id,
                     displays=displays_map,
                     cdp_endpoint=cdp,
+                    dom_page=dom_page,
                 )
             except Exception as e:
                 # Degrade gracefully; emit and continue with whatever we have (or empty)
@@ -476,7 +479,10 @@ class ComputerUseWorkerAdapter:
             summaries: Dict[str, Any] = {}
             for sc, snap in raw_snaps.items():
                 try:
-                    summaries[sc] = perception.make_summary(snap)
+                    # Dict-shaped so the in-process reasoner sees the SAME contract a
+                    # subprocess reasoner gets after JSON serialization (snapshots[scope]
+                    # is a JSON object with an "elements" list, never a dataclass).
+                    summaries[sc] = asdict(perception.make_summary(snap))
                 except Exception:
                     summaries[sc] = {"snapshot_id": getattr(snap, "snapshot_id", "s"), "scope": sc}
 

@@ -14,17 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
-import pytest
-
 from agy_orchestrator.computer_use import (
     ComputerUseWorkerAdapter,
-    RunRequest,
-    is_available,
 )
 from agy_orchestrator.computer_use.audit import AuditEventSink
 from agy_orchestrator.computer_use.models import (
@@ -33,11 +28,9 @@ from agy_orchestrator.computer_use.models import (
     ConfirmationOutcome,
     ConfirmationOutcomeType,
     ValidationResult,
-    WorkerEventType,
 )
-from harness import roles
 from harness import cli as harness_cli
-from harness import computer_use_role
+from harness import computer_use_role, roles
 
 
 def _mk_intent() -> ActionIntent:

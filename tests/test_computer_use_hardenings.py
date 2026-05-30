@@ -11,7 +11,7 @@ Four mission-critical invariants (hard, tested, never relaxed):
    path a child could open via HOME fallback. "Cannot authenticate to real :0"
    holds even when worker runs as same UID as the :0 session.
 2. KILLABLE TREE (hardening #2): every owned subprocess (Xvfb, apps, reasoner
-   CLI) is launched with its own process group (start_new_session=True). 
+   CLI) is launched with its own process group (start_new_session=True).
    terminate_tree uses killpg + ancestry + waitpid so grandchildren and
    daemonized children are reaped, not just the direct child.
 3. HARD RESOURCE BACKSTOP (hardening #3): OS rlimits (RLIMIT_NPROC, RLIMIT_AS)
@@ -52,8 +52,6 @@ from agy_orchestrator.computer_use import (
     redact_secrets,
 )
 from agy_orchestrator.computer_use.models import (
-    ActionIntent,
-    CoordinateTarget,
     RunMode,
     Scope,
 )

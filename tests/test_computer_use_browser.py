@@ -6,7 +6,6 @@ No test imports playwright, launches a real browser, or touches :0.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -17,17 +16,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agy_orchestrator.computer_use import AuditEventSink, ComputerUseWorkerAdapter
 from agy_orchestrator.computer_use.action_executor import ActionExecutor
 from agy_orchestrator.computer_use.browser import BrowserController, FakeBrowserController
 from agy_orchestrator.computer_use.gui_prompt import FakePrompter
-from agy_orchestrator.computer_use.models import ActionIntent, ActionStatus, RunRequest, ViolationCode
+from agy_orchestrator.computer_use.models import (
+    ActionStatus,
+    RunRequest,
+    ViolationCode,
+)
 from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
 from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
-from agy_orchestrator.computer_use.session import _pick_isolated_display
 from agy_orchestrator.computer_use.safety import SafetyKernel
 from harness import cli as harness_cli
-
 
 pytestmark = [pytest.mark.release_blocking, pytest.mark.browser]
 

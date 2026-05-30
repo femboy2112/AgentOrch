@@ -15,17 +15,21 @@ from typing import Any, Dict
 
 import pytest
 
-from agy_orchestrator.computer_use import DEFAULT_APP_LAUNCH_POLICY, SafetyKernel, get_default_app_launch_policy
-from agy_orchestrator.computer_use.models import AppLaunchPolicy, ViolationCode
-from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor, SpawnSpec
+from agy_orchestrator.computer_use import (
+    DEFAULT_APP_LAUNCH_POLICY,
+    SafetyKernel,
+    get_default_app_launch_policy,
+)
 
 # Step 5 realgui release-blocking additions (imports only; no existing test bodies touched)
-from agy_orchestrator.computer_use.grants import FakeClock, GrantCache
+from agy_orchestrator.computer_use.grants import GrantCache
 from agy_orchestrator.computer_use.gui_prompt import FakePrompter
-from agy_orchestrator.computer_use.models import AskMode, RealGuiPolicy
+from agy_orchestrator.computer_use.models import (
+    AppLaunchPolicy,
+    ViolationCode,
+)
 from agy_orchestrator.computer_use.ownership import FakeOwnershipResolver
-from agy_orchestrator.computer_use.safety import FakeOwnershipResolver as _FOR, FakePrompter as _FP  # via safety re-exports (Step 5 "export the new helpers")
-
+from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor, SpawnSpec
 
 # Step 13: release-blocking FR markers applied to the exact FR-03/04/09/12/23/24 tests
 
@@ -51,7 +55,8 @@ def kernel(sup: ProcessSupervisor) -> SafetyKernel:
 def mk_intent(**kw: Any) -> Dict[str, Any]:
     action: Dict[str, Any] = {"type": kw.pop("type", "wait"), "display_scope": kw.pop("display_scope", "isolated")}
     for f in ("target", "text", "hotkey", "scroll_delta", "drag_to", "wait_ms", "url", "app", "app_args"):
-        if f in kw: action[f] = kw.pop(f)
+        if f in kw:
+            action[f] = kw.pop(f)
     return {"intent_id": kw.pop("intent_id", "i1"), "snapshot_id": "s1", "action": action,
             "rationale": kw.pop("rationale", "test"), "risk_level": kw.pop("risk_level", "low"),
             "requires_confirmation": False, "confirmation_token": kw.pop("confirmation_token", None)}

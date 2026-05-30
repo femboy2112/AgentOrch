@@ -12,31 +12,23 @@ verification artifact for `python -m pytest tests/test_computer_use*.py -q -m 'n
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Any, Dict
-from unittest.mock import MagicMock
 
 import psutil
 import pytest
 
 from agy_orchestrator.computer_use import (
-    AuditEventSink,
-    ComputerUseWorkerAdapter,
     SafetyKernel,
     get_default_app_launch_policy,
 )
 from agy_orchestrator.computer_use.models import (
-    ActionIntent,
-    IsolatedDisplaySpec,
-    PerceptionSnapshot,
     RunMode,
     RunRequest,
     SpawnSpec,
     ViolationCode,
 )
 from agy_orchestrator.computer_use.process_supervisor import ProcessSupervisor
-
 
 # Step 13: these module tests (except the explicit @slow e2e placeholder) participate
 # in the hermetic not-slow release-blocking gate alongside the hardenings module.

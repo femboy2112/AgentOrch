@@ -28,11 +28,9 @@ import os
 import shutil
 import subprocess
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict
 
-import psutil
 import pytest
 
 from agy_orchestrator.computer_use.action_executor import ActionExecutor
@@ -181,7 +179,7 @@ def test_executor_spatial_and_nonspatial_on_isolated_xvfb(supervisor: ProcessSup
     display = f":{90 + (os.getpid() % 47)}"
     xv_spec = type("S", (), {"display": display, "screen": "640x480x24", "xvfb_binary": xvfb, "timeout_ms": 2000})()
     try:
-        spawned_xv = supervisor.spawn_isolated_display(xv_spec)  # type: ignore[arg-type]
+        supervisor.spawn_isolated_display(xv_spec)  # type: ignore[arg-type]
     except RuntimeError as e:
         if "already active" in str(e).lower() or "address" in str(e).lower():
             pytest.skip(f"display {display} busy")
@@ -343,7 +341,6 @@ def test_realgui_executor_valid_token_uses_real_env_not_isolated(monkeypatch: py
     cookie or AGY_ISOLATED_X marker. isolated lazy env remains unmaterialized.
     """
     captured_envs: list[Dict[str, str]] = []
-    real_run = subprocess.run
 
     def spying_run(argv: Any, *, env: Dict[str, str] | None = None, **kw: Any) -> Any:
         if argv and isinstance(argv, (list, tuple)) and "xdotool" in str(argv[0] if argv else ""):

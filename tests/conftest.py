@@ -12,7 +12,6 @@ import pytest
 from agy_orchestrator.computer_use import ProcessSupervisor, get_isolated_env
 from agy_orchestrator.computer_use.models import IsolatedDisplaySpec
 
-
 ROOT = Path(__file__).resolve().parent.parent
 root_str = str(ROOT)
 if root_str not in sys.path:

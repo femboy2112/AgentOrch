@@ -34,13 +34,14 @@ BrowserController code paths. The module imports cleanly for Fake-only usage.
 
 from __future__ import annotations
 
-import os
 import glob
+import os
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .process_supervisor import ProcessSupervisor
@@ -97,6 +98,9 @@ class BrowserController:
         self._user_data_dir: Optional[str] = None
         self._cdp_endpoint: Optional[str] = None
         self._closed = False
+        # Playwright is thread-affine; the first browser call pins this controller to
+        # that thread and all later calls run inline on it (see _call_on_owner).
+        self._owner_ident: Optional[int] = None
 
     @property
     def cdp_endpoint(self) -> Optional[str]:
@@ -109,6 +113,76 @@ class BrowserController:
     def browser_pid(self) -> Optional[int]:
         """The OS pid of the Chromium root process (registered as owned via supervisor)."""
         return self._browser_pid
+
+    @property
+    def current_page(self) -> Optional[Any]:
+        """The live Playwright page the run is acting on (most recent, after new-tab follows).
+
+        Handed to BrowserDOMCollector so DOM perception reads this in-process page directly
+        instead of opening a second sync_playwright()/connect_over_cdp (which would raise).
+        Returns None before first launch or after close.
+        """
+        # Never hand a live Playwright page to a non-owner thread.
+        if self._closed or self._context is None or not self._is_owner_thread():
+            return None
+        try:
+            pages = self._context.pages
+            if pages:
+                return pages[-1]
+        except Exception:
+            pass
+        return self._page
+
+    def _is_owner_thread(self) -> bool:
+        return bool(self._owner_ident is not None and threading.get_ident() == self._owner_ident)
+
+    def _call_on_owner(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a Playwright operation on the browser's pinned thread.
+
+        Playwright's sync API is thread-affine: a page/context may only be driven from
+        the thread that created its sync_playwright loop. The adapter's perceive->reason
+        ->act loop is single-threaded (adapter.start runs _execute_run inline), so the
+        FIRST browser call pins the controller to that thread and every later call runs
+        inline on it -- the exact single-threaded usage Playwright supports.
+
+        An earlier design marshaled each call onto a SEPARATE owner thread via a queue;
+        that made page.evaluate() hang in the asyncio greenlet after navigate (the loop
+        thread blocked on a Future the greenlet never completed). Pinning to the caller's
+        own thread removes the cross-thread hand-off entirely.
+        """
+        if self._owner_ident is None:
+            self._owner_ident = threading.get_ident()
+        if threading.get_ident() == self._owner_ident:
+            return fn(*args, **kwargs)
+        # Foreign thread: the pinned thread owns the sync loop; we cannot safely drive
+        # Playwright from here. Fail closed -- callers (collect_dom_elements) degrade to [].
+        raise RuntimeError(
+            "BrowserController driven from a non-owner thread; the Playwright sync API "
+            "is thread-affine. Drive all browser ops from the run-loop thread."
+        )
+
+    def _stop_owner_thread(self) -> None:
+        # No separate owner thread is spawned (calls run inline on the pinned thread);
+        # nothing to join. Reset the pin so a reused controller can re-pin. Kept for
+        # close() compatibility.
+        self._owner_ident = None
+
+    def collect_dom_elements(self, scan_page: Callable[[Any], List[Any]]) -> List[Any]:
+        """Run DOM scan callback on the Playwright owner thread."""
+        if not callable(scan_page):
+            return []
+        try:
+            return list(self._call_on_owner(self._collect_dom_elements_impl, scan_page))
+        except Exception:
+            return []
+
+    def _collect_dom_elements_impl(self, scan_page: Callable[[Any], List[Any]]) -> List[Any]:
+        if self._closed or self._context is None:
+            return []
+        page = self.current_page
+        if page is None:
+            return []
+        return list(scan_page(page))
 
     def _build_clean_env(self) -> Dict[str, str]:
         """Return env for the browser process.
@@ -220,7 +294,7 @@ class BrowserController:
             pass
         return None
 
-    def _launch(self) -> None:
+    def _launch_impl(self) -> None:
         """Launch the owned Chromium (idempotent; only first navigate pays the cost).
 
         Uses launch_persistent_context: modern Playwright rejects ``--user-data-dir``
@@ -312,9 +386,12 @@ class BrowserController:
         Targets the most recent page (context.pages[-1] after new-tab clicks) for consistency
         with click_dom/type_dom and to support autonomous perceive->reason->act flows.
         """
+        return self._call_on_owner(self._navigate_impl, url)
+
+    def _navigate_impl(self, url: str) -> Tuple[str, int]:
         if not url or not isinstance(url, str):
             raise ValueError("url must be non-empty string")
-        self._launch()
+        self._launch_impl()
         assert self._context is not None and self._page is not None
         try:
             active = self._context.pages[-1] if self._context.pages else self._page
@@ -335,6 +412,9 @@ class BrowserController:
 
     def click_dom(self, selector: Optional[str] = None, index: int = 1) -> Dict[str, Any]:
         """Locator-based click of the Nth (1-based) match. Supports new-tab follow (capture pages[-1])."""
+        return self._call_on_owner(self._click_dom_impl, selector, index)
+
+    def _click_dom_impl(self, selector: Optional[str] = None, index: int = 1) -> Dict[str, Any]:
         if not self._context or not self._page or self._closed:
             return {"ok": False, "error_code": "browser_not_open", "index": index}
 
@@ -380,6 +460,11 @@ class BrowserController:
         self, selector: Optional[str], index: int, text: str, press_enter: bool = True
     ) -> Dict[str, Any]:
         """Locator-based type into the Nth match (optionally press Enter)."""
+        return self._call_on_owner(self._type_dom_impl, selector, index, text, press_enter)
+
+    def _type_dom_impl(
+        self, selector: Optional[str], index: int, text: str, press_enter: bool = True
+    ) -> Dict[str, Any]:
         if not self._context or not self._page or self._closed:
             return {"ok": False, "error_code": "browser_not_open", "index": index}
 
@@ -412,7 +497,29 @@ class BrowserController:
             return {"ok": False, "error_code": "dom_actuation_failed", "index": index, "error": str(e)}
 
     def close(self) -> None:
-        """Terminate the owned browser tree (via supervisor) and stop playwright driver. Idempotent."""
+        """Terminate the owned browser tree (via supervisor) and stop the Playwright
+        driver. Idempotent.
+
+        Playwright teardown runs on the pinned thread. If close() is called from another
+        thread we still reap the whole owned OS process tree via the supervisor so the
+        browser process group is never leaked (B3)."""
+        if self._closed:
+            return
+        if self._owner_ident is None or threading.get_ident() == self._owner_ident:
+            self._close_impl()
+        else:
+            # Foreign-thread close: do not touch Playwright objects from here, but the
+            # supervisor can still reap the owned process tree deterministically (B3).
+            self._closed = True
+            if self._supervisor is not None and self._root_id:
+                try:
+                    self._supervisor.terminate_tree(self._root_id)
+                except Exception:
+                    pass
+            self._browser_pid = None
+            self._cdp_endpoint = None
+
+    def _close_impl(self) -> None:
         if self._closed:
             return
         self._closed = True
