@@ -95,10 +95,13 @@ class AgyAgent(AgentInstance):
         return 100.0
 
     def build_command(self, piped_input: Optional[str] = None) -> List[str]:
+        # Generic "be excellent / be performant" exhortations were dropped: a
+        # prompt-ablation (2026-05-30, codex, partial-credit bench) showed they
+        # buy no measurable quality. The interface-CORRECTNESS line stays (it's
+        # plausibly load-bearing for multi-file work the bench doesn't exercise),
+        # as does the NO SUDO safety constraint.
         injected_prompt = (
             "System constraints:\n"
-            "- EXCELLENCE: Produce work that meets a high, domain-appropriate quality bar for the task — correct, robust, and well-crafted.\n"
-            "- PERFORMANCE: Where performance matters, write efficient code and avoid needless overhead.\n"
             "- CORRECTNESS: Double-check that identifiers, signatures, and interfaces match exactly across files and components.\n"
             "- NO SUDO: Do NOT use `sudo` under any circumstances.\n"
         )
