@@ -221,8 +221,16 @@ class BrowserController:
         return None
 
     def _launch(self) -> None:
-        """Launch the owned Chromium (idempotent; only first navigate pays the cost)."""
-        if self._browser is not None:
+        """Launch the owned Chromium (idempotent; only first navigate pays the cost).
+
+        Uses launch_persistent_context: modern Playwright rejects ``--user-data-dir``
+        as a launch *arg* (it must be the persistent-context's own parameter), and a
+        persistent profile dir is exactly what we need for DevToolsActivePort →
+        CDP-endpoint discovery with ``--remote-debugging-port=0``. The launched
+        Chromium is still an agent-owned child (adopted via the supervisor) on the
+        run's display, matching scripts/agent_browser_demo.py's proven mechanism.
+        """
+        if self._context is not None:
             return
         if self._closed:
             raise RuntimeError("BrowserController already closed")
@@ -230,37 +238,48 @@ class BrowserController:
         exe = _find_chromium_executable()
         child_env = self._build_clean_env()
 
-        # Private user data dir (required for DevToolsActivePort discovery with port=0)
+        # Persistent profile dir (Chromium writes DevToolsActivePort here for port=0).
         self._user_data_dir = tempfile.mkdtemp(prefix="agu-browser-")
 
         from playwright.sync_api import sync_playwright  # type: ignore  # lazy real-only import
 
         self._playwright = sync_playwright().start()
 
+        # NOTE: no --user-data-dir here; launch_persistent_context manages the profile.
         args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
             "--remote-debugging-port=0",
-            f"--user-data-dir={self._user_data_dir}",
         ]
 
         # Headed on REAL :0 so the operator can watch the agent's browser window.
         # Headless on isolated Xvfb (saves a tiny amount of resources; still renders).
         headless = self._display != ":0"
 
-        browser = self._playwright.chromium.launch(
+        # launch_persistent_context returns a BrowserContext directly (no separate
+        # Browser object); context options (viewport/locale/user_agent) are passed here.
+        context = self._playwright.chromium.launch_persistent_context(
+            self._user_data_dir,
             executable_path=exe,
             args=args,
             env=child_env,
             headless=headless,
             slow_mo=0,
+            viewport=None if not headless else {"width": 1280, "height": 900},
+            locale="en-US",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
         )
-        self._browser = browser
+        self._context = context
+        # The underlying Browser handle (may be None on some persistent setups; kept for close()).
+        self._browser = getattr(context, "browser", None)
 
-        # Extract pid *before* we create contexts (some internals are populated early)
-        pid = self._extract_browser_pid(browser, exe)
+        # Extract pid (persistent context: psutil scan keyed on exe + remote-debugging-port).
+        pid = self._extract_browser_pid(self._browser, exe)
         self._browser_pid = pid if pid else 0
 
         # Register with supervisor so is_owned(pid) == True and terminate_tree will reap (B1/B3)
@@ -276,16 +295,8 @@ class BrowserController:
             except Exception:
                 self._root_id = None
 
-        # Create a single context + page (matches prototype; viewport=None on headed :0)
-        self._context = browser.new_context(
-            viewport=None if not headless else {"width": 1280, "height": 900},
-            locale="en-US",
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-        )
-        self._page = self._context.new_page()
+        # Persistent context opens with an initial page; reuse it (else create one).
+        self._page = context.pages[0] if context.pages else context.new_page()
 
         # Discover CDP endpoint with short retry (DevToolsActivePort appears shortly after launch).
         # Still best-effort only; BrowserDOMCollector and actuation paths tolerate None (B4 safe).
@@ -413,7 +424,13 @@ class BrowserController:
             except Exception:
                 pass
 
-        # Close playwright objects (best-effort)
+        # Close playwright objects (best-effort). For a persistent context, closing
+        # the context is what shuts the browser down; close the Browser handle too if present.
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
         try:
             if self._browser is not None:
                 self._browser.close()
