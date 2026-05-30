@@ -184,3 +184,40 @@ class ClaudeAgent(AgentInstance):
                 logger.info("New session established: %s", sid)
             self.session_id = sid
         return self._extract_result_text(raw_stdout)
+
+    def _extract_usage(self, raw_stdout: str, raw_stderr: str) -> dict:
+        """Parse usage from Claude's normal JSON/stream-json output."""
+        usage = {}
+        try:
+            payload = json.loads(raw_stdout)
+            blobs = payload if isinstance(payload, list) else [payload]
+            for blob in blobs:
+                if isinstance(blob, dict) and isinstance(blob.get("usage"), dict):
+                    usage = blob.get("usage") or usage
+        except Exception:
+            pass
+        if not usage:
+            for line in raw_stdout.splitlines():
+                try:
+                    blob = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(blob, dict) and isinstance(blob.get("usage"), dict):
+                    usage = blob.get("usage") or usage
+        if not usage:
+            return {
+                "token_source": "unavailable",
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+            }
+        return {
+            "token_source": "cli",
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_tokens": (
+                usage.get("cache_read_tokens")
+                or usage.get("cache_read_input_tokens")
+                or usage.get("cached_input_tokens")
+            ),
+        }

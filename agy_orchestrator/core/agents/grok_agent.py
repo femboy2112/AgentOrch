@@ -193,3 +193,24 @@ class GrokAgent(AgentInstance):
     def _extract_session_id(raw_stdout: str) -> Optional[str]:
         m = re.search(r'"sessionId"\s*:\s*"([^"]+)"', raw_stdout)
         return m.group(1) if m else None
+
+    def _extract_usage(self, raw_stdout: str, raw_stderr: str) -> dict:
+        obj = self._extract_payload(raw_stdout)
+        usage = obj.get("usage") if isinstance(obj, dict) else None
+        if not isinstance(usage, dict):
+            return {
+                "token_source": "unavailable",
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+            }
+        return {
+            "token_source": "cli",
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_tokens": (
+                usage.get("cache_read_tokens")
+                or usage.get("cache_read_input_tokens")
+                or usage.get("cached_input_tokens")
+            ),
+        }
