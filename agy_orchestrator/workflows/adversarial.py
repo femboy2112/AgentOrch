@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.verifier import QualityVerifier
@@ -54,6 +54,7 @@ class AdversarialReview:
         diff_only: bool = False,
         working_directory: str = ".",
         critic_preamble: str = "",
+        event_callback: Optional[Callable[[dict], None]] = None,
     ):
         self.generator = generator_instance
         self.critic = critic_instance
@@ -75,6 +76,28 @@ class AdversarialReview:
         self.approved = False
         self.verified = False  # programmatic verifier passed
         self.stalled = False   # bailed early on a repeated critique
+        self.event_callback = event_callback
+
+    def _emit_orchestration(self, **fields) -> None:
+        cb = self.event_callback
+        if cb is None:
+            return
+        orchestration = {"workflow": "master"}
+        for key, value in fields.items():
+            if value is not None:
+                orchestration[key] = value
+        try:
+            cb(
+                {
+                    "kind": "lifecycle",
+                    "data": {
+                        "event": "orchestration_transition",
+                        "orchestration": orchestration,
+                    },
+                }
+            )
+        except Exception:
+            pass
 
     async def execute(self, initial_prompt: str) -> str:
         current_prompt = initial_prompt
@@ -84,6 +107,12 @@ class AdversarialReview:
         for iteration in range(self.max_iterations):
             logger.info(f"Adversarial Review Iteration {iteration+1}/{self.max_iterations}")
             self.iterations_used = iteration + 1
+            self._emit_orchestration(
+                phase="adversarial",
+                action="iteration_started",
+                iteration=iteration + 1,
+                iteration_total=self.max_iterations,
+            )
 
             self.generator.prompt = current_prompt
             last_output = await self.generator.run_async()
@@ -98,6 +127,12 @@ class AdversarialReview:
                     logger.info("Programmatic verification passed — accepting (no critic pass needed).")
                     self.verified = True
                     self.approved = True
+                    self._emit_orchestration(
+                        phase="adversarial",
+                        action="iteration_completed",
+                        iteration=iteration + 1,
+                        iteration_total=self.max_iterations,
+                    )
                     return last_output
                 logger.info("Programmatic verification failed. Sending back to generator.")
                 # Feed the failing CODE back with the error, not just the error —
@@ -139,6 +174,12 @@ class AdversarialReview:
             if _is_approved(critic_feedback):
                 logger.info("Critic approved the output.")
                 self.approved = True
+                self._emit_orchestration(
+                    phase="adversarial",
+                    action="iteration_completed",
+                    iteration=iteration + 1,
+                    iteration_total=self.max_iterations,
+                )
                 return last_output
 
             # Adaptive cap: if the critic returns essentially the SAME critique as
@@ -149,6 +190,12 @@ class AdversarialReview:
             if prev_feedback_norm is not None and fb_norm == prev_feedback_norm:
                 logger.info("Critique unchanged from last round — stalling out early.")
                 self.stalled = True
+                self._emit_orchestration(
+                    phase="adversarial",
+                    action="iteration_completed",
+                    iteration=iteration + 1,
+                    iteration_total=self.max_iterations,
+                )
                 return last_output
             prev_feedback_norm = fb_norm
 
@@ -172,4 +219,11 @@ class AdversarialReview:
             )
 
         logger.warning(f"Max iterations ({self.max_iterations}) reached without Critic approval.")
+        if self.max_iterations > 0:
+            self._emit_orchestration(
+                phase="adversarial",
+                action="iteration_completed",
+                iteration=self.max_iterations,
+                iteration_total=self.max_iterations,
+            )
         return last_output

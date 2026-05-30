@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
 from agy_orchestrator.execution.verifier import QualityVerifier
@@ -43,6 +43,7 @@ class MasterWorkflow:
         selector: str = "judge",
         working_directory: str = ".",
         recent_steps_verbatim: int = DEFAULT_RECENT_STEPS_VERBATIM,
+        event_callback: Optional[Callable[[dict], None]] = None,
     ):
         self.model = model
         self.effort = effort
@@ -73,6 +74,28 @@ class MasterWorkflow:
         # the session so the accumulated transcript is shed. 0/negative disables.
         self.compaction_interval = int(compaction_interval)
         self.max_context_chars = int(max_context_chars)
+        self.event_callback = event_callback
+
+    def _emit_orchestration(self, **fields) -> None:
+        cb = self.event_callback
+        if cb is None:
+            return
+        orchestration = {"workflow": "master"}
+        for key, value in fields.items():
+            if value is not None:
+                orchestration[key] = value
+        try:
+            cb(
+                {
+                    "kind": "lifecycle",
+                    "data": {
+                        "event": "orchestration_transition",
+                        "orchestration": orchestration,
+                    },
+                }
+            )
+        except Exception:
+            pass
 
     def _should_compact(self, steps_since_compaction: int, project_context: str) -> bool:
         if self.compaction_interval and steps_since_compaction >= self.compaction_interval:
@@ -274,6 +297,11 @@ class MasterWorkflow:
                 tasks = [initial_prompt]
 
             logger.info(f"Project broken down into {len(tasks)} steps.")
+            self._emit_orchestration(
+                phase="plan",
+                action="completed",
+                step_total=len(tasks),
+            )
 
             project_context = f"Original Goal: {initial_prompt}\n\n=== Accumulated Implementation ===\n"
             start_index = 0
@@ -285,6 +313,12 @@ class MasterWorkflow:
             task = tasks[i]
             logger.info(f"--- Executing Step {i+1}/{len(tasks)} ---")
             logger.info(f"Task description: {task[:100]}...")
+            self._emit_orchestration(
+                phase="step",
+                action="started",
+                step_index=i + 1,
+                step_total=len(tasks),
+            )
 
             step_prompt = (
                 f"You are implementing Step {i+1} of a larger project.\n\n"
@@ -311,7 +345,12 @@ class MasterWorkflow:
                 # the workflow session here — resuming it would both contaminate
                 # per-branch scoring and pollute the main thread.
                 tot_evaluator = self.agent_class(prompt="", model=self.model, effort="high")
-                tot = TreeOfThought(tot_branches, tot_evaluator, selector=self.selector)
+                tot = TreeOfThought(
+                    tot_branches,
+                    tot_evaluator,
+                    selector=self.selector,
+                    event_callback=self.event_callback,
+                )
                 best_tot_output = await tot.execute()
 
             # Phase B: Adversarial Review (Refinement) — resume main workflow session
@@ -345,11 +384,18 @@ class MasterWorkflow:
                 verifier=self.verifier,
                 max_iterations=self.max_iterations,
                 working_directory=self.working_directory,
+                event_callback=self.event_callback,
             )
 
             final_step_output = await adv.execute(adv_prompt)
 
             logger.info(f"Step {i+1} Completed. Summarizing for project context.")
+            self._emit_orchestration(
+                phase="step",
+                action="completed",
+                step_index=i + 1,
+                step_total=len(tasks),
+            )
             # Summarize the step output to keep project_context compact.
             # Passing full HTML/code outputs into every subsequent prompt balloons to 50KB+.
             summarize_kwargs = dict(model=self.model, effort="low")

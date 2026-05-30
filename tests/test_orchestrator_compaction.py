@@ -27,7 +27,7 @@ class FakeAgent:
 
 
 class _StubToT:
-    def __init__(self, branches, evaluator):
+    def __init__(self, branches, evaluator, selector="judge", event_callback=None):
         pass
 
     async def execute(self) -> str:
@@ -36,7 +36,7 @@ class _StubToT:
 
 class _StubAdv:
     def __init__(self, generator_instance=None, critic_instance=None, verifier=None,
-                 max_iterations=1, working_directory="."):
+                 max_iterations=1, working_directory=".", event_callback=None):
         pass
 
     async def execute(self, prompt) -> str:

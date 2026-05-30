@@ -147,6 +147,27 @@ def make_fallback_agent(
                     logger.warning("[Fallback] post_construct_hook raised: %s", exc)
             return sub
 
+        def _emit_orchestration(self, **fields) -> None:
+            cb = self.event_callback
+            if cb is None:
+                return
+            orchestration = {"workflow": "master"}
+            for key, value in fields.items():
+                if value is not None:
+                    orchestration[key] = value
+            try:
+                cb(
+                    {
+                        "kind": "lifecycle",
+                        "data": {
+                            "event": "orchestration_transition",
+                            "orchestration": orchestration,
+                        },
+                    }
+                )
+            except Exception:
+                pass
+
         async def run_async(self, piped_input: Optional[str] = None) -> str:
             last_error: Optional[Exception] = None
             # Repeat the chain ``_cycles`` times: codex -> agy -> claude -> (repeat).
@@ -184,6 +205,14 @@ def make_fallback_agent(
                             "[Fallback] %s tripped watchdog:%s — re-routing to %s",
                             label, reason, [c.__name__ for c in targets],
                         )
+                        to_worker = targets[0].__name__ if targets else None
+                        self._emit_orchestration(
+                            phase="fallback",
+                            action="reroute",
+                            from_worker=label,
+                            to_worker=to_worker,
+                            reason=reason,
+                        )
                     else:
                         logger.warning(
                             "[Fallback] %s failed%s%s: %s",
@@ -191,6 +220,14 @@ def make_fallback_agent(
                             " (usage/quota wall)" if looked_like_usage else "",
                             f" (watchdog:{reason})" if reason else "",
                             exc,
+                        )
+                        to_worker = pending[0].__name__ if pending else None
+                        self._emit_orchestration(
+                            phase="fallback",
+                            action="reroute",
+                            from_worker=label,
+                            to_worker=to_worker,
+                            reason=reason or "error",
                         )
                     last_error = exc
                     continue

@@ -3,7 +3,7 @@ import copy
 import logging
 import re
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.pipeline import ParallelSwarm
@@ -83,10 +83,33 @@ class TreeOfThought:
         branch_instances: List[AgentInstance],
         evaluator_instance: AgentInstance,
         selector: str = "judge",
+        event_callback: Optional[Callable[[dict], None]] = None,
     ):
         self.branch_instances = branch_instances
         self.evaluator = evaluator_instance
         self.selector = selector
+        self.event_callback = event_callback
+
+    def _emit_orchestration(self, **fields) -> None:
+        cb = self.event_callback
+        if cb is None:
+            return
+        orchestration = {"workflow": "master"}
+        for key, value in fields.items():
+            if value is not None:
+                orchestration[key] = value
+        try:
+            cb(
+                {
+                    "kind": "lifecycle",
+                    "data": {
+                        "event": "orchestration_transition",
+                        "orchestration": orchestration,
+                    },
+                }
+            )
+        except Exception:
+            pass
 
     async def execute(self) -> str:
         logger.info(f"Generating {len(self.branch_instances)} ToT branches concurrently...")
@@ -122,6 +145,11 @@ class TreeOfThought:
         logger.info("Vote tally (branch->votes): %s", tally)
         winner_idx = first_index[best_key]
         logger.info(f"Selected branch {winner_idx + 1} with {counts[best_key]} vote(s)")
+        self._emit_orchestration(
+            phase="tot",
+            action="branch_selected",
+            selected_branch=winner_idx + 1,
+        )
         return outputs[winner_idx]
 
     async def _select_by_judge(self, outputs: List[str]) -> str:
@@ -151,4 +179,9 @@ class TreeOfThought:
 
         best_score, neg_idx, best_output = max(scored_outputs, key=lambda t: (t[0], t[1]))
         logger.info("Selected best branch (#%d) with score %d", -neg_idx + 1, best_score)
+        self._emit_orchestration(
+            phase="tot",
+            action="branch_selected",
+            selected_branch=-neg_idx + 1,
+        )
         return best_output

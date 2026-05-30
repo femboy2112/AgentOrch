@@ -287,6 +287,7 @@ async def _run_workflow(
     mode: str,
     prompt: str,
     *,
+    run_id: str,
     generator_chain: List[str],
     critic_chain: List[str],
     fallback: bool,
@@ -333,9 +334,18 @@ async def _run_workflow(
             computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
         )
+        model = str(getattr(gen, "model", None) or "n/a")
+        effort = str(getattr(gen, "effort", None) or "n/a")
         wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations,
                                working_directory=working_directory,
-                               critic_preamble=(CATASTROPHIC_FOCUS_PREAMBLE if mission_critical else ""))
+                               critic_preamble=(CATASTROPHIC_FOCUS_PREAMBLE if mission_critical else ""),
+                               event_callback=EVENT_BUS.publisher_for(
+                                   run_id,
+                                   worker="orchestrator",
+                                   model=model,
+                                   effort=effort,
+                                   branch=None,
+                               ))
         return await wf.execute(prompt), wf
 
     if mode == "feedback":
@@ -392,6 +402,13 @@ async def _run_workflow(
             verifier=verifier,
             agent_class=agent_class,
             working_directory=working_directory,
+            event_callback=EVENT_BUS.publisher_for(
+                run_id,
+                worker="orchestrator",
+                model=model,
+                effort=effort,
+                branch=None,
+            ),
         )
         return await wf.execute(prompt), wf
 
@@ -454,6 +471,13 @@ async def _run_workflow(
             verifier=verifier,
             agent_class=agent_class,
             working_directory=working_directory,
+            event_callback=EVENT_BUS.publisher_for(
+                run_id,
+                worker="orchestrator",
+                model=model,
+                effort=effort,
+                branch=None,
+            ),
         )
         wf = PatWorkflow(
             direct_generator=direct_gen,
@@ -708,6 +732,7 @@ async def dispatch_async(
         else:
             output, workflow = await _run_workflow(
                 mode, prompt,
+                run_id=run_id,
                 generator_chain=generator_chain, critic_chain=critic_chain,
                 fallback=fallback, cycles=cycles, max_iterations=max_iterations,
                 branches=branches, verifier=verifier, codex_config=codex_config,
