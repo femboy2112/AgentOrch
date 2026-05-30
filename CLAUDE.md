@@ -68,6 +68,27 @@ chain (e.g. `--generator codex,agy`).
 Caveat: the diff is a before/after snapshot of the whole tree, so don't create
 unrelated files **during** a running dispatch or they'll show up in its diff.
 
+## Keep it lean (anti-bureaucracy)
+
+This workflow tends to over-produce documents. Defaults that fight that:
+
+- **Specs are scope-gated and ephemeral.** Write a standing design doc only for
+  a genuinely large or ambiguous feature; for everything else the focused
+  instruction *is* the spec. When you do write one it lives in `runs/<id>/spec.md`
+  — promote it to a tracked `docs/` doc only if it'll be referenced repeatedly,
+  and move it to `docs/archive/` once the feature merges (git keeps the history).
+- **One doc per feature, no sidecars.** Fold "validation"/review into a short
+  Risks / Open-Questions section of the doc, or do it inline — don't spawn a
+  separate `*.VALIDATION.md`.
+- **Memory is a working set, not a changelog.** Git records what shipped; memory
+  records what's true *now* and what's still pending. Prune DONE/SUPERSEDED
+  entries on sight.
+- **Instructions are focused PR descriptions, not banner walls.** Cap dispatch
+  prompts; inject a long spec with `--spec <file>` instead of inlining 300 lines.
+  Reserve invariant-lists for genuinely invariant-critical builds.
+- **Default to `pat`/`direct`.** Escalate to `master` (+ a spec) only when the
+  task truly spans many distinct steps.
+
 ## Account-sharing rule (avoid usage-wall cascades)
 
 **Don't run the orchestrator's worker on the same provider+account as the agent
