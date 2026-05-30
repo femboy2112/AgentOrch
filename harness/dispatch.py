@@ -70,6 +70,118 @@ class DispatchResult:
     error: Optional[str] = None
     # Quality-cost ledger (task #9): confidence label + signals for this run.
     quality: Optional[dict] = None
+    # Per-dispatch token telemetry rollup from usage events.
+    tokens: Optional[dict] = None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        iv = int(value)
+    except Exception:
+        return None
+    return iv if iv >= 0 else None
+
+
+def _summarize_token_usage(events_path: Path) -> dict:
+    per_worker: Dict[str, Dict[str, Any]] = {}
+    total_calls = 0
+    for raw in events_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict) or event.get("kind") != "usage":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict) or data.get("usage_kind") != "call":
+            continue
+        worker = str(event.get("worker") or data.get("worker") or "unknown")
+        model = str(event.get("model") or data.get("model") or "n/a")
+        token_source = str(data.get("token_source") or "unavailable")
+        token_source = token_source if token_source in {"cli", "unavailable"} else "unavailable"
+        row = per_worker.setdefault(
+            worker,
+            {
+                "calls": 0,
+                "cli_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "has_input": False,
+                "has_output": False,
+                "has_cache": False,
+                "models": set(),
+            },
+        )
+        total_calls += 1
+        row["calls"] += 1
+        if token_source == "cli":
+            row["cli_calls"] += 1
+        row["models"].add(model)
+        input_tokens = _as_int(data.get("input_tokens"))
+        output_tokens = _as_int(data.get("output_tokens"))
+        cache_read_tokens = _as_int(data.get("cache_read_tokens"))
+        if input_tokens is not None:
+            row["input_tokens"] += input_tokens
+            row["has_input"] = True
+        if output_tokens is not None:
+            row["output_tokens"] += output_tokens
+            row["has_output"] = True
+        if cache_read_tokens is not None:
+            row["cache_read_tokens"] += cache_read_tokens
+            row["has_cache"] = True
+
+    out_per_worker: Dict[str, Dict[str, Any]] = {}
+    total_input = 0
+    total_output = 0
+    total_cache = 0
+    has_total_input = False
+    has_total_output = False
+    has_total_cache = False
+    for worker in sorted(per_worker):
+        row = per_worker[worker]
+        calls = int(row["calls"])
+        cli_calls = int(row["cli_calls"])
+        token_source = "unavailable"
+        if cli_calls == calls and calls > 0:
+            token_source = "cli"
+        elif 0 < cli_calls < calls:
+            token_source = "mixed"
+        input_tokens = row["input_tokens"] if row["has_input"] else None
+        output_tokens = row["output_tokens"] if row["has_output"] else None
+        cache_read_tokens = row["cache_read_tokens"] if row["has_cache"] else None
+        if input_tokens is not None:
+            total_input += int(input_tokens)
+            has_total_input = True
+        if output_tokens is not None:
+            total_output += int(output_tokens)
+            has_total_output = True
+        if cache_read_tokens is not None:
+            total_cache += int(cache_read_tokens)
+            has_total_cache = True
+        out_per_worker[worker] = {
+            "calls": calls,
+            "token_source": token_source,
+            "models": sorted(row["models"]),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+        }
+
+    return {
+        "total_calls": total_calls,
+        "per_worker": out_per_worker,
+        "grand_total": {
+            "input_tokens": total_input if has_total_input else None,
+            "output_tokens": total_output if has_total_output else None,
+            "cache_read_tokens": total_cache if has_total_cache else None,
+        },
+    }
 
 
 def _build_prompt(
@@ -702,6 +814,7 @@ async def dispatch_async(
             diff_files_deleted=len(diff.deleted),
         )
 
+    tokens = _summarize_token_usage(events_path)
     result = DispatchResult(
         run_id=run_id,
         run_dir=str(run_dir),
@@ -716,6 +829,7 @@ async def dispatch_async(
         deleted=diff.deleted,
         error=error,
         quality=quality,
+        tokens=tokens,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"

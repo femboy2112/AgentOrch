@@ -182,6 +182,54 @@ class AgentInstance(ABC):
             return None
         return {**os.environ, **self.extra_env}
 
+    @staticmethod
+    def _to_int_token(value: object) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            iv = int(value)
+        except Exception:
+            return None
+        return iv if iv >= 0 else None
+
+    def _extract_usage(self, raw_stdout: str, raw_stderr: str) -> Dict[str, object]:
+        """Best-effort token usage extraction from normal CLI output.
+
+        Subclasses override this when their CLI emits usage counts in
+        non-interactive output. Failures must degrade to "unavailable".
+        """
+        return {
+            "token_source": "unavailable",
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_read_tokens": None,
+        }
+
+    def _emit_usage_event(self, raw_stdout: str, raw_stderr: str, *,
+                          attempt: int, success: bool) -> None:
+        usage: Dict[str, object]
+        try:
+            usage = dict(self._extract_usage(raw_stdout, raw_stderr) or {})
+        except Exception:
+            usage = {}
+        token_source = str(usage.get("token_source") or "unavailable")
+        if token_source not in {"cli", "unavailable"}:
+            token_source = "unavailable"
+        self._emit_event({
+            "kind": "usage",
+            "data": {
+                "usage_kind": "call",
+                "token_source": token_source,
+                "input_tokens": self._to_int_token(usage.get("input_tokens")),
+                "output_tokens": self._to_int_token(usage.get("output_tokens")),
+                "cache_read_tokens": self._to_int_token(usage.get("cache_read_tokens")),
+                "attempt": attempt,
+                "success": bool(success),
+                "worker": self._worker_name(),
+                "model": self.model,
+            },
+        })
+
     async def _stream_communicate(self, process, stdin_bytes: Optional[bytes] = None,
                                   *, max_output_bytes: int = 0,
                                   stall_seconds: float = 0) -> Tuple[bytes, bytes]:
@@ -393,6 +441,7 @@ class AgentInstance(ABC):
                                      self.timeout)
                         await self._kill_current()
                         self.stderr = f"timed out after {self.timeout:.0f}s"
+                        self._emit_usage_event("", self.stderr, attempt=attempt, success=False)
                         raise RuntimeError(self.stderr)  # fail fast, no retry
 
                     raw_stdout = stdout_bytes.decode()
@@ -400,6 +449,9 @@ class AgentInstance(ABC):
                     self.returncode = process.returncode
                     self._current_process = None
                     self.last_wall_ms = (time.monotonic() - attempt_start) * 1000
+                    self._emit_usage_event(
+                        raw_stdout, self.stderr, attempt=attempt, success=bool(self.returncode == 0)
+                    )
 
                     # Watchdog trip: the child was killed mid-flight. Surface the
                     # reason in stderr so FallbackAgent (and human readers) can

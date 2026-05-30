@@ -1,3 +1,4 @@
+import json
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
@@ -56,6 +57,39 @@ class CodexAgent(AgentInstance):
         if parsed:
             return parsed
         return super()._events_from_stderr_line(line)
+
+    def _extract_usage(self, raw_stdout: str, raw_stderr: str) -> dict:
+        # codex usage is available only when JSON turn events are present.
+        usage = {}
+        for line in raw_stdout.splitlines():
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            event_type = payload.get("type") or payload.get("event")
+            if event_type == "turn.completed":
+                row = payload.get("usage") or payload.get("data", {}).get("usage") or {}
+                if isinstance(row, dict):
+                    usage = row
+        if not usage:
+            return {
+                "token_source": "unavailable",
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+            }
+        return {
+            "token_source": "cli",
+            "input_tokens": usage.get("input_tokens") or usage.get("in_tokens"),
+            "output_tokens": usage.get("output_tokens") or usage.get("out_tokens"),
+            "cache_read_tokens": (
+                usage.get("cache_read_tokens")
+                or usage.get("cached_input_tokens")
+                or usage.get("cached_tokens")
+            ),
+        }
 
     def build_command(self, piped_input: Optional[str] = None) -> List[str]:
         cmd = [

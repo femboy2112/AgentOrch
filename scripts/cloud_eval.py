@@ -113,24 +113,50 @@ def extract_code(text: str) -> str:
     return body
 
 
-def run_test(code: str, test_src: str) -> tuple[bool, str]:
-    """Write code + test to a temp dir, run pytest, return (passed, tail)."""
+def _parse_pytest_counts(output: str) -> tuple[int, int]:
+    passed = 0
+    total = 0
+    for n in re.findall(r"(\d+)\s+passed\b", output):
+        passed += int(n)
+        total += int(n)
+    for n in re.findall(r"(\d+)\s+errors?\b", output):
+        total += int(n)
+    for label in ("failed", "skipped", "xfailed", "xpassed", "deselected"):
+        for n in re.findall(rf"(\d+)\s+{label}\b", output):
+            total += int(n)
+    return passed, total
+
+
+def _run_pytest_grade(code: str, test_src: str, *, stop_on_first: bool) -> tuple[bool, str, int, int]:
+    """Write code+tests and grade with pytest, returning pass/fail and case counts."""
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / "solution.py").write_text(code, encoding="utf-8")
         (Path(d) / "test_solution.py").write_text(textwrap.dedent(test_src), encoding="utf-8")
+        cmd = [sys.executable, "-m", "pytest", "-q", "--no-header", "--tb=short"]
+        if stop_on_first:
+            cmd.append("-x")
         try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q", "--no-header", "-x", "--tb=short"],
-                cwd=d, capture_output=True, text=True, timeout=60,
-            )
+            proc = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
-            return False, "pytest timed out (likely infinite loop in generated code)"
+            return False, "pytest timed out (likely infinite loop in generated code)", 0, 0
         out = (proc.stdout + proc.stderr).strip()
+        passed_cases, total_cases = _parse_pytest_counts(out)
         if proc.returncode == 0:
-            return True, "ok"
+            return True, "ok", passed_cases, total_cases
         idx = out.find("FAILURES")
         detail = out[idx:] if idx != -1 else out
-        return False, detail[-1200:]
+        return False, detail[-1200:], passed_cases, total_cases
+
+
+def run_test(code: str, test_src: str) -> tuple[bool, str]:
+    """Write code + test to a temp dir, run pytest, return (passed, tail)."""
+    ok, tail, _, _ = _run_pytest_grade(code, test_src, stop_on_first=True)
+    return ok, tail
+
+
+def run_test_counts(code: str, test_src: str, *, stop_on_first: bool = False) -> tuple[bool, str, int, int]:
+    """Run pytest and return (ok, tail, passed_cases, total_cases)."""
+    return _run_pytest_grade(code, test_src, stop_on_first=stop_on_first)
 
 # ---- discriminating tasks (LeetCode medium/hard) -------------------------
 # Verified graders: a correct reference solution passes each test suite.
@@ -338,7 +364,7 @@ CLOUD_SUFFIX = (
 )
 
 
-async def run_one(worker: str, task: str, prompt: str, test_src: str) -> dict:
+async def run_one(worker: str, task: str, prompt: str, test_src: str, *, partial: bool) -> dict:
     """Generate with one worker, grade with the hidden test. Never raises."""
     from harness import roles
     t0 = time.time()
@@ -347,14 +373,22 @@ async def run_one(worker: str, task: str, prompt: str, test_src: str) -> dict:
                                        fallback=False)
         raw = await agent.run_async()
         code = extract_code(raw)
-        ok, tail = run_test(code, test_src)
+        if partial:
+            ok, tail, passed_cases, total_cases = run_test_counts(code, test_src, stop_on_first=False)
+        else:
+            ok, tail = run_test(code, test_src)
+            passed_cases = 1 if ok else 0
+            total_cases = 1
+        frac = (passed_cases / total_cases) if total_cases > 0 else 0.0
         return {"worker": worker, "task": task, "ok": ok,
                 "t": time.time() - t0, "tail": "" if ok else tail[:80],
-                "empty": not code.strip()}
+                "empty": not code.strip(), "passed_cases": passed_cases,
+                "total_cases": total_cases, "fraction": frac}
     except Exception as exc:
         return {"worker": worker, "task": task, "ok": False,
                 "t": time.time() - t0, "tail": f"{type(exc).__name__}: {exc}"[:80],
-                "empty": False}
+                "empty": False, "passed_cases": 0, "total_cases": 0,
+                "fraction": 0.0}
 
 
 async def run(args) -> None:
@@ -371,13 +405,14 @@ async def run(args) -> None:
     for task in names:
         prompt, test_src = ALL_TASKS[task]
         rows = await asyncio.gather(*[
-            run_one(w, task, prompt, test_src) for w in workers
+            run_one(w, task, prompt, test_src, partial=args.partial) for w in workers
         ])
         cells = []
         for r in rows:
             results[r["worker"]][task] = r
             mark = "PASS" if r["ok"] else "FAIL"
-            cells.append(f"{r['worker']}=[{mark}] {r['t']:4.0f}s")
+            frac = f"{r['passed_cases']}/{r['total_cases']}={r['fraction']:.2f}" if args.partial else "-"
+            cells.append(f"{r['worker']}=[{mark}] {frac} {r['t']:4.0f}s")
         tag = "easy" if task in EASY else ("BRUTAL" if task in BRUTAL else "HARD")
         print(f"{task:16} {tag:6}  " + " | ".join(cells))
         for r in rows:
@@ -387,7 +422,7 @@ async def run(args) -> None:
 
     # Scoreboard
     print("\n=== scoreboard ===")
-    hdr = f"{'worker':10} {'easy':>7} {'hard':>7} {'total':>7} {'avg s':>7}"
+    hdr = f"{'worker':10} {'easy':>7} {'hard':>7} {'total':>7} {'partial':>8} {'avg s':>7}"
     print(hdr)
     print("-" * len(hdr))
     rankable = []
@@ -398,13 +433,17 @@ async def run(args) -> None:
         n_easy = sum(t in EASY for t in names)
         n_hard = sum(t not in EASY for t in names)
         total = easy_ok + hard_ok
+        partial_avg = (
+            sum(rs[t]["fraction"] for t in names) / max(len(names), 1)
+            if args.partial else 0.0
+        )
         avg = sum(rs[t]["t"] for t in names) / max(len(names), 1)
-        rankable.append((total, hard_ok, -avg, w))
+        rankable.append((total, hard_ok, partial_avg, -avg, w))
         print(f"{w:10} {f'{easy_ok}/{n_easy}':>7} {f'{hard_ok}/{n_hard}':>7} "
-              f"{f'{total}/{len(names)}':>7} {avg:7.0f}")
+              f"{f'{total}/{len(names)}':>7} {partial_avg:8.3f} {avg:7.0f}")
     rankable.sort(reverse=True)
-    print("\nranking (total, then hard, then speed): "
-          + " > ".join(r[3] for r in rankable))
+    print("\nranking (total, then hard, then partial, then speed): "
+          + " > ".join(r[4] for r in rankable))
 
 
 def _describe_models(workers) -> dict:
@@ -428,6 +467,8 @@ def main() -> None:
                     help="subset of tasks (default: all easy+hard)")
     ap.add_argument("--timeout", type=int, default=300,
                     help="per-call wall-clock ceiling (sets AGY_TIMEOUT)")
+    ap.add_argument("--partial", action=argparse.BooleanOptionalAction, default=True,
+                    help="run full graders (no -x) and report per-task fractional scores")
     args = ap.parse_args()
     os.environ["AGY_TIMEOUT"] = str(args.timeout)
     asyncio.run(run(args))
