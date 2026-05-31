@@ -24,6 +24,11 @@ _STEP_HEADER_RE = re.compile(r"^---\s*Step\s+(\d+)\s+Summary\s*---\s*$", re.MULT
 # detail is fine to digest. Bump via MasterWorkflow(recent_steps_verbatim=K).
 DEFAULT_RECENT_STEPS_VERBATIM = 2
 
+
+def _truncate_orch_title(value: object) -> str:
+    return str(value)[:120]
+
+
 class MasterWorkflow:
     """
     Combines Tree of Thought and Adversarial Review to manage and execute
@@ -297,10 +302,12 @@ class MasterWorkflow:
                 tasks = [initial_prompt]
 
             logger.info(f"Project broken down into {len(tasks)} steps.")
+            step_titles = [_truncate_orch_title(task) for task in tasks]
             self._emit_orchestration(
                 phase="plan",
                 action="completed",
                 step_total=len(tasks),
+                step_titles=step_titles,
             )
 
             project_context = f"Original Goal: {initial_prompt}\n\n=== Accumulated Implementation ===\n"
@@ -318,6 +325,9 @@ class MasterWorkflow:
                 action="started",
                 step_index=i + 1,
                 step_total=len(tasks),
+                step_title=_truncate_orch_title(task),
+                model=self.model,
+                effort=self.effort,
             )
 
             step_prompt = (
@@ -395,6 +405,7 @@ class MasterWorkflow:
                 action="completed",
                 step_index=i + 1,
                 step_total=len(tasks),
+                step_title=_truncate_orch_title(task),
             )
             # Summarize the step output to keep project_context compact.
             # Passing full HTML/code outputs into every subsequent prompt balloons to 50KB+.

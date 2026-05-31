@@ -41,6 +41,16 @@ def _watchdog_reason_in(stderr: str) -> Optional[str]:
     return head.split("]", 1)[0].strip() or None
 
 
+def _reason_category(*, looked_like_usage: bool, watchdog_reason: Optional[str]) -> str:
+    if looked_like_usage:
+        return "usage"
+    if watchdog_reason == "verbose":
+        return "verbose"
+    if watchdog_reason == "stalled":
+        return "stalled"
+    return "error"
+
+
 def make_fallback_agent(
     chain: List[Type[AgentInstance]],
     cycles: int = 3,
@@ -212,6 +222,12 @@ def make_fallback_agent(
                             from_worker=label,
                             to_worker=to_worker,
                             reason=reason,
+                            reason_category=_reason_category(
+                                looked_like_usage=looked_like_usage,
+                                watchdog_reason=reason,
+                            ),
+                            attempt=attempts,
+                            attempt_total=len(self._chain),
                         )
                     else:
                         logger.warning(
@@ -228,6 +244,12 @@ def make_fallback_agent(
                             from_worker=label,
                             to_worker=to_worker,
                             reason=reason or "error",
+                            reason_category=_reason_category(
+                                looked_like_usage=looked_like_usage,
+                                watchdog_reason=reason,
+                            ),
+                            attempt=attempts,
+                            attempt_total=len(self._chain),
                         )
                     last_error = exc
                     continue

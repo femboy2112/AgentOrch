@@ -144,11 +144,16 @@ class TreeOfThought:
         tally = {f"#{first_index[k] + 1}": counts[k] for k in counts}
         logger.info("Vote tally (branch->votes): %s", tally)
         winner_idx = first_index[best_key]
+        branch_scores = [counts[_normalize(out)] for out in outputs]
         logger.info(f"Selected branch {winner_idx + 1} with {counts[best_key]} vote(s)")
         self._emit_orchestration(
             phase="tot",
             action="branch_selected",
             selected_branch=winner_idx + 1,
+            branch_total=len(outputs),
+            selector="vote",
+            score=counts[best_key],
+            scores=branch_scores,
         )
         return outputs[winner_idx]
 
@@ -178,10 +183,15 @@ class TreeOfThought:
             scored_outputs.append((score, -idx, out))
 
         best_score, neg_idx, best_output = max(scored_outputs, key=lambda t: (t[0], t[1]))
+        branch_scores = [score for score, _, _ in scored_outputs]
         logger.info("Selected best branch (#%d) with score %d", -neg_idx + 1, best_score)
         self._emit_orchestration(
             phase="tot",
             action="branch_selected",
             selected_branch=-neg_idx + 1,
+            branch_total=len(outputs),
+            selector="judge",
+            score=best_score,
+            scores=branch_scores,
         )
         return best_output

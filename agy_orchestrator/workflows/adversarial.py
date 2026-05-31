@@ -99,6 +99,15 @@ class AdversarialReview:
         except Exception:
             pass
 
+    def _iteration_outcome(self) -> str:
+        if self.verified:
+            return "verified"
+        if self.approved:
+            return "approved"
+        if self.stalled:
+            return "stalled"
+        return "continue"
+
     async def execute(self, initial_prompt: str) -> str:
         current_prompt = initial_prompt
         last_output = ""
@@ -112,6 +121,8 @@ class AdversarialReview:
                 action="iteration_started",
                 iteration=iteration + 1,
                 iteration_total=self.max_iterations,
+                model=getattr(self.generator, "model", None),
+                effort=getattr(self.generator, "effort", None),
             )
 
             self.generator.prompt = current_prompt
@@ -132,6 +143,9 @@ class AdversarialReview:
                         action="iteration_completed",
                         iteration=iteration + 1,
                         iteration_total=self.max_iterations,
+                        outcome=self._iteration_outcome(),
+                        verified=self.verified,
+                        approved=self.approved,
                     )
                     return last_output
                 logger.info("Programmatic verification failed. Sending back to generator.")
@@ -145,6 +159,16 @@ class AdversarialReview:
                     f"version. Re-read the requirement for edge cases; keep everything that "
                     f"already works unchanged."
                 )
+                if iteration + 1 < self.max_iterations:
+                    self._emit_orchestration(
+                        phase="adversarial",
+                        action="iteration_completed",
+                        iteration=iteration + 1,
+                        iteration_total=self.max_iterations,
+                        outcome=self._iteration_outcome(),
+                        verified=self.verified,
+                        approved=self.approved,
+                    )
                 continue
 
             # LLM Critic Gate
@@ -179,6 +203,9 @@ class AdversarialReview:
                     action="iteration_completed",
                     iteration=iteration + 1,
                     iteration_total=self.max_iterations,
+                    outcome=self._iteration_outcome(),
+                    verified=self.verified,
+                    approved=self.approved,
                 )
                 return last_output
 
@@ -195,6 +222,9 @@ class AdversarialReview:
                     action="iteration_completed",
                     iteration=iteration + 1,
                     iteration_total=self.max_iterations,
+                    outcome=self._iteration_outcome(),
+                    verified=self.verified,
+                    approved=self.approved,
                 )
                 return last_output
             prev_feedback_norm = fb_norm
@@ -217,6 +247,16 @@ class AdversarialReview:
                 f"Critic Feedback:\n{critic_feedback}\n\n"
                 f"{revise_instruction}"
             )
+            if iteration + 1 < self.max_iterations:
+                self._emit_orchestration(
+                    phase="adversarial",
+                    action="iteration_completed",
+                    iteration=iteration + 1,
+                    iteration_total=self.max_iterations,
+                    outcome=self._iteration_outcome(),
+                    verified=self.verified,
+                    approved=self.approved,
+                )
 
         logger.warning(f"Max iterations ({self.max_iterations}) reached without Critic approval.")
         if self.max_iterations > 0:
@@ -225,5 +265,8 @@ class AdversarialReview:
                 action="iteration_completed",
                 iteration=self.max_iterations,
                 iteration_total=self.max_iterations,
+                outcome=self._iteration_outcome(),
+                verified=self.verified,
+                approved=self.approved,
             )
         return last_output
