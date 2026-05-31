@@ -1,5 +1,5 @@
 import { getArtifact, getRun } from '../api.js';
-import { StreamRenderer } from '../components/stream.js';
+import { mountRunRenderers } from '../components/mode_render.js';
 
 function esc(value) {
     return String(value ?? '')
@@ -67,6 +67,7 @@ export async function renderRunDetail(container, runId) {
 
     const bodyEl = document.getElementById('run-detail-body');
     const tabButtons = Array.from(container.querySelectorAll('.tab-btn'));
+    let streamViewDestroy = null;
 
     async function renderTab(tab) {
         for (const btn of tabButtons) {
@@ -74,14 +75,19 @@ export async function renderRunDetail(container, runId) {
         }
 
         if (tab === 'stream') {
+            if (streamViewDestroy) {
+                streamViewDestroy();
+                streamViewDestroy = null;
+            }
             const host = document.createElement('div');
             bodyEl.innerHTML = '';
             bodyEl.appendChild(host);
-            const renderer = new StreamRenderer(host);
+            const rendererView = mountRunRenderers(host, runId);
+            streamViewDestroy = () => rendererView.destroy();
             try {
                 const raw = await getArtifact(runId, 'events');
                 for (const evt of parseEventsNdjson(raw)) {
-                    renderer.appendEvent(evt);
+                    rendererView.appendEvent(evt);
                 }
             } catch (_err) {
                 const msg = document.createElement('p');
@@ -89,6 +95,11 @@ export async function renderRunDetail(container, runId) {
                 bodyEl.appendChild(msg);
             }
             return;
+        }
+
+        if (streamViewDestroy) {
+            streamViewDestroy();
+            streamViewDestroy = null;
         }
 
         if (tab === 'quality') {

@@ -47,6 +47,7 @@ def _parse_sse_block(lines: list[str]) -> dict:
 def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
     runs_dir = tmp_path / "runs"
     monkeypatch.setattr(dispatch_mod, "RUNS_DIR", runs_dir)
+    dispatch_calls: list[dict] = []
 
     def fake_dispatch(
         instruction: str,
@@ -60,12 +61,14 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
         cycles: int = 2,
         max_iterations: int = 5,
         branches: int = 3,
+        out_dir: str | None = None,
         test_cmd=None,
         web_search: bool = False,
         dashboard_stream_json: bool = False,
     ) -> DispatchResult:
         assert dashboard_stream_json is True
         assert run_id is not None
+        dispatch_calls.append({"run_id": run_id, "out_dir": out_dir})
         run_dir = runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         events_path = run_dir / "events.jsonl"
@@ -137,10 +140,13 @@ def test_dashboard_api_dispatch_and_sse(tmp_path: Path, monkeypatch):
             "mode": "direct",
             "generator_chain": ["codex"],
             "critic_chain": ["agy"],
+            "out_dir": str(tmp_path / "target-repo"),
         },
     )
     assert resp.status_code == 200
     run_id = resp.json()["run_id"]
+    assert dispatch_calls
+    assert dispatch_calls[-1]["out_dir"] == str(tmp_path / "target-repo")
 
     live = client.get("/api/live")
     assert live.status_code == 200

@@ -27,6 +27,7 @@ class DispatchRequest(BaseModel):
     cycles: int = Field(default=2, ge=1)
     max_iterations: int = Field(default=5, ge=1)
     branches: int = Field(default=3, ge=1)
+    out_dir: Optional[str] = None
 
 
 def _parse_chain_csv(raw: Optional[str], default: list[str]) -> list[str]:
@@ -54,6 +55,7 @@ async def _run_dispatch(request: Request, run_id: str, payload: DispatchRequest)
             cycles=payload.cycles,
             max_iterations=payload.max_iterations,
             branches=payload.branches,
+            out_dir=payload.out_dir,
             dashboard_stream_json=True,
         )
         done_payload = {

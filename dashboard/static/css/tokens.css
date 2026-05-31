@@ -5,6 +5,10 @@
   --fg-0: #e8e8ea;  --fg-1: #9c9ca3;  --fg-2: #5c5c64;
   --accent: #7cc4ff;
   --good: #6fcf97;  --warn: #f2c94c;  --bad: #eb5757;
+  --plan-pending: #7c7c86;
+  --plan-active: var(--accent);
+  --plan-done: var(--good);
+  --plan-failed: var(--bad);
   /* worker tags */
   --codex:  #6c9eff;  --claude: #ff9b6c;
   --agy:    #7fd49a;  --grok:   #b48cff;
@@ -21,6 +25,10 @@ html.light {
   --line: #d1d1d6;
   --fg-0: #1c1c1e;  --fg-1: #8e8e93;  --fg-2: #aeaeb2;
   --accent: #007aff;
+  --plan-pending: #9a9aa1;
+  --plan-active: var(--accent);
+  --plan-done: #1f9c52;
+  --plan-failed: #d53333;
   --codex:  #0040dd;  --claude: #d94000;
   --agy:    #009030;  --grok:   #6a00ff;
 }

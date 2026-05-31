@@ -1,6 +1,6 @@
 import { getBudget, getRuns, postDispatch } from '../api.js';
 import { subscribe } from '../sse.js';
-import { StreamRenderer } from '../components/stream.js';
+import { mountRunRenderers } from '../components/mode_render.js';
 
 const WORKERS = ['codex', 'agy', 'grok'];
 
@@ -43,6 +43,10 @@ export function renderDispatch(container) {
             <div class="form-group">
                 <label for="d-test-cmd">Test Command</label>
                 <input type="text" id="d-test-cmd" placeholder="python -m pytest -q">
+            </div>
+            <div class="form-group">
+                <label for="d-out-dir">Output Directory (--out-dir)</label>
+                <input type="text" id="d-out-dir" placeholder="/path/to/target/repo">
             </div>
             <div class="form-group inline-checks">
                 <label><input type="checkbox" id="d-web"> web-search</label>
@@ -118,6 +122,7 @@ export function renderDispatch(container) {
         const noFallback = document.getElementById('d-no-fallback').checked;
         const webSearch = document.getElementById('d-web').checked;
         const testCmd = document.getElementById('d-test-cmd').value.trim();
+        const outDir = document.getElementById('d-out-dir').value.trim();
 
         const payload = {
             instruction: inst,
@@ -129,6 +134,9 @@ export function renderDispatch(container) {
         };
         if (mode === 'adversarial') {
             payload.critic_chain = critic.length ? critic : undefined;
+        }
+        if (outDir) {
+            payload.out_dir = outDir;
         }
 
         try {
@@ -142,15 +150,16 @@ export function renderDispatch(container) {
 
             const holder = document.getElementById('d-stream-container');
             holder.style.display = 'block';
-            holder.innerHTML = `<h3>Run: ${res.run_id}</h3><div id="d-stream"></div>`;
-            const renderer = new StreamRenderer(document.getElementById('d-stream'));
+            holder.innerHTML = `<h3>Run: ${res.run_id}</h3><div id="d-stream"></div><p id="d-stream-status" class="live-meta"></p>`;
+            const rendererView = mountRunRenderers(document.getElementById('d-stream'), res.run_id);
             subscribe(
                 res.run_id,
-                (event) => renderer.appendEvent(event),
+                (event) => rendererView.appendEvent(event),
                 () => {
-                    const p = document.createElement('p');
-                    p.textContent = '[done]';
-                    renderer.viewport.appendChild(p);
+                    const status = document.getElementById('d-stream-status');
+                    if (status) {
+                        status.textContent = '[done]';
+                    }
                 },
                 (err) => {
                     console.error('SSE error', err);

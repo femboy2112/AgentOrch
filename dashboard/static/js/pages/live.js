@@ -1,6 +1,6 @@
 import { getBudget, getLive } from '../api.js';
 import { subscribe } from '../sse.js';
-import { StreamRenderer } from '../components/stream.js';
+import { mountRunRenderers } from '../components/mode_render.js';
 
 function elapsed(startedAt) {
     const age = Math.max(0, Date.now() / 1000 - Number(startedAt || 0));
@@ -75,13 +75,13 @@ export async function renderLive(container) {
             }
         });
 
-        const renderer = new StreamRenderer(streamHost);
-        wires.push({ run, renderer, tokensEl, budgetEl });
+        const rendererView = mountRunRenderers(streamHost, run.run_id);
+        wires.push({ run, rendererView, tokensEl, budgetEl });
     }
 
     // Now fire every budget fetch in parallel; whichever resolves first
     // updates its budget cell. None blocks any other run's SSE subscription.
-    for (const { run, renderer, tokensEl, budgetEl } of wires) {
+    for (const { run, rendererView, tokensEl, budgetEl } of wires) {
         let outTokens = 0;
         let maxBytes = 0;
         // Start the SSE subscription immediately — don't wait on the
@@ -90,7 +90,7 @@ export async function renderLive(container) {
         subscribe(
             run.run_id,
             (e) => {
-                renderer.appendEvent(e);
+                rendererView.appendEvent(e);
                 if (e.kind === 'usage') {
                     outTokens += Number(e.data?.out_tokens || 0);
                     tokensEl.textContent = `tokens=${outTokens}`;

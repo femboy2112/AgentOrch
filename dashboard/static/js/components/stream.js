@@ -26,7 +26,7 @@ function eventFilterKind(e) {
     return 'messages';
 }
 
-export class StreamRenderer {
+export class ProfessionalRenderer {
     constructor(container) {
         this.container = container;
         this.lastEvent = null;
@@ -223,3 +223,6 @@ export class StreamRenderer {
         this.lastEvent = e;
     }
 }
+
+// Backward compatibility for existing imports while pages are migrated.
+export const StreamRenderer = ProfessionalRenderer;

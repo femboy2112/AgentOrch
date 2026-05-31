@@ -17,6 +17,7 @@ def test_dashboard_shell_serves_index_and_static_assets() -> None:
     assert root.status_code == 200
     assert "AgentOrch Dashboard" in root.text
     assert "/static/js/app.js" in root.text
+    assert 'id="presentation-toggle"' in root.text
 
     dispatch = client.get("/dispatch")
     assert dispatch.status_code == 200
@@ -41,3 +42,19 @@ def test_dashboard_shell_serves_index_and_static_assets() -> None:
     detail_js = client.get("/static/js/pages/run_detail.js")
     assert detail_js.status_code == 200
     assert "renderRunDetail" in detail_js.text
+
+    mode_js = client.get("/static/js/presentation_mode.js")
+    assert mode_js.status_code == 200
+    assert "setMode" in mode_js.text
+
+    store_js = client.get("/static/js/run_event_store.js")
+    assert store_js.status_code == 200
+    assert "RunEventStore" in store_js.text
+
+    plan_js = client.get("/static/js/components/plan_renderer.js")
+    assert plan_js.status_code == 200
+    assert "FriendlyPlanRenderer" in plan_js.text
+
+    scheduler_js = client.get("/static/js/render_scheduler.js")
+    assert scheduler_js.status_code == 200
+    assert "RenderScheduler" in scheduler_js.text
