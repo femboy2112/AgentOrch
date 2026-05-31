@@ -1,5 +1,6 @@
 import { getArtifact, getRun } from '../api.js';
 import { mountRunRenderers } from '../components/mode_render.js';
+import { getMode, onModeChange } from '../presentation_mode.js';
 
 function esc(value) {
     return String(value ?? '')
@@ -46,6 +47,10 @@ function renderMetaValue(value, label, title) {
 }
 
 export async function renderRunDetail(container, runId) {
+    if (typeof container._runDetailCleanup === 'function') {
+        container._runDetailCleanup();
+        container._runDetailCleanup = null;
+    }
     container.innerHTML = '<h2>Run Detail</h2><div class="card">Loading...</div>';
 
     let payload;
@@ -61,7 +66,7 @@ export async function renderRunDetail(container, runId) {
 
     container.innerHTML = `
         <h2>Run ${esc(runId)}</h2>
-        <div class="card run-header">
+        <div class="card run-header run-meta">
             <div><strong>Mode:</strong> ${renderMetaValue(meta.mode, 'Mode not recorded', 'Run metadata did not include a mode value.')}</div>
             <div><strong>Generator:</strong> ${renderMetaValue(formatChain(meta.generator), 'Generator chain not recorded', 'Run metadata did not include a generator chain.')}</div>
             <div><strong>Critic:</strong> ${renderMetaValue(formatChain(meta.critic || ''), 'Critic chain not used', 'This run mode may not use a critic chain, or it was not recorded.')}</div>
@@ -78,8 +83,16 @@ export async function renderRunDetail(container, runId) {
     `;
 
     const bodyEl = document.getElementById('run-detail-body');
+    const runMetaEl = container.querySelector('.run-meta');
     const tabButtons = Array.from(container.querySelectorAll('.tab-btn'));
     let streamViewDestroy = null;
+    const applyMode = (mode) => {
+        if (runMetaEl) {
+            runMetaEl.hidden = mode === 'friendly';
+        }
+    };
+    const offMode = onModeChange((mode) => applyMode(mode));
+    applyMode(getMode());
 
     async function renderTab(tab) {
         for (const btn of tabButtons) {
@@ -94,7 +107,7 @@ export async function renderRunDetail(container, runId) {
             const host = document.createElement('div');
             bodyEl.innerHTML = '';
             bodyEl.appendChild(host);
-            const rendererView = mountRunRenderers(host, runId);
+            const rendererView = mountRunRenderers(host, runId, { runMeta: meta });
             streamViewDestroy = () => rendererView.destroy();
             try {
                 const raw = await getArtifact(runId, 'events');
@@ -146,6 +159,14 @@ export async function renderRunDetail(container, runId) {
             renderTab(btn.dataset.tab);
         });
     });
+
+    container._runDetailCleanup = () => {
+        offMode();
+        if (streamViewDestroy) {
+            streamViewDestroy();
+            streamViewDestroy = null;
+        }
+    };
 
     await renderTab('stream');
 }

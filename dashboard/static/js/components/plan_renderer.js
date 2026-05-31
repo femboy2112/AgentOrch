@@ -38,15 +38,15 @@ function formatDuration(secondsRaw) {
 
 function iconForStatus(status) {
     if (status === 'done') {
-        return '[ok]';
+        return '[ OK ]';
     }
     if (status === 'failed') {
-        return '[x]';
+        return '[FAIL]';
     }
     if (status === 'active') {
-        return '[*]';
+        return '[ RUN ]';
     }
-    return '[ ]';
+    return '[ .. ]';
 }
 
 function latestTransition(events) {
@@ -93,20 +93,26 @@ function statusLine(snapshot) {
         }
     }
     if (phase === 'tot' && action === 'branch_selected') {
-        return `Picked branch ${transition.selected_branch || '?'}${transition.score !== undefined ? ` (score ${transition.score})` : ''}`;
+        const branchTotal = Number(transition.branch_total ?? transition.branchTotal);
+        const score = Number(transition.score);
+        const scoreText = Number.isFinite(score) ? ` (${score.toFixed(1)}/10)` : '';
+        if (Number.isFinite(branchTotal) && branchTotal > 1) {
+            return `Explored ${branchTotal} approaches${scoreText}`;
+        }
+        return `Picked the best approach${scoreText}`;
     }
     if (phase === 'adversarial') {
         const idx = transition.step_index || '?';
         const iter = transition.iteration || '?';
         const iterTotal = transition.iteration_total || '?';
         if (action === 'iteration_started') {
-            return `Step ${idx} critic round ${iter}/${iterTotal}`;
+            return `Step ${idx} review pass ${iter} of ${iterTotal}`;
         }
         if (action === 'iteration_completed') {
             if (transition.outcome) {
-                return `Step ${idx} round ${iter}/${iterTotal} ${transition.outcome}`;
+                return `Step ${idx} pass ${iter} of ${iterTotal} ${transition.outcome}`;
             }
-            return `Step ${idx} critic round ${iter}/${iterTotal} complete`;
+            return `Step ${idx} review pass ${iter} of ${iterTotal} complete`;
         }
     }
     if (phase === 'fallback' && action === 'reroute') {
@@ -132,6 +138,15 @@ function chip(text, cls = '') {
     return `<span class="plan-chip ${cls}">${esc(text)}</span>`;
 }
 
+function kvChip(key, value, cls = '') {
+    const keyText = String(key || '').trim();
+    const valueText = String(value || '').trim();
+    if (!keyText || !valueText) {
+        return '';
+    }
+    return `<span class="plan-chip ${cls}"><span class="plan-chip-key">${esc(keyText)}:</span><span class="plan-chip-value">${esc(valueText)}</span></span>`;
+}
+
 function badge(text, cls = '') {
     if (!text) {
         return '';
@@ -154,15 +169,21 @@ function progressBar(current, total) {
     `;
 }
 
-function cleanModelEffort(meta) {
-    const model = String(meta?.model || '').trim();
-    const effort = String(meta?.effort || '').trim();
-    const modelSafe = model && model !== 'n/a' ? model : '';
-    const effortSafe = effort && effort !== 'n/a' ? effort : '';
-    if (!modelSafe && !effortSafe) {
+function cleanFieldValue(value) {
+    const text = String(value || '').trim();
+    if (!text) {
         return '';
     }
-    return [modelSafe, effortSafe].filter(Boolean).join(' / ');
+    return text.toLowerCase() === 'n/a' ? '' : text;
+}
+
+function modelEffortChips(meta) {
+    const model = cleanFieldValue(meta?.model);
+    const effort = cleanFieldValue(meta?.effort);
+    return [
+        model ? kvChip('model', model, 'plan-chip-model') : '',
+        effort ? kvChip('effort', effort, 'plan-chip-model') : '',
+    ].filter(Boolean).join('');
 }
 
 function usageChip(meta) {
@@ -179,17 +200,17 @@ function usageChip(meta) {
     if (costUsd > 0) {
         parts.push(`$${costUsd.toFixed(4)}`);
     }
-    return parts.join(' / ');
+    return parts.join(' · ');
 }
 
 function durationChip(node) {
     const started = asNumber(node.meta?.startedTs ?? node.started_ts);
     const ended = asNumber(node.meta?.endedTs ?? node.ended_ts);
     if (node.status === 'active' && started) {
-        return `<span class="plan-chip plan-chip-timer plan-live-timer" data-live-elapsed="1" data-start-ts="${started}">elapsed ${esc(formatDuration((Date.now() / 1000) - started))}</span>`;
+        return `<span class="plan-chip plan-chip-timer"><span class="plan-chip-key">elapsed:</span><span class="plan-chip-value plan-live-timer" data-live-elapsed="1" data-start-ts="${started}">${esc(formatDuration((Date.now() / 1000) - started))}</span></span>`;
     }
     if (started && ended && ended >= started) {
-        return chip(`duration ${formatDuration(ended - started)}`, 'plan-chip-timer');
+        return kvChip('duration', formatDuration(ended - started), 'plan-chip-timer');
     }
     return '';
 }
@@ -209,6 +230,110 @@ function outcomeBadge(meta) {
         return badge(outcome, 'plan-badge-neutral');
     }
     return '';
+}
+
+function totSummaryLabel(meta) {
+    const branchTotal = Number(meta?.branchTotal);
+    const score = Number(meta?.score);
+    const scoreText = Number.isFinite(score) ? ` (${score.toFixed(1)}/10)` : '';
+    if (Number.isFinite(branchTotal) && branchTotal > 1) {
+        return `Explored ${branchTotal} approaches · kept the best${scoreText}`;
+    }
+    return `Picked the best approach${scoreText}`;
+}
+
+function summarizeDurationSeconds(snapshot, meta) {
+    const candidates = [
+        meta?.duration_s,
+        meta?.duration,
+        meta?.durationSeconds,
+    ];
+    for (const value of candidates) {
+        const n = Number(value);
+        if (Number.isFinite(n) && n >= 0) {
+            return n;
+        }
+    }
+    let minStart = Number.POSITIVE_INFINITY;
+    let maxEnd = 0;
+    const now = Date.now() / 1000;
+    for (const node of snapshot.nodes || []) {
+        const started = asNumber(node.meta?.startedTs ?? node.started_ts);
+        if (started && started > 0) {
+            minStart = Math.min(minStart, started);
+        }
+        const ended = asNumber(node.meta?.endedTs ?? node.ended_ts);
+        if (ended && ended > 0) {
+            maxEnd = Math.max(maxEnd, ended);
+        } else if (node.status === 'active' && started) {
+            maxEnd = Math.max(maxEnd, now);
+        }
+    }
+    if (Number.isFinite(minStart) && maxEnd >= minStart) {
+        return maxEnd - minStart;
+    }
+    return null;
+}
+
+function changedFilesCount(meta) {
+    if (Array.isArray(meta?.changed_files)) {
+        return meta.changed_files.length;
+    }
+    const numeric = Number(meta?.changed_files_count ?? meta?.changedFiles);
+    if (Number.isFinite(numeric) && numeric >= 0) {
+        return Math.floor(numeric);
+    }
+    return null;
+}
+
+function deriveRunSummaryStatus(snapshot, meta) {
+    const statuses = (snapshot.nodes || []).map((node) => String(node.status || ''));
+    if (statuses.includes('failed') || meta?.success === false) {
+        return { icon: '✗', text: 'RUN FAILED' };
+    }
+    if (statuses.includes('active')) {
+        return { icon: '▶', text: 'RUNNING' };
+    }
+    const planNode = (snapshot.nodes || []).find((node) => node.id === 'plan');
+    if (meta?.success === true || planNode?.status === 'done') {
+        return { icon: '✅', text: 'RUN COMPLETE' };
+    }
+    return { icon: '▶', text: 'RUNNING' };
+}
+
+function stepProgressText(stepNodes, planNode, snapshot) {
+    const totalRaw = Number(
+        planNode?.meta?.step_total
+        ?? snapshot?.step_total
+        ?? stepNodes.length
+        ?? 0,
+    );
+    const total = Number.isFinite(totalRaw) && totalRaw > 0 ? totalRaw : 0;
+    if (total <= 0) {
+        return '';
+    }
+    const done = stepNodes.filter((node) => node.status === 'done').length;
+    const active = stepNodes.filter((node) => node.status === 'active').length;
+    const completed = Math.min(total, done + active);
+    return `${completed}/${total} steps`;
+}
+
+function buildFriendlyHero(snapshot, meta, stepNodes, planNode) {
+    const status = deriveRunSummaryStatus(snapshot, meta);
+    const parts = [`${status.icon} ${status.text}`];
+    const progress = stepProgressText(stepNodes, planNode, snapshot);
+    if (progress) {
+        parts.push(progress);
+    }
+    const durationSeconds = summarizeDurationSeconds(snapshot, meta);
+    if (durationSeconds !== null) {
+        parts.push(formatDuration(durationSeconds));
+    }
+    const files = changedFilesCount(meta);
+    if (files !== null) {
+        parts.push(`${files} file${files === 1 ? '' : 's'} changed`);
+    }
+    return `> ${parts.join(' · ')}`;
 }
 
 function fallbackReasonBadge(meta) {
@@ -272,7 +397,7 @@ function stepRoadmapHtml(planNode, stepNodes) {
 
 function nodeHtml(node, context) {
     const meta = node.meta || {};
-    const modelEffort = cleanModelEffort(meta);
+    const modelEffort = modelEffortChips(meta);
     const usage = usageChip(meta);
     const duration = durationChip(node);
 
@@ -297,8 +422,8 @@ function nodeHtml(node, context) {
             ? `<div class="plan-activity">${esc(meta.activity)}</div>`
             : '';
         const chips = [
-            modelEffort ? chip(modelEffort, 'plan-chip-model') : '',
-            usage ? chip(usage, 'plan-chip-usage') : '',
+            modelEffort,
+            usage ? kvChip('usage', usage, 'plan-chip-usage') : '',
             duration,
         ].filter(Boolean).join('');
         return `
@@ -315,15 +440,11 @@ function nodeHtml(node, context) {
     }
 
     if (node.type === 'tot') {
-        const selectedBranch = meta.selected_branch ?? '?';
-        const branchTotal = meta.branchTotal ?? '?';
-        const selector = meta.selector ? ` by ${meta.selector}` : '';
-        const score = Number.isFinite(Number(meta.score)) ? `, score ${Number(meta.score).toFixed(3)}` : '';
         return `
             <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">Picked branch ${esc(selectedBranch)} of ${esc(branchTotal)}${esc(score)}${esc(selector)}</div>
+                    <div class="plan-node-label">${esc(totSummaryLabel(meta))}</div>
                 </div>
             </div>
         `;
@@ -334,16 +455,16 @@ function nodeHtml(node, context) {
         const iterTotal = Number(meta.iteration_total || 0) || '?';
         const iterProgress = Number(iter) > 0 && Number(iterTotal) > 0
             ? progressBar(iter, iterTotal)
-            : '<div class="plan-progress plan-progress-empty"><span>Critic progress unavailable</span></div>';
+            : '<div class="plan-progress plan-progress-empty"><span>Review progress unavailable</span></div>';
         const chips = [
             outcomeBadge(meta),
-            modelEffort ? chip(modelEffort, 'plan-chip-model') : '',
+            modelEffort,
         ].filter(Boolean).join('');
         return `
             <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">Critic round ${esc(iter)}/${esc(iterTotal)}</div>
+                    <div class="plan-node-label">Review pass ${esc(iter)} of ${esc(iterTotal)}</div>
                     ${iterProgress}
                     ${chips ? `<div class="plan-chip-row">${chips}</div>` : ''}
                 </div>
@@ -383,10 +504,16 @@ function nodeHtml(node, context) {
 }
 
 export class FriendlyPlanRenderer {
-    constructor(container) {
+    constructor(container, options = {}) {
         this.container = container;
+        this.runMeta = options.runMeta && typeof options.runMeta === 'object' ? options.runMeta : {};
         this.lastSignature = '';
         this._timerInterval = null;
+    }
+
+    setRunMeta(meta) {
+        this.runMeta = meta && typeof meta === 'object' ? meta : {};
+        this.lastSignature = '';
     }
 
     _updateLiveTimers() {
@@ -400,7 +527,7 @@ export class FriendlyPlanRenderer {
             if (!Number.isFinite(start) || start <= 0) {
                 continue;
             }
-            el.textContent = `elapsed ${formatDuration(nowTs - start)}`;
+            el.textContent = formatDuration(nowTs - start);
         }
     }
 
@@ -439,6 +566,7 @@ export class FriendlyPlanRenderer {
         const { nodeMap, children, stepNodes } = collectStepGroups(snapshot);
         const planNode = nodeMap.get('plan');
         const planHtml = planNode ? nodeHtml(planNode, { stepNodes, stepTotal: planNode?.meta?.step_total }) : '';
+        const heroLine = buildFriendlyHero(snapshot, this.runMeta, stepNodes, planNode);
         const badges = snapshot.inferred
             ? '<span class="plan-badge">inferred timeline - limited detail</span>'
             : (snapshot.limited_detail
@@ -483,9 +611,10 @@ export class FriendlyPlanRenderer {
         this.container.innerHTML = `
             <div class="friendly-plan">
                 <div class="friendly-head">
+                    <div class="friendly-hero">${esc(heroLine)}</div>
                     <div class="friendly-status">${esc(statusLine(snapshot))}</div>
                     <div class="friendly-counters">${esc(formatCounters(snapshot.counters || {}))}</div>
-                    ${badges}
+                    ${badges ? `<div class="friendly-badges">${badges}</div>` : ''}
                 </div>
                 <div class="friendly-diagram">
                     ${planHtml}

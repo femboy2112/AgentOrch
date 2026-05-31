@@ -4,7 +4,7 @@ import { getMode, onModeChange } from '../presentation_mode.js';
 import { runEventStore } from '../run_event_store.js';
 import { RenderScheduler } from '../render_scheduler.js';
 
-export function mountRunRenderers(container, runId) {
+export function mountRunRenderers(container, runId, options = {}) {
     container.innerHTML = '';
 
     const professionalHost = document.createElement('div');
@@ -17,7 +17,7 @@ export function mountRunRenderers(container, runId) {
     container.appendChild(friendlyHost);
 
     const professional = new ProfessionalRenderer(professionalHost);
-    const friendly = new FriendlyPlanRenderer(friendlyHost);
+    const friendly = new FriendlyPlanRenderer(friendlyHost, { runMeta: options.runMeta || {} });
     let professionalCursor = 0;
 
     function renderProfessional(snapshot) {
@@ -67,6 +67,10 @@ export function mountRunRenderers(container, runId) {
     return {
         appendEvent(event, eventId) {
             runEventStore.append(runId, event, eventId);
+        },
+        setRunMeta(meta) {
+            friendly.setRunMeta(meta);
+            scheduler.queueUpdate(runId);
         },
         destroy() {
             offStore();

@@ -436,27 +436,44 @@ input[type="text"], textarea, select {
     border-radius: var(--r-2);
     background: linear-gradient(180deg, var(--bg-1), var(--bg-0));
     padding: var(--s-4);
+    font-family: var(--font-mono);
+    position: relative;
+    overflow: hidden;
 }
 
-.friendly-head {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--s-2) var(--s-3);
+.friendly-plan .friendly-head {
+    display: grid;
+    gap: var(--s-2);
     margin-bottom: var(--s-4);
 }
 
-.friendly-status {
+.friendly-plan .friendly-hero {
+    border: 1px solid var(--line);
+    border-radius: var(--r-2);
+    background: var(--bg-0);
+    color: var(--fg-0);
+    padding: var(--s-2) var(--s-3);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.friendly-plan .friendly-status {
     font-weight: 600;
 }
 
-.friendly-counters {
+.friendly-plan .friendly-counters {
     color: var(--fg-1);
-    font-family: var(--font-mono);
     font-size: 0.9rem;
 }
 
-.plan-badge {
+.friendly-plan .friendly-badges {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    flex-wrap: wrap;
+}
+
+.friendly-plan .plan-badge {
     border: 1px solid var(--line);
     border-radius: 999px;
     padding: 2px 8px;
@@ -464,12 +481,12 @@ input[type="text"], textarea, select {
     font-size: 0.8rem;
 }
 
-.friendly-diagram {
+.friendly-plan .friendly-diagram {
     display: grid;
     gap: var(--s-3);
 }
 
-.plan-step-group {
+.friendly-plan .plan-step-group {
     margin-left: var(--s-4);
     padding-left: var(--s-4);
     border-left: 2px solid var(--line);
@@ -477,13 +494,13 @@ input[type="text"], textarea, select {
     gap: var(--s-2);
 }
 
-.plan-step-children {
+.friendly-plan .plan-step-children {
     display: grid;
     gap: var(--s-2);
     margin-left: var(--s-4);
 }
 
-.plan-node {
+.friendly-plan .plan-node {
     display: flex;
     gap: var(--s-2);
     align-items: flex-start;
@@ -494,40 +511,50 @@ input[type="text"], textarea, select {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-    .plan-node,
-    .plan-progress-fill,
-    .plan-badge-item,
-    .plan-chip {
+    .friendly-plan .plan-node,
+    .friendly-plan .plan-progress-fill,
+    .friendly-plan .plan-badge-item,
+    .friendly-plan .plan-chip {
         transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease, opacity 180ms ease, width 240ms ease;
     }
 }
 
-.plan-node[data-status="pending"] {
+.friendly-plan .plan-node[data-status="pending"] {
     border-color: var(--plan-pending);
     color: var(--fg-1);
 }
 
-.plan-node[data-status="active"] {
+.friendly-plan .plan-node[data-status="active"] {
     border-color: var(--plan-active);
     box-shadow: 0 0 0 1px var(--plan-active);
 }
 
-.plan-node[data-status="done"] {
+.friendly-plan .plan-node[data-status="done"] {
     border-color: var(--plan-done);
 }
 
-.plan-node[data-status="failed"] {
+.friendly-plan .plan-node[data-status="failed"] {
     border-color: var(--plan-failed);
 }
 
-.plan-node-icon {
-    width: 1.2rem;
-    line-height: 1.2rem;
-    font-size: 0.95rem;
+.friendly-plan .plan-node-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 3.8rem;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    padding: 1px 8px;
+    line-height: 1.1;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
     color: var(--plan-pending);
+    background: var(--bg-0);
 }
 
-.plan-node[data-status="active"] .plan-node-icon {
+.friendly-plan .plan-node[data-status="active"] .plan-node-icon {
     color: var(--plan-active);
 }
 
@@ -535,42 +562,42 @@ input[type="text"], textarea, select {
    pegs software-GL compositors (e.g. swiftshader) and never lets the frame settle,
    which also breaks automated/computer-use perception of the view. */
 @media (prefers-reduced-motion: no-preference) {
-    .plan-node[data-status="active"] .plan-node-icon {
+    .friendly-plan .plan-node[data-status="active"] .plan-node-icon {
         animation: plan-pulse 1.2s ease-in-out infinite;
     }
 }
 
-.plan-node[data-status="done"] .plan-node-icon {
+.friendly-plan .plan-node[data-status="done"] .plan-node-icon {
     color: var(--plan-done);
 }
 
-.plan-node[data-status="failed"] .plan-node-icon {
+.friendly-plan .plan-node[data-status="failed"] .plan-node-icon {
     color: var(--plan-failed);
 }
 
-.plan-node-body {
+.friendly-plan .plan-node-body {
     display: grid;
     gap: var(--s-1);
     min-width: 0;
     width: 100%;
 }
 
-.plan-node-label {
+.friendly-plan .plan-node-label {
     font-weight: 500;
 }
 
-.plan-node-note {
+.friendly-plan .plan-node-note {
     color: var(--fg-1);
     font-size: 0.86rem;
 }
 
-.plan-chip-row {
+.friendly-plan .plan-chip-row {
     display: flex;
     flex-wrap: wrap;
     gap: var(--s-1);
 }
 
-.plan-chip {
+.friendly-plan .plan-chip {
     display: inline-flex;
     align-items: center;
     gap: 4px;
@@ -583,26 +610,33 @@ input[type="text"], textarea, select {
     max-width: 100%;
 }
 
-.plan-chip-model {
+.friendly-plan .plan-chip-key {
+    opacity: 0.85;
+}
+
+.friendly-plan .plan-chip-value {
+    font-weight: 600;
+}
+
+.friendly-plan .plan-chip-model {
     border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
 }
 
-.plan-chip-usage {
+.friendly-plan .plan-chip-usage {
     border-color: color-mix(in srgb, var(--good) 35%, var(--line));
 }
 
-.plan-chip-timer {
+.friendly-plan .plan-chip-timer {
     border-color: color-mix(in srgb, var(--plan-active) 50%, var(--line));
     color: var(--fg-0);
-    font-family: var(--font-mono);
 }
 
-.plan-progress {
+.friendly-plan .plan-progress {
     display: grid;
     gap: 2px;
 }
 
-.plan-progress-track {
+.friendly-plan .plan-progress-track {
     width: 100%;
     height: 8px;
     background: var(--bg-0);
@@ -611,24 +645,23 @@ input[type="text"], textarea, select {
     overflow: hidden;
 }
 
-.plan-progress-fill {
+.friendly-plan .plan-progress-fill {
     height: 100%;
     background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 80%, var(--bg-0)), var(--accent));
 }
 
-.plan-progress-label {
+.friendly-plan .plan-progress-label {
     font-size: 0.75rem;
     color: var(--fg-1);
-    font-family: var(--font-mono);
 }
 
-.plan-progress-empty .plan-progress-label,
-.plan-progress-empty span {
+.friendly-plan .plan-progress-empty .plan-progress-label,
+.friendly-plan .plan-progress-empty span {
     color: var(--fg-1);
     font-size: 0.75rem;
 }
 
-.plan-roadmap {
+.friendly-plan .plan-roadmap {
     list-style: none;
     margin: 0;
     padding: 0;
@@ -636,7 +669,7 @@ input[type="text"], textarea, select {
     gap: 2px;
 }
 
-.plan-roadmap-item {
+.friendly-plan .plan-roadmap-item {
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 6px;
@@ -645,21 +678,20 @@ input[type="text"], textarea, select {
     color: var(--fg-1);
 }
 
-.plan-roadmap-index {
+.friendly-plan .plan-roadmap-index {
     color: var(--fg-1);
-    font-family: var(--font-mono);
 }
 
-.plan-roadmap-item[data-status="done"] {
+.friendly-plan .plan-roadmap-item[data-status="done"] {
     color: color-mix(in srgb, var(--good) 70%, var(--fg-0));
 }
 
-.plan-roadmap-item[data-status="active"] {
+.friendly-plan .plan-roadmap-item[data-status="active"] {
     color: var(--fg-0);
     font-weight: 500;
 }
 
-.plan-activity {
+.friendly-plan .plan-activity {
     color: var(--fg-1);
     font-size: 0.83rem;
     white-space: nowrap;
@@ -667,7 +699,7 @@ input[type="text"], textarea, select {
     text-overflow: ellipsis;
 }
 
-.plan-badge-item {
+.friendly-plan .plan-badge-item {
     display: inline-flex;
     align-items: center;
     border: 1px solid var(--line);
@@ -676,33 +708,261 @@ input[type="text"], textarea, select {
     font-size: 0.75rem;
 }
 
-.plan-badge-ok {
+.friendly-plan .plan-badge-ok {
     border-color: color-mix(in srgb, var(--good) 50%, var(--line));
     color: var(--good);
 }
 
-.plan-badge-good {
+.friendly-plan .plan-badge-good {
     border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
     color: var(--accent);
 }
 
-.plan-badge-warn {
+.friendly-plan .plan-badge-warn {
     border-color: color-mix(in srgb, #d39f31 60%, var(--line));
     color: #d39f31;
 }
 
-.plan-badge-bad {
+.friendly-plan .plan-badge-bad {
     border-color: color-mix(in srgb, var(--bad) 55%, var(--line));
     color: var(--bad);
 }
 
-.plan-badge-usage {
+.friendly-plan .plan-badge-usage {
     border-color: color-mix(in srgb, #4ea4d9 60%, var(--line));
     color: #4ea4d9;
 }
 
-.plan-badge-neutral {
+.friendly-plan .plan-badge-neutral {
     color: var(--fg-1);
+}
+
+:root:not(.light) .friendly-plan {
+    --friendly-bg: #070a07;
+    --friendly-panel: #0b130d;
+    --friendly-panel-soft: #0f1b12;
+    --friendly-line: #1f3a2a;
+    --friendly-text: #33ff9c;
+    --friendly-text-dim: #9ecbb1;
+    --friendly-active: #ffb000;
+    --friendly-fail: #ff5c5c;
+    color: var(--friendly-text);
+    border-color: var(--friendly-line);
+    background: linear-gradient(180deg, #0a0f0a, var(--friendly-bg));
+    box-shadow: inset 0 0 0 1px rgba(51, 255, 156, 0.08);
+    text-shadow: 0 0 2px rgba(51, 255, 156, 0.22);
+}
+
+:root:not(.light) .friendly-plan .friendly-hero {
+    border-color: var(--friendly-line);
+    background: linear-gradient(180deg, rgba(51, 255, 156, 0.08), rgba(7, 10, 7, 0.75));
+    color: var(--friendly-text);
+    text-transform: uppercase;
+}
+
+:root:not(.light) .friendly-plan .friendly-status,
+:root:not(.light) .friendly-plan .friendly-counters,
+:root:not(.light) .friendly-plan .plan-node-note,
+:root:not(.light) .friendly-plan .plan-progress-label,
+:root:not(.light) .friendly-plan .plan-progress-empty span,
+:root:not(.light) .friendly-plan .plan-roadmap-item,
+:root:not(.light) .friendly-plan .plan-roadmap-index,
+:root:not(.light) .friendly-plan .plan-activity,
+:root:not(.light) .friendly-plan .plan-badge,
+:root:not(.light) .friendly-plan .plan-badge-neutral {
+    color: var(--friendly-text-dim);
+}
+
+:root:not(.light) .friendly-plan .plan-node {
+    border-color: var(--friendly-line);
+    background: linear-gradient(180deg, var(--friendly-panel), var(--friendly-bg));
+}
+
+:root:not(.light) .friendly-plan .plan-node[data-status="done"] {
+    border-color: color-mix(in srgb, var(--friendly-text) 65%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-node[data-status="active"] {
+    border-color: color-mix(in srgb, var(--friendly-active) 80%, var(--friendly-line));
+    box-shadow: 0 0 0 1px rgba(255, 176, 0, 0.45);
+}
+
+:root:not(.light) .friendly-plan .plan-node[data-status="failed"] {
+    border-color: color-mix(in srgb, var(--friendly-fail) 75%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-node-icon {
+    border-color: color-mix(in srgb, var(--friendly-line) 80%, var(--friendly-text) 20%);
+    background: var(--friendly-panel-soft);
+    color: var(--friendly-text-dim);
+    box-shadow: inset 0 0 0 1px rgba(51, 255, 156, 0.06);
+}
+
+:root:not(.light) .friendly-plan .plan-node[data-status="done"] .plan-node-icon {
+    color: var(--friendly-text);
+    border-color: color-mix(in srgb, var(--friendly-text) 75%, var(--friendly-line));
+    box-shadow: 0 0 8px rgba(51, 255, 156, 0.2);
+}
+
+:root:not(.light) .friendly-plan .plan-node[data-status="active"] .plan-node-icon {
+    color: var(--friendly-active);
+    border-color: color-mix(in srgb, var(--friendly-active) 70%, var(--friendly-line));
+    box-shadow: 0 0 8px rgba(255, 176, 0, 0.25);
+}
+
+:root:not(.light) .friendly-plan .plan-node[data-status="failed"] .plan-node-icon {
+    color: var(--friendly-fail);
+    border-color: color-mix(in srgb, var(--friendly-fail) 70%, var(--friendly-line));
+    box-shadow: 0 0 8px rgba(255, 92, 92, 0.28);
+}
+
+:root:not(.light) .friendly-plan .plan-node-label {
+    color: var(--friendly-text);
+}
+
+:root:not(.light) .friendly-plan .plan-chip {
+    border-color: var(--friendly-line);
+    background: var(--friendly-panel);
+    color: var(--friendly-text);
+}
+
+:root:not(.light) .friendly-plan .plan-chip-key {
+    color: var(--friendly-text-dim);
+}
+
+:root:not(.light) .friendly-plan .plan-chip-model {
+    border-color: color-mix(in srgb, var(--friendly-text) 38%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-chip-usage {
+    border-color: color-mix(in srgb, var(--friendly-active) 30%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-chip-timer {
+    border-color: color-mix(in srgb, var(--friendly-active) 50%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-progress-track {
+    border-color: var(--friendly-line);
+    background: #091009;
+}
+
+:root:not(.light) .friendly-plan .plan-progress-fill {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--friendly-active) 65%, #0d1a0f), var(--friendly-text));
+}
+
+:root:not(.light) .friendly-plan .plan-badge,
+:root:not(.light) .friendly-plan .plan-badge-item {
+    border-color: var(--friendly-line);
+    background: var(--friendly-panel);
+}
+
+:root:not(.light) .friendly-plan .plan-badge-good,
+:root:not(.light) .friendly-plan .plan-badge-ok {
+    color: var(--friendly-text);
+    border-color: color-mix(in srgb, var(--friendly-text) 55%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-badge-warn {
+    color: var(--friendly-active);
+    border-color: color-mix(in srgb, var(--friendly-active) 60%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-badge-bad {
+    color: var(--friendly-fail);
+    border-color: color-mix(in srgb, var(--friendly-fail) 60%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-badge-usage {
+    color: #79d6ff;
+    border-color: color-mix(in srgb, #79d6ff 60%, var(--friendly-line));
+}
+
+:root:not(.light) .friendly-plan .plan-step-group {
+    border-left: 0;
+    position: relative;
+    margin-left: calc(var(--s-4) + 4px);
+    padding-left: var(--s-4);
+}
+
+:root:not(.light) .friendly-plan .plan-step-group::before {
+    content: '';
+    position: absolute;
+    left: 8px;
+    top: -10px;
+    bottom: 14px;
+    border-left: 1px solid var(--friendly-line);
+}
+
+:root:not(.light) .friendly-plan .plan-step-group > .plan-node {
+    position: relative;
+}
+
+:root:not(.light) .friendly-plan .plan-step-group > .plan-node::before {
+    content: '';
+    position: absolute;
+    left: -16px;
+    top: 1rem;
+    width: 12px;
+    border-top: 1px solid var(--friendly-line);
+}
+
+:root:not(.light) .friendly-plan .plan-step-children {
+    margin-left: 10px;
+    padding-left: 18px;
+    position: relative;
+}
+
+:root:not(.light) .friendly-plan .plan-step-children::before {
+    content: '';
+    position: absolute;
+    left: 4px;
+    top: 0.25rem;
+    bottom: 1rem;
+    border-left: 1px solid var(--friendly-line);
+}
+
+:root:not(.light) .friendly-plan .plan-step-children > .plan-node {
+    position: relative;
+}
+
+:root:not(.light) .friendly-plan .plan-step-children > .plan-node::before {
+    content: '';
+    position: absolute;
+    left: -14px;
+    top: 1rem;
+    width: 10px;
+    border-top: 1px solid var(--friendly-line);
+}
+
+:root:not(.light) .friendly-plan .plan-step-children > .plan-node::after {
+    content: '';
+    position: absolute;
+    left: -14px;
+    top: 1rem;
+    bottom: -0.9rem;
+    border-left: 1px solid var(--friendly-line);
+}
+
+:root:not(.light) .friendly-plan .plan-step-children > .plan-node:last-child::after {
+    display: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    :root:not(.light) .friendly-plan::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: repeating-linear-gradient(
+            to bottom,
+            rgba(51, 255, 156, 0.04) 0,
+            rgba(51, 255, 156, 0.04) 1px,
+            transparent 1px,
+            transparent 3px
+        );
+        opacity: 0.18;
+    }
 }
 
 @keyframes plan-pulse {
@@ -724,6 +984,13 @@ input[type="text"], textarea, select {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--s-2) var(--s-4);
+}
+
+/* Friendly mode hides the professional meta strip in favour of the friendly hero.
+   Needs higher specificity than `.run-header { display: grid }` so the [hidden]
+   attribute actually takes effect (the UA `[hidden]` rule loses to the class rule). */
+.run-meta[hidden] {
+    display: none;
 }
 
 .tab-bar {
