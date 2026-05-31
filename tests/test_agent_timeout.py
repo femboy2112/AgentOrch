@@ -117,3 +117,63 @@ def test_timeout_disabled_when_zero(monkeypatch):
     agent.timeout = 0
     asyncio.run(agent.run_async())
     assert agent.returncode == 0
+
+
+class _StreamingAgent(_SleepAgent):
+    """Streams stderr every 0.3s for ~1.8s, then exits 0. Stands in for a long
+    but legitimate turn that keeps making visible progress."""
+
+    def build_command(self, piped_input=None):
+        return ["bash", "-c", "for i in $(seq 1 6); do echo work >&2; sleep 0.3; done"]
+
+
+def test_streaming_output_extends_past_base_timeout():
+    """#28: in stream mode the base `timeout` is the IDLE ceiling — a worker
+    that keeps emitting output runs past it (up to the absolute cap) instead of
+    being killed mid-progress. The worker streams for ~1.8s with a 1.0s base
+    timeout; under the old flat wall it would have been killed at 1.0s."""
+    agent = _StreamingAgent(prompt="x")
+    agent.event_callback = lambda e: None    # force stream_mode
+    agent.max_output_bytes = 0
+    agent.stall_seconds = 0                   # watchdog inert; liveness wait is the gate
+    agent.timeout = 1.0                       # idle window, below the ~1.8s total
+    agent.absolute_timeout = 10.0
+    agent.max_retries = 1
+
+    started = time.monotonic()
+    asyncio.run(agent.run_async())            # must NOT raise
+    elapsed = time.monotonic() - started
+
+    assert agent.returncode == 0
+    assert agent._watchdog_reason is None
+    # Ran past the 1.0s base timeout (proves extension) but nowhere near the cap.
+    assert elapsed > 1.0
+    assert elapsed < 9.0
+
+
+def test_streaming_idle_is_killed_at_window():
+    """#28 guard: extension must NOT mask a genuine hang. A worker that emits
+    once then goes silent past the idle window is still killed — even though it
+    produced output (so the stall watchdog, which only trips pre-first-token,
+    would not catch it)."""
+    class _EmitThenHang(_SleepAgent):
+        def build_command(self, piped_input=None):
+            return ["bash", "-c", "echo work >&2; sleep 10"]
+
+    agent = _EmitThenHang(prompt="x")
+    agent.event_callback = lambda e: None    # force stream_mode
+    agent.max_output_bytes = 0
+    agent.stall_seconds = 0                   # only the liveness idle check can kill here
+    agent.timeout = 1.0                       # idle window
+    agent.absolute_timeout = 30.0
+    agent.max_retries = 1
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio.run(agent.run_async())
+    elapsed = time.monotonic() - started
+
+    # Killed shortly after the 1.0s idle window (2s poll cadence), well before
+    # both the 10s sleep and the 30s absolute cap.
+    assert elapsed < 6.0
+    assert "timed out" in agent.stderr

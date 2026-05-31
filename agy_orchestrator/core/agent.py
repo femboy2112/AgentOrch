@@ -16,6 +16,13 @@ WATCHDOG_VERBOSE = "verbose"   # output bytes > per-config budget (rambling/loop
 WATCHDOG_STALLED = "stalled"   # no output for > stall_seconds and nothing produced
 WATCHDOG_MARKER = "[watchdog:"  # carried in self.stderr for downstream pattern matching
 
+# Default absolute-timeout multiple of `timeout` when AGY_ABSOLUTE_TIMEOUT is
+# unset: a streaming worker that keeps emitting output can extend its idle
+# deadline up to this many `timeout` windows before the hard wall-clock cap
+# fires. Bounds a worker that streams forever while still letting a legitimately
+# long slow-gate turn run several idle-windows past the base ceiling. (Issue #28)
+ABSOLUTE_TIMEOUT_FACTOR = 4.0
+
 # Substrings (lowercased) in stderr that indicate a usage/quota wall rather than
 # a transient error. Such a failure will NOT clear within a few seconds, so the
 # base run loop fails fast (no retry/backoff) and lets the fallback layer roll to
@@ -61,7 +68,22 @@ class AgentInstance(ABC):
         # the whole dispatch indefinitely. On timeout we kill it and fail fast so
         # the fallback chain can roll to the next provider. 0/unset disables.
         # Override per run with AGY_TIMEOUT (seconds).
+        #
+        # In streaming mode `timeout` is reinterpreted as the IDLE ceiling: the
+        # deadline is extended as long as the child keeps emitting output, so a
+        # legitimately long turn on a slow-test-gate repo (which streams edit/
+        # verify traces the whole time) is no longer discarded mid-progress. The
+        # extension is hard-capped by `absolute_timeout` below, and a full
+        # `timeout` window with NO new output is still treated as a kill. The
+        # non-streaming path keeps the flat wall-clock semantics. See issue #28.
         self.timeout = float(os.environ.get("AGY_TIMEOUT", "2400") or 0)
+        # Absolute wall-clock ceiling for a single streaming call — the hard cap
+        # on liveness-based extension. 0/unset => default to ABSOLUTE_TIMEOUT_FACTOR
+        # x timeout. Override with AGY_ABSOLUTE_TIMEOUT (seconds).
+        self.absolute_timeout = float(os.environ.get("AGY_ABSOLUTE_TIMEOUT", "0") or 0)
+        # Last time the child emitted output on either stream (monotonic). Shared
+        # between the stream drain, the watchdog, and the liveness-aware wait.
+        self._last_progress: float = 0.0
 
         # Streaming watchdog budgets (opt-in; 0/unset disables that signal).
         # max_output_bytes: kill if the child has emitted more than this on stdout.
@@ -273,7 +295,10 @@ class AgentInstance(ABC):
         # network blips looks like a stall under stdout-only progress tracking.
         out_total = [0]
         any_output = [False]
-        last_progress = [time.monotonic()]
+        # Reset the shared last-progress clock at the start of this attempt so a
+        # stale value from a prior attempt can't make the liveness wait think the
+        # child is already idle.
+        self._last_progress = time.monotonic()
 
         def _emit_line(line: bytes, echo: bool, stream: str) -> None:
             if echo:
@@ -312,7 +337,7 @@ class AgentInstance(ABC):
                 chunks.append(data)
                 # Either stream resets the stall clock — the watchdog cares
                 # about "is the worker doing anything", not "is stdout flowing".
-                last_progress[0] = time.monotonic()
+                self._last_progress = time.monotonic()
                 any_output[0] = True
                 if count:
                     # Byte budget tallies stdout only: runaway-verbose tax
@@ -345,7 +370,7 @@ class AgentInstance(ABC):
                                    out_total[0], max_output_bytes)
                     self._killpg_tree(process)
                     return
-                if stall_seconds > 0 and (time.monotonic() - last_progress[0]) > stall_seconds:
+                if stall_seconds > 0 and (time.monotonic() - self._last_progress) > stall_seconds:
                     # Only trip stall if NOTHING has been produced on EITHER stream
                     # yet. A worker that emitted, then went silent for one stall
                     # window, may be reasoning between bursts — the hard wall-timeout
@@ -403,6 +428,53 @@ class AgentInstance(ABC):
         except Exception:
             pass
 
+    def _absolute_cap(self) -> float:
+        """Hard wall-clock ceiling for a streaming call (0 = uncapped). Explicit
+        AGY_ABSOLUTE_TIMEOUT wins; otherwise default to a multiple of timeout."""
+        if self.absolute_timeout and self.absolute_timeout > 0:
+            return self.absolute_timeout
+        if self.timeout and self.timeout > 0:
+            return self.timeout * ABSOLUTE_TIMEOUT_FACTOR
+        return 0.0
+
+    async def _await_with_liveness(self, comm, attempt_start: float):
+        """Await a streaming call, extending the deadline while the child keeps
+        emitting output. Raises asyncio.TimeoutError when the child has produced
+        NO new output for a full `timeout` (idle) window, or when the absolute
+        wall-clock cap is reached — whichever comes first. This replaces the flat
+        `wait_for(comm, timeout)` for streaming runs so a legitimately long turn
+        that is still making visible progress isn't discarded mid-flight. (#28)"""
+        idle_window = self.timeout if self.timeout and self.timeout > 0 else 0.0
+        hard_cap = self._absolute_cap()
+        if idle_window <= 0 and hard_cap <= 0:
+            return await comm  # no ceiling at all
+        task = asyncio.ensure_future(comm)
+        try:
+            while True:
+                now = time.monotonic()
+                last = self._last_progress or attempt_start
+                if hard_cap > 0 and (now - attempt_start) >= hard_cap:
+                    raise asyncio.TimeoutError
+                if idle_window > 0 and (now - last) >= idle_window:
+                    raise asyncio.TimeoutError
+                slice_s = 2.0  # poll cadence; matches the watchdog tick
+                if idle_window > 0:
+                    slice_s = min(slice_s, max(idle_window - (now - last), 0.05))
+                if hard_cap > 0:
+                    slice_s = min(slice_s, max(hard_cap - (now - attempt_start), 0.05))
+                # asyncio.wait does NOT cancel the task on timeout (unlike
+                # wait_for), so the streaming call survives each poll slice.
+                done, _pending = await asyncio.wait({task}, timeout=max(slice_s, 0.05))
+                if task in done:
+                    return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
     async def run_async(self, piped_input: Optional[str] = None) -> str:
         """Run the agent CLI, retrying only on transient errors.
 
@@ -427,6 +499,7 @@ class AgentInstance(ABC):
             for attempt in range(1, self.max_retries + 1):
                 self._watchdog_reason = None
                 attempt_start = time.monotonic()
+                self._last_progress = attempt_start
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *cmd,
@@ -465,15 +538,22 @@ class AgentInstance(ABC):
                         comm = process.communicate(input=stdin_bytes)
 
                     try:
-                        if self.timeout and self.timeout > 0:
+                        if stream_mode:
+                            # Liveness-aware: extend while the child streams output,
+                            # capped by the absolute ceiling (#28).
+                            stdout_bytes, stderr_bytes = await self._await_with_liveness(
+                                comm, attempt_start)
+                        elif self.timeout and self.timeout > 0:
                             stdout_bytes, stderr_bytes = await asyncio.wait_for(comm, self.timeout)
                         else:
                             stdout_bytes, stderr_bytes = await comm
                     except asyncio.TimeoutError:
-                        logger.error("Agent subprocess exceeded %.0fs; killing and failing over.",
-                                     self.timeout)
+                        waited = time.monotonic() - attempt_start
+                        logger.error("Agent subprocess exceeded liveness/abs ceiling "
+                                     "(%.0fs elapsed, idle>%.0fs or cap %.0fs); killing and "
+                                     "failing over.", waited, self.timeout, self._absolute_cap())
                         await self._kill_current()
-                        self.stderr = f"timed out after {self.timeout:.0f}s"
+                        self.stderr = f"timed out after {waited:.0f}s"
                         self._emit_usage_event("", self.stderr, attempt=attempt, success=False)
                         raise RuntimeError(self.stderr)  # fail fast, no retry
 
