@@ -275,14 +275,41 @@ class AgentInstance(ABC):
         any_output = [False]
         last_progress = [time.monotonic()]
 
+        def _emit_line(line: bytes, echo: bool, stream: str) -> None:
+            if echo:
+                sys.stderr.buffer.write(line)
+                sys.stderr.buffer.flush()
+            text = line.decode(errors="replace")
+            try:
+                if stream == "stdout":
+                    events = self._events_from_stdout_line(text)
+                else:
+                    events = self._events_from_stderr_line(text)
+            except Exception:
+                events = []
+            for event in events:
+                self._emit_event(event)
+
         async def _drain(reader, chunks, echo: bool, count: bool, stream: str) -> None:
             if reader is None:
                 return
+            # Read fixed-size chunks instead of readline(): readline() on the
+            # default 64 KiB StreamReader raises LimitOverrunError ("Separator is
+            # not found, and chunk exceed the limit") on any single line longer
+            # than 64 KiB with no newline — common for claude emitting one long
+            # JSON payload — failing the attempt deterministically on every retry.
+            # Chunked reads are immune to line length. We still re-split on '\n'
+            # before dispatching to the per-line event consumers, because the
+            # stream-json adapters (load_json_line) require exactly one JSON
+            # object per line. The full byte stream is reconstructed identically
+            # from `chunks`, so raw_stdout / usage extraction are byte-for-byte
+            # unchanged. See issue #30.
+            buf = bytearray()
             while True:
-                line = await reader.readline()
-                if not line:
+                data = await reader.read(65536)
+                if not data:
                     break
-                chunks.append(line)
+                chunks.append(data)
                 # Either stream resets the stall clock — the watchdog cares
                 # about "is the worker doing anything", not "is stdout flowing".
                 last_progress[0] = time.monotonic()
@@ -291,20 +318,19 @@ class AgentInstance(ABC):
                     # Byte budget tallies stdout only: runaway-verbose tax
                     # (e.g. claude:haiku spitting 4528 tokens on calc3) lands
                     # on stdout. Stderr volume is normal worker chatter.
-                    out_total[0] += len(line)
-                if echo:
-                    sys.stderr.buffer.write(line)
-                    sys.stderr.buffer.flush()
-                text = line.decode(errors="replace")
-                try:
-                    if stream == "stdout":
-                        events = self._events_from_stdout_line(text)
-                    else:
-                        events = self._events_from_stderr_line(text)
-                except Exception:
-                    events = []
-                for event in events:
-                    self._emit_event(event)
+                    out_total[0] += len(data)
+                buf.extend(data)
+                # Emit every complete (newline-terminated) line; keep the partial
+                # remainder buffered for the next read.
+                nl = buf.find(b"\n")
+                while nl >= 0:
+                    _emit_line(bytes(buf[: nl + 1]), echo, stream)
+                    del buf[: nl + 1]
+                    nl = buf.find(b"\n")
+            # Flush any trailing newline-less final segment at EOF (matches the
+            # final non-terminated chunk readline() used to return).
+            if buf:
+                _emit_line(bytes(buf), echo, stream)
 
         async def _watchdog() -> None:
             # Poll every 2s; cheap relative to subprocess scheduling, fine-grained
@@ -407,6 +433,11 @@ class AgentInstance(ABC):
                         stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        # Raise the StreamReader buffer well above the 64 KiB
+                        # default so a long single-line worker payload never
+                        # overflows even on the rare code path that still buffers
+                        # a whole line (the chunked _drain is immune regardless).
+                        limit=8 * 1024 * 1024,
                         cwd=self.cwd,
                         env=self._child_env(),
                         # Own session/process group so the WHOLE worker tree is
