@@ -493,6 +493,15 @@ input[type="text"], textarea, select {
     padding: var(--s-2) var(--s-3);
 }
 
+@media (prefers-reduced-motion: no-preference) {
+    .plan-node,
+    .plan-progress-fill,
+    .plan-badge-item,
+    .plan-chip {
+        transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease, opacity 180ms ease, width 240ms ease;
+    }
+}
+
 .plan-node[data-status="pending"] {
     border-color: var(--plan-pending);
     color: var(--fg-1);
@@ -542,6 +551,8 @@ input[type="text"], textarea, select {
 .plan-node-body {
     display: grid;
     gap: var(--s-1);
+    min-width: 0;
+    width: 100%;
 }
 
 .plan-node-label {
@@ -551,6 +562,147 @@ input[type="text"], textarea, select {
 .plan-node-note {
     color: var(--fg-1);
     font-size: 0.86rem;
+}
+
+.plan-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s-1);
+}
+
+.plan-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 0.78rem;
+    color: var(--fg-1);
+    background: var(--bg-0);
+    max-width: 100%;
+}
+
+.plan-chip-model {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+}
+
+.plan-chip-usage {
+    border-color: color-mix(in srgb, var(--good) 35%, var(--line));
+}
+
+.plan-chip-timer {
+    border-color: color-mix(in srgb, var(--plan-active) 50%, var(--line));
+    color: var(--fg-0);
+    font-family: var(--font-mono);
+}
+
+.plan-progress {
+    display: grid;
+    gap: 2px;
+}
+
+.plan-progress-track {
+    width: 100%;
+    height: 8px;
+    background: var(--bg-0);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.plan-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 80%, var(--bg-0)), var(--accent));
+}
+
+.plan-progress-label {
+    font-size: 0.75rem;
+    color: var(--fg-1);
+    font-family: var(--font-mono);
+}
+
+.plan-progress-empty .plan-progress-label,
+.plan-progress-empty span {
+    color: var(--fg-1);
+    font-size: 0.75rem;
+}
+
+.plan-roadmap {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 2px;
+}
+
+.plan-roadmap-item {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px;
+    align-items: start;
+    font-size: 0.85rem;
+    color: var(--fg-1);
+}
+
+.plan-roadmap-index {
+    color: var(--fg-1);
+    font-family: var(--font-mono);
+}
+
+.plan-roadmap-item[data-status="done"] {
+    color: color-mix(in srgb, var(--good) 70%, var(--fg-0));
+}
+
+.plan-roadmap-item[data-status="active"] {
+    color: var(--fg-0);
+    font-weight: 500;
+}
+
+.plan-activity {
+    color: var(--fg-1);
+    font-size: 0.83rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.plan-badge-item {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 0.75rem;
+}
+
+.plan-badge-ok {
+    border-color: color-mix(in srgb, var(--good) 50%, var(--line));
+    color: var(--good);
+}
+
+.plan-badge-good {
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+    color: var(--accent);
+}
+
+.plan-badge-warn {
+    border-color: color-mix(in srgb, #d39f31 60%, var(--line));
+    color: #d39f31;
+}
+
+.plan-badge-bad {
+    border-color: color-mix(in srgb, var(--bad) 55%, var(--line));
+    color: var(--bad);
+}
+
+.plan-badge-usage {
+    border-color: color-mix(in srgb, #4ea4d9 60%, var(--line));
+    color: #4ea4d9;
+}
+
+.plan-badge-neutral {
+    color: var(--fg-1);
 }
 
 @keyframes plan-pulse {

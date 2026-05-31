@@ -15,6 +15,25 @@ function usageFromText(text) {
     };
 }
 
+function truncateText(value, maxLen = 160) {
+    const raw = String(value || '').trim();
+    if (raw.length <= maxLen) {
+        return raw;
+    }
+    return `${raw.slice(0, Math.max(0, maxLen - 3)).trimEnd()}...`;
+}
+
+function usageFromEvent(event) {
+    const textUsage = usageFromText(event.text);
+    const inTokens = toNumber(event.data?.in_tokens) || textUsage.in_tokens;
+    const outTokens = toNumber(event.data?.out_tokens) || textUsage.out_tokens;
+    const eventCostRaw = event.data?.cost_usd;
+    const eventCostAlt = event.data?.cost;
+    const eventCost = eventCostRaw !== undefined && eventCostRaw !== null ? eventCostRaw : eventCostAlt;
+    const cost = toNumber(eventCost) || toNumber(textUsage.cost_usd);
+    return { inTokens, outTokens, cost };
+}
+
 function normalizeEvent(workerEvent, runId) {
     const evt = workerEvent && typeof workerEvent === 'object' ? workerEvent : {};
     const data = evt.data && typeof evt.data === 'object' ? evt.data : {};
@@ -130,12 +149,15 @@ export class RunEventStore {
 
         if (phase === 'plan' && action === 'completed') {
             const total = Number.isFinite(state.step_total) ? state.step_total : '?';
+            const stepTitles = Array.isArray(o.step_titles)
+                ? o.step_titles.map((item) => truncateText(item, 120)).filter(Boolean)
+                : undefined;
             this._setNode(state, 'plan', {
                 type: 'plan',
                 label: `Plan (${total} steps)`,
                 status: 'done',
                 ended_ts: event.ts,
-                meta: { step_total: state.step_total },
+                meta: { step_total: state.step_total, stepTitles },
             });
             return true;
         }
@@ -159,7 +181,14 @@ export class RunEventStore {
                 label: `Step ${idx}/${total}`,
                 status: 'active',
                 started_ts: event.ts,
-                meta: { step_index: idx, step_total: state.step_total },
+                meta: {
+                    step_index: idx,
+                    step_total: state.step_total,
+                    title: truncateText(o.step_title, 120),
+                    model: o.model ? String(o.model) : undefined,
+                    effort: o.effort ? String(o.effort) : undefined,
+                    startedTs: event.ts,
+                },
             });
             this._ensureEdge(state, 'plan', nodeId);
             return true;
@@ -171,6 +200,10 @@ export class RunEventStore {
                     type: 'step',
                     status: 'done',
                     ended_ts: event.ts,
+                    meta: {
+                        title: truncateText(o.step_title, 120),
+                        endedTs: event.ts,
+                    },
                 });
             }
             return true;
@@ -184,7 +217,13 @@ export class RunEventStore {
                 label: `Picked branch ${branch}`,
                 status: 'done',
                 ended_ts: event.ts,
-                meta: { selected_branch: o.selected_branch },
+                meta: {
+                    selected_branch: o.selected_branch,
+                    branchTotal: Number.isFinite(Number(o.branch_total)) ? Number(o.branch_total) : undefined,
+                    selector: o.selector ? String(o.selector) : undefined,
+                    score: Number.isFinite(Number(o.score)) ? Number(o.score) : undefined,
+                    scores: Array.isArray(o.scores) ? o.scores : undefined,
+                },
             });
             this._ensureEdge(state, idx ? `step:${idx}` : 'plan', nodeId);
             return true;
@@ -199,7 +238,12 @@ export class RunEventStore {
                 label: `Critic iter ${iter}/${iterTotal}`,
                 status: 'active',
                 started_ts: event.ts,
-                meta: { iteration: iter, iteration_total: o.iteration_total },
+                meta: {
+                    iteration: iter,
+                    iteration_total: o.iteration_total,
+                    model: o.model ? String(o.model) : undefined,
+                    effort: o.effort ? String(o.effort) : undefined,
+                },
             });
             this._ensureEdge(state, idx ? `step:${idx}` : 'plan', nodeId);
             return true;
@@ -211,6 +255,11 @@ export class RunEventStore {
                 type: 'iteration',
                 status: 'done',
                 ended_ts: event.ts,
+                meta: {
+                    outcome: o.outcome ? String(o.outcome) : undefined,
+                    verified: o.verified === true ? true : (o.verified === false ? false : undefined),
+                    approved: o.approved === true ? true : (o.approved === false ? false : undefined),
+                },
             });
             return true;
         }
@@ -225,7 +274,14 @@ export class RunEventStore {
                 status: 'failed',
                 started_ts: event.ts,
                 ended_ts: event.ts,
-                meta: { reason: o.reason || '', from_worker: o.from_worker, to_worker: o.to_worker },
+                meta: {
+                    reason: o.reason || '',
+                    from_worker: o.from_worker,
+                    to_worker: o.to_worker,
+                    reasonCategory: o.reason_category ? String(o.reason_category) : undefined,
+                    attempt: Number.isFinite(Number(o.attempt)) ? Number(o.attempt) : undefined,
+                    attemptTotal: Number.isFinite(Number(o.attempt_total)) ? Number(o.attempt_total) : undefined,
+                },
             });
             const parent = state.current_step ? `step:${state.current_step}` : 'plan';
             this._ensureEdge(state, parent, nodeId);
@@ -291,13 +347,151 @@ export class RunEventStore {
         if (event.kind !== 'usage') {
             return;
         }
-        const textUsage = usageFromText(event.text);
-        const inTokens = toNumber(event.data?.in_tokens) || textUsage.in_tokens;
-        const outTokens = toNumber(event.data?.out_tokens) || textUsage.out_tokens;
-        const cost = toNumber(event.data?.cost_usd ?? event.data?.cost) || toNumber(textUsage.cost_usd);
+        const { inTokens, outTokens, cost } = usageFromEvent(event);
         state.counters.in_tokens += inTokens;
         state.counters.out_tokens += outTokens;
         state.counters.cost_usd += cost;
+    }
+
+    _applyFrontendMeta(state, nodes) {
+        const stepNodes = nodes
+            .filter((node) => node.type === 'step' && node.id.startsWith('step:'))
+            .sort((a, b) => {
+                const ai = Number(a.meta?.step_index ?? a.id.split(':')[1] ?? 0);
+                const bi = Number(b.meta?.step_index ?? b.id.split(':')[1] ?? 0);
+                return ai - bi;
+            });
+        const byStepId = new Map(stepNodes.map((node) => [node.id, node]));
+        const activeStep = stepNodes
+            .filter((node) => node.status === 'active')
+            .sort((a, b) => Number(b.started_ts || 0) - Number(a.started_ts || 0))[0] || null;
+
+        for (let i = 0; i < stepNodes.length; i += 1) {
+            const node = stepNodes[i];
+            const next = stepNodes[i + 1];
+            const startedTs = Number(node.started_ts || node.meta?.startedTs || 0) || undefined;
+            const endedTs = Number(node.ended_ts || node.meta?.endedTs || 0) || undefined;
+            const nextStartedTs = Number(next?.started_ts || next?.meta?.startedTs || 0) || undefined;
+            node.meta.startedTs = startedTs;
+            node.meta.endedTs = endedTs;
+            node.meta.inTokens = 0;
+            node.meta.outTokens = 0;
+            node.meta.costUsd = 0;
+            node._usageWindowEndTs = endedTs || nextStartedTs || (node.status === 'active' ? Number.POSITIVE_INFINITY : undefined);
+        }
+
+        for (const event of state.events) {
+            if (event.kind !== 'usage') {
+                continue;
+            }
+            for (const node of stepNodes) {
+                const startedTs = Number(node.meta.startedTs || 0);
+                const windowEnd = Number(node._usageWindowEndTs);
+                const hasWindowEnd = node._usageWindowEndTs !== undefined;
+                if (!Number.isFinite(startedTs) || !hasWindowEnd) {
+                    continue;
+                }
+                if (event.ts < startedTs) {
+                    continue;
+                }
+                if (event.ts > windowEnd) {
+                    continue;
+                }
+                const usage = usageFromEvent(event);
+                node.meta.inTokens += usage.inTokens;
+                node.meta.outTokens += usage.outTokens;
+                node.meta.costUsd += usage.cost;
+                break;
+            }
+        }
+
+        if (activeStep) {
+            const startedTs = Number(activeStep.meta?.startedTs || 0);
+            let latestActivity = '';
+            for (let i = state.events.length - 1; i >= 0; i -= 1) {
+                const event = state.events[i];
+                if (event.kind !== 'message') {
+                    continue;
+                }
+                if (event.ts < startedTs) {
+                    break;
+                }
+                if (!event.text || event.worker === 'orchestrator') {
+                    continue;
+                }
+                latestActivity = truncateText(event.text, 160);
+                break;
+            }
+            if (latestActivity) {
+                activeStep.meta.activity = latestActivity;
+            } else {
+                delete activeStep.meta.activity;
+            }
+        }
+
+        for (const node of stepNodes) {
+            delete node._usageWindowEndTs;
+            if (node.meta.inTokens <= 0) {
+                delete node.meta.inTokens;
+            }
+            if (node.meta.outTokens <= 0) {
+                delete node.meta.outTokens;
+            }
+            if (node.meta.costUsd <= 0) {
+                delete node.meta.costUsd;
+            }
+            if (!node.meta.title) {
+                const idx = node.meta?.step_index ?? node.id.split(':')[1] ?? '?';
+                const total = node.meta?.step_total ?? state.step_total ?? '?';
+                node.meta.title = `Step ${idx}/${total}`;
+            }
+        }
+
+        const planNode = nodes.find((node) => node.id === 'plan');
+        if (planNode && !Array.isArray(planNode.meta?.stepTitles)) {
+            const titles = stepNodes
+                .map((node) => node.meta?.title)
+                .filter(Boolean);
+            if (titles.length > 0) {
+                planNode.meta.stepTitles = titles;
+            }
+        }
+
+        for (const node of nodes) {
+            if (node.type === 'tot') {
+                if (node.meta?.branchTotal !== undefined) {
+                    node.meta.branchTotal = Number(node.meta.branchTotal) || undefined;
+                }
+                if (node.meta?.score !== undefined) {
+                    node.meta.score = Number(node.meta.score);
+                    if (!Number.isFinite(node.meta.score)) {
+                        delete node.meta.score;
+                    }
+                }
+            }
+            if (node.type === 'iteration') {
+                if (!node.meta?.outcome) {
+                    if (node.meta?.verified === true) {
+                        node.meta.outcome = 'verified';
+                    } else if (node.meta?.approved === true) {
+                        node.meta.outcome = 'approved';
+                    }
+                }
+            }
+            if (node.type === 'fallback') {
+                if (!node.meta?.reasonCategory && node.meta?.reason) {
+                    if (String(node.meta.reason).toLowerCase().includes('usage')) {
+                        node.meta.reasonCategory = 'usage';
+                    }
+                }
+            }
+            if (byStepId.has(node.id) && node.meta?.model === 'n/a') {
+                delete node.meta.model;
+            }
+            if (byStepId.has(node.id) && node.meta?.effort === 'n/a') {
+                delete node.meta.effort;
+            }
+        }
     }
 
     _rebuildGraph(state) {
@@ -353,6 +547,7 @@ export class RunEventStore {
             .map((id) => state.nodes.get(id))
             .filter(Boolean)
             .map((node) => ({ ...node, meta: { ...(node.meta || {}) } }));
+        this._applyFrontendMeta(state, nodes);
         const counters = {
             in_tokens: state.counters.in_tokens,
             out_tokens: state.counters.out_tokens,
