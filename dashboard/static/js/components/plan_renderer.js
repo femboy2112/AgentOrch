@@ -426,6 +426,7 @@ export class FriendlyPlanRenderer {
             edges: snapshot.edges || [],
             counters: snapshot.counters || {},
             inferred: snapshot.inferred,
+            limited_detail: snapshot.limited_detail,
             events: (snapshot.events || []).length,
         });
         if (signature === this.lastSignature) {
@@ -440,7 +441,9 @@ export class FriendlyPlanRenderer {
         const planHtml = planNode ? nodeHtml(planNode, { stepNodes, stepTotal: planNode?.meta?.step_total }) : '';
         const badges = snapshot.inferred
             ? '<span class="plan-badge">inferred timeline - limited detail</span>'
-            : '';
+            : (snapshot.limited_detail
+                ? '<span class="plan-badge">older run - limited detail</span>'
+                : '');
         const renderedIds = new Set();
 
         let stepsHtml = '';

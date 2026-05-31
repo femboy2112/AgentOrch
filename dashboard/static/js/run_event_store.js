@@ -65,6 +65,8 @@ function createState(runId) {
         step_total: null,
         fallback_count: 0,
         inferred_count: 0,
+        steps_seen: 0,
+        steps_with_title: 0,
         listeners: new Set(),
         seen_ids: new Set(),
     };
@@ -175,6 +177,10 @@ export class RunEventStore {
             const total = Number.isFinite(state.step_total) ? state.step_total : '?';
             const nodeId = `step:${idx}`;
             state.current_step = idx;
+            state.steps_seen += 1;
+            if (o.step_title) {
+                state.steps_with_title += 1;
+            }
             this._markActiveStepDone(state, nodeId);
             this._setNode(state, nodeId, {
                 type: 'step',
@@ -504,6 +510,8 @@ export class RunEventStore {
         state.step_total = null;
         state.fallback_count = 0;
         state.inferred_count = 0;
+        state.steps_seen = 0;
+        state.steps_with_title = 0;
         for (const event of state.events) {
             const handled = this._foldOrchestration(state, event);
             if (!handled) {
@@ -562,6 +570,11 @@ export class RunEventStore {
             edges: state.edges.slice(),
             counters,
             inferred: Boolean(state.inferred),
+            limited_detail: Boolean(
+                state.has_orchestration
+                && state.steps_seen > 0
+                && state.steps_with_title === 0,
+            ),
         };
     }
 
