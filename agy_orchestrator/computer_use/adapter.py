@@ -421,6 +421,13 @@ class ComputerUseWorkerAdapter:
         mode = sess.worker_session.mode
         task_priority = sess.worker_session.task_priority
 
+        # Repeated-failure backstop: if the same action type fails (rejected/failed)
+        # this many times in a row, abort the run instead of spinning and burning
+        # reasoner calls (e.g. a navigate that never lands). Reset on any success.
+        max_repeat_failures = int(budgets.get("max_repeat_failures", 3))
+        last_fail_key: Optional[str] = None
+        repeat_failures = 0
+
         # Initial capability snapshot (already emitted by controller.create_session)
         # Budget-aware loop: check limits *before* each perception/reason/execute cycle (FR-10)
         for step in range(1, max_steps + 1):
@@ -652,6 +659,34 @@ class ComputerUseWorkerAdapter:
             ))
 
             sess.current_actions += 1
+
+            # Repeated-identical-failure backstop (FR-10 spirit): a navigate/click that
+            # keeps failing would otherwise spin the loop, re-invoking the reasoner each
+            # step and burning budget for no progress. Track consecutive same-type
+            # failures; abort once the threshold is hit. Any success resets the streak.
+            if result.status == ActionStatus.OK.value:
+                last_fail_key = None
+                repeat_failures = 0
+            else:
+                fail_key = str(getattr(action_spec, "type", None))
+                if fail_key == last_fail_key:
+                    repeat_failures += 1
+                else:
+                    last_fail_key = fail_key
+                    repeat_failures = 1
+                if repeat_failures >= max_repeat_failures:
+                    sink.emit(WorkerEvent(
+                        ts=datetime.now(timezone.utc).isoformat(),
+                        run_id=run_id,
+                        event_type=WorkerEventType.SAFETY_VIOLATION.value,
+                        payload={
+                            "reason": "repeated_action_failure",
+                            "action_type": fail_key,
+                            "consecutive_failures": repeat_failures,
+                            "last_error_code": getattr(result, "error_code", None),
+                        },
+                    ))
+                    break
 
             # Simple objective-completion heuristic for unit tests / minimal runs
             rat = (getattr(action_spec, "rationale", "") or "").lower()

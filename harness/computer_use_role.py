@@ -93,10 +93,22 @@ class ComputerUseShim:
                 return AuditEventSink(run_id=rid, events_path=Path(events_path))
             return AuditEventSink(run_id=rid)
 
-        adapter = Adapter(audit_sink_factory=_sink_factory)
+        rid = run_id or f"cu-{int(__import__('time').time()*1000)}"
+
+        # Wire a real reasoner for the harness path. The adapter only self-builds
+        # a bridge with auto_build_agents=False (the "outer layer supplies agents"
+        # contract); without this the harness loop has no LLM wired, so every
+        # decide() returns no-agent:* and the session ends after one empty step.
+        # Supply a bridge that lazily builds the codex->claude reasoner, sharing
+        # the single harness sink so its reasoner events land in events.jsonl.
+        from agy_orchestrator.computer_use.reasoner import ReasonerBridge
+
+        _shared_sink = _sink_factory(rid)
+        reasoner = ReasonerBridge(run_id=rid, audit_sink=_shared_sink, auto_build_agents=True)
+        adapter = Adapter(audit_sink_factory=lambda _rid: _shared_sink, reasoner=reasoner)
 
         req: Dict[str, Any] = {
-            "run_id": run_id or f"cu-{int(__import__('time').time()*1000)}",
+            "run_id": rid,
             "objective": objective or "computer-use objective from harness",
         }
         if cfg.get("mode"):
@@ -117,8 +129,24 @@ class ComputerUseShim:
 
         # Confirmation tokens are submitted via adapter.submit_confirmation() by caller
         # when high-risk actions are gated; dispatch itself is fire-and-observe for cu.
+        #
+        # adapter.start() is fully synchronous and runs the entire perceive->reason->
+        # act loop inline. run_async() is awaited under an asyncio event loop, so this
+        # thread has a *running* loop. The owned BrowserController drives Playwright's
+        # SYNC API, which hard-refuses to launch on a thread with a running asyncio loop
+        # ("using Playwright Sync API inside the asyncio loop") -> every navigate fails.
+        # Offload the whole loop to a worker thread (no asyncio loop there): Playwright
+        # sync works, and the reasoner's own asyncio.run (reasoner._call_agent) takes its
+        # inline branch since that worker thread has no running loop.
         try:
-            handle = adapter.start(req)
+            try:
+                loop = __import__("asyncio").get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                handle = await loop.run_in_executor(None, adapter.start, req)
+            else:
+                handle = adapter.start(req)
             self.stdout = f"computer-use completed run_id={handle.run_id} status={handle.status}"
             self.returncode = 0 if handle.status in ("completed", "ok") else 1
         except Exception as exc:  # never destabilize harness caller

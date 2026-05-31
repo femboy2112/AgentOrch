@@ -214,7 +214,11 @@ class BrowserDOMCollector:
         () => {
           const sels = ["#b_results h2 a", "#b_results a", "#search h3 a",
             "#search a h3", "[data-testid*='result'] a", "a[href]", "button",
-            "input", "textarea", "[role='link']", "[role='button']", "[role='textbox']"];
+            "input", "textarea", "[role='link']", "[role='button']", "[role='textbox']",
+            // App/dashboard semantic text nodes (friendly plan diagram + roadmap): these are
+            // div/span, not anchors, so they are invisible to the SERP-oriented selectors above.
+            ".plan-node-label", ".plan-roadmap-item", ".plan-chip", ".plan-progress-label",
+            "[data-status]", "h1", "h2", "h3"];
           const out = [];
           const seen = new Set();
           for (const sel of sels) {

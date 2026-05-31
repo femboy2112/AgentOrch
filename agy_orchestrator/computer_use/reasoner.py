@@ -41,15 +41,18 @@ class ReasonerError(RuntimeError):
 
 
 # Auth-state markers per spec (FR-25): scan raw output + stderr for interactive / OAuth / TTY login prompts.
+# Specific auth/interactive-login phrases only. Bare tokens like "browser",
+# "interactive", "expired", and "tty" were removed: they collide with the
+# reasoner's own action rationales (e.g. "use the agent-owned browser to
+# navigate"), which would false-positive as an auth-required state and kill a
+# perfectly valid reasoning turn. Real interactive-login prompts contain these
+# fuller phrases. (Deeper hardening would scan only the CLI's stderr, never the
+# model's structured answer, for these markers.)
 AUTH_MARKERS: tuple[str, ...] = (
     "oauth",
     "sign in",
     "log in",
     "authentication",
-    "expired",
-    "interactive",
-    "browser",
-    "tty",
     "login required",
     "re-authenticate",
     "please authenticate",
@@ -291,8 +294,27 @@ class ReasonerBridge:
                 # Some agents accept the per-turn text as positional / piped_input
                 return await agent.run_async(prompt)  # type: ignore
 
-            try:
+            def _run_blocking() -> str:
                 return asyncio.run(asyncio.wait_for(_invoke(), timeout=timeout_s))
+
+            try:
+                # decide() is synchronous but is driven on the adapter's perceive->
+                # reason->act loop thread, which ALSO owns the BrowserController's
+                # Playwright SYNC API. Two hazards if we run asyncio.run() on that
+                # thread directly:
+                #   (a) if the harness's outer loop is running on it, asyncio.run()
+                #       refuses to nest and raises immediately; and
+                #   (b) even with no outer loop, creating+tearing down an event loop
+                #       on the Playwright-owner thread corrupts Playwright's own loop
+                #       state, so the NEXT page.evaluate() (next-step perception) hangs
+                #       forever. (Playwright sync leaves a live loop pinned to the thread.)
+                # Both are avoided by ALWAYS running the agent coroutine on a dedicated
+                # worker thread (its own fresh loop), never inline. The owner thread's
+                # asyncio/Playwright state is then never disturbed.
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    return ex.submit(_run_blocking).result()
             except asyncio.TimeoutError:
                 raise
 
