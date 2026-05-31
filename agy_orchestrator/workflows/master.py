@@ -449,5 +449,20 @@ class MasterWorkflow:
                 steps_since_compaction = 0
                 self._save_checkpoint(initial_prompt, tasks, i + 1, project_context, workflow_session_id)
 
+        # Run finished cleanly: drop the salvage checkpoint so a later identical
+        # dispatch starts fresh instead of "resuming" a completed project, and so
+        # the checkpoint dir holds only in-flight/abruptly-killed runs (issue #31).
+        self._remove_checkpoint()
         logger.info("Master Workflow Complete!")
         return project_context
+
+    def _remove_checkpoint(self) -> None:
+        path = self.checkpoint_path
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not remove checkpoint %s: %s", path, exc)

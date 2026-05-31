@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import hashlib
 import inspect
 import json
 import logging
@@ -39,9 +40,32 @@ from harness.snapshot import diff_snapshots, take_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "runs"
+# Stable, instruction-keyed master/pat checkpoints (issue #31, salvage-on-death).
+# A long master run that dies abruptly mid-step (e.g. systemd scope exit-144 from
+# a worker's stray pkill) leaves completed-step edits on disk; this directory lets
+# a re-dispatch of the SAME instruction resume from the last completed step instead
+# of restarting. Under runs/ (gitignored), separate from per-run runs/<id>/ logs so
+# the path is stable across run_ids.
+CHECKPOINT_DIR = RUNS_DIR / ".checkpoints"
 
 logger = logging.getLogger("harness")
 EVENT_BUS = EventBus()
+
+
+def _master_checkpoint_path(prompt: str) -> str:
+    """Deterministic checkpoint file for a master/pat run, keyed by the full prompt.
+
+    Same instruction (same built prompt) -> same path, so an abruptly-killed run
+    is resumable simply by re-dispatching it (issue #31, fix option 4).
+    MasterWorkflow refuses to resume a checkpoint whose key doesn't match the
+    prompt, and refuses once completed==len(tasks) — so a *completed* or a
+    *different* instruction starts clean. The checkpoint is removed on successful
+    completion (see MasterWorkflow.execute), so this directory holds only the
+    in-flight / salvageable runs.
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    return str(CHECKPOINT_DIR / f"{key}.json")
 
 WORKER_PREAMBLE = (
     "You are a coding worker operating inside an existing project repository at the "
@@ -49,7 +73,23 @@ WORKER_PREAMBLE = (
     "modifying files DIRECTLY on disk in this directory. Make the changes yourself — "
     "do not ask questions and do not merely describe what to do. Keep the change "
     "minimal and tightly scoped to the instruction, and match the existing code "
-    "style. Do NOT run `sudo`. When finished, end your reply with a short list of the "
+    "style. Do NOT run `sudo`. "
+    # Process discipline (issue #31): a worker that runs the project's full,
+    # long-running test/build gate ITSELF contends with the harness's own
+    # --test-cmd verifier on lock-guarded parallel gates, accumulates "stale"
+    # jobs, and then "helpfully" pkills them by name — a pattern that matches
+    # and kills the orchestrator process running the worker (scope exit-144).
+    # The harness owns verification; the worker must neither re-run the heavy
+    # gate nor pkill by name.
+    "A separate automated harness runs the project's full test/build gate to verify "
+    "your work after your turn — do NOT run the full or long-running test suite or "
+    "build gate yourself (e.g. `make check`, the complete CI suite); run only the "
+    "narrow, fast checks needed to validate your specific change. NEVER kill a "
+    "process you did not directly start, and never use `pkill`, `killall`, or `kill` "
+    "by process name or pattern — such a pattern can match and take down the "
+    "orchestrator that is running you; if a process you spawned hangs, kill only its "
+    "exact PID. "
+    "When finished, end your reply with a short list of the "
     "files you created or modified and a one-line reason for each."
 )
 
@@ -402,6 +442,7 @@ async def _run_workflow(
             verifier=verifier,
             agent_class=agent_class,
             working_directory=working_directory,
+            checkpoint_path=_master_checkpoint_path(prompt),
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -471,6 +512,7 @@ async def _run_workflow(
             verifier=verifier,
             agent_class=agent_class,
             working_directory=working_directory,
+            checkpoint_path=_master_checkpoint_path(prompt),
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
