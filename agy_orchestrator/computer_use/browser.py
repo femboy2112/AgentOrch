@@ -136,6 +136,46 @@ class BrowserController:
     def _is_owner_thread(self) -> bool:
         return bool(self._owner_ident is not None and threading.get_ident() == self._owner_ident)
 
+    def _is_browser_alive(self) -> bool:
+        """Best-effort: True unless the owned Chromium root pid is provably dead.
+
+        A computer-use run drives Chromium over CDP on a software-GL (swiftshader)
+        display, where the renderer/GPU process can crash mid-run (OOM / shader
+        fault). The sync ``page.evaluate()`` we use for DOM perception has NO
+        transport timeout, so a call issued against a dead browser blocks the
+        single-threaded run loop FOREVER (the observed "tail hang": ~4 good steps,
+        then a crash, then perceive wedges). We probe the pid before each DOM scan
+        and fail closed (perceive -> []) when it is gone, letting the run loop's
+        give-up guard abort cleanly instead of hanging.
+
+        Semantics: only a POSITIVE dead signal returns False. An unknown/zero pid
+        (extraction failed, or a fake-page unit path) is treated as alive so this
+        guard never changes behavior for launches we can't probe.
+        """
+        pid = self._browser_pid
+        if not pid or pid <= 0:
+            return True  # nothing to probe -> do not block
+        try:
+            import psutil  # type: ignore  # lazy, real-path only
+
+            if not psutil.pid_exists(pid):
+                return False
+            try:
+                if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                    return False
+            except psutil.NoSuchProcess:
+                return False
+            return True
+        except Exception:
+            # psutil unavailable: fall back to a signal-0 liveness probe.
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return True  # exists but not signalable (perm) -> alive
+
     def _call_on_owner(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Run a Playwright operation on the browser's pinned thread.
 
@@ -178,6 +218,11 @@ class BrowserController:
 
     def _collect_dom_elements_impl(self, scan_page: Callable[[Any], List[Any]]) -> List[Any]:
         if self._closed or self._context is None:
+            return []
+        if not self._is_browser_alive():
+            # Owned Chromium crashed: skip the no-timeout page.evaluate that would
+            # otherwise wedge the run loop forever; perceive degrades to [] and the
+            # loop's give-up guard aborts cleanly. (See _is_browser_alive.)
             return []
         page = self.current_page
         if page is None:

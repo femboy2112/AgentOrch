@@ -400,6 +400,60 @@ def test_click_dom_reports_actuation_failure_when_all_tiers_fail() -> None:
     assert out["error_code"] == "dom_actuation_failed"
 
 
+def _mk_controller_for_collect(browser_pid: int) -> "tuple[BrowserController, List[str]]":
+    """A BrowserController with fake Playwright handles + a recording scan, used to
+    prove the perceive-path liveness gate (no real browser / pid probe stubbed)."""
+    calls: List[str] = []
+    bc = object.__new__(BrowserController)
+    page = _FakePage(_FakeLocator(set(), calls), calls)
+    bc._context = _FakeContext(page)  # type: ignore[attr-defined]
+    bc._page = page  # type: ignore[attr-defined]
+    bc._closed = False  # type: ignore[attr-defined]
+    bc._owner_ident = None  # type: ignore[attr-defined]
+    bc._browser_pid = browser_pid  # type: ignore[attr-defined]
+    return bc, calls
+
+
+def test_collect_dom_skips_scan_when_owned_browser_is_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A crashed Chromium pid must NOT reach the no-timeout page.evaluate (that wedges
+    # the run loop). The gate fails closed: perceive degrades to [].
+    bc, calls = _mk_controller_for_collect(browser_pid=999_999)
+    monkeypatch.setattr("psutil.pid_exists", lambda pid: False)
+    scanned: List[str] = []
+
+    def scan(page: Any) -> List[Any]:
+        scanned.append("ran")
+        return [SimpleNamespace(name="x")]
+
+    out = bc.collect_dom_elements(scan)
+    assert out == []
+    assert scanned == []  # scan never invoked against the dead transport
+
+
+def test_collect_dom_runs_scan_when_owned_browser_is_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    bc, _calls = _mk_controller_for_collect(browser_pid=4242)
+
+    class _Proc:
+        def status(self) -> str:
+            return "running"
+
+    monkeypatch.setattr("psutil.pid_exists", lambda pid: True)
+    monkeypatch.setattr("psutil.Process", lambda pid: _Proc())
+
+    def scan(page: Any) -> List[Any]:
+        return [SimpleNamespace(name="ok")]
+
+    out = bc.collect_dom_elements(scan)
+    assert [e.name for e in out] == ["ok"]
+
+
+def test_collect_dom_does_not_gate_when_pid_unknown() -> None:
+    # No owned pid (extraction failed / fake-page path): never block on a probe.
+    bc, _calls = _mk_controller_for_collect(browser_pid=0)
+    out = bc.collect_dom_elements(lambda page: [SimpleNamespace(name="ok")])
+    assert [e.name for e in out] == ["ok"]
+
+
 def test_b4_prior_computer_use_suite_pass_count_stays_exact() -> None:
     root = Path(__file__).resolve().parent.parent
     prior_files = [
