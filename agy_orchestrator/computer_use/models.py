@@ -389,6 +389,12 @@ class ElementHandle:
     bbox: Dict[str, int] = field(default_factory=dict)  # {x,y,w,h}
     confidence: float = 0.0
     provenance: List[str] = field(default_factory=list)
+    # DOM elements only: a stable, actuation-ready selector (+ 1-based index within
+    # querySelectorAll(selector)) so the reasoner can emit a precise
+    # target {kind:'dom', selector, index} click/type instead of guessing
+    # coordinates from the bbox. None for non-DOM (geometry/AT-SPI/OCR) sources.
+    dom_selector: Optional[str] = None
+    dom_index: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.source not in {s.value for s in ElementSource}:

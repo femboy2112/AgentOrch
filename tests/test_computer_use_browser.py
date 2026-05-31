@@ -454,6 +454,61 @@ def test_collect_dom_does_not_gate_when_pid_unknown() -> None:
     assert [e.name for e in out] == ["ok"]
 
 
+class _ScanPage:
+    """A fake Playwright page whose evaluate() returns canned _scan_page rows."""
+
+    def __init__(self, rows: List[Dict[str, Any]]) -> None:
+        self._rows = rows
+
+    def evaluate(self, js: str, arg: Any = None) -> List[Dict[str, Any]]:
+        return self._rows
+
+
+def test_scan_page_surfaces_id_selector_and_falls_back_to_indexed_selector() -> None:
+    from agy_orchestrator.computer_use.perception import BrowserDOMCollector
+
+    rows = [
+        # A toggle button with a stable id -> #id selector, index 1.
+        {"tag": "button", "text": "Professional View", "sel": "button",
+         "dsel": "#presentation-toggle", "didx": 1, "x": 1050, "y": 20, "w": 120, "h": 30},
+        # An id-less anchor -> matching selector + its 1-based position.
+        {"tag": "a", "text": "run detail", "sel": "a[href]",
+         "dsel": "a[href]", "didx": 3, "x": 10, "y": 200, "w": 80, "h": 16},
+    ]
+    els = BrowserDOMCollector(live_page=_ScanPage(rows)).collect()
+    assert len(els) == 2
+    toggle = els[0]
+    assert toggle.dom_selector == "#presentation-toggle"
+    assert toggle.dom_index == 1
+    assert els[1].dom_selector == "a[href]"
+    assert els[1].dom_index == 3
+
+
+def test_make_summary_emits_dom_selector_for_dom_elements_only() -> None:
+    from agy_orchestrator.computer_use.models import ElementHandle, ElementSource, PerceptionSnapshot
+    from agy_orchestrator.computer_use.perception import PerceptionPipeline
+
+    dom_el = ElementHandle(
+        handle_id="dom-1", source=ElementSource.DOM.value, role="button",
+        name="Professional View", bbox={"x": 1050, "y": 20, "w": 120, "h": 30},
+        confidence=0.9, dom_selector="#presentation-toggle", dom_index=1,
+    )
+    geom_el = ElementHandle(
+        handle_id="geom-w1", source=ElementSource.GEOMETRY.value, name="window",
+        bbox={"x": 0, "y": 0, "w": 800, "h": 600}, confidence=0.7,
+    )
+    snap = PerceptionSnapshot(
+        snapshot_id="s1", run_id="r", mode="ISOLATED", scope="isolated",
+        captured_at="t", windows=[], elements=[dom_el, geom_el], raw_text_blocks=[],
+    )
+    summary = PerceptionPipeline().make_summary(snap)
+    by_id = {e["handle_id"]: e for e in summary.elements}
+    assert by_id["dom-1"]["dom_selector"] == "#presentation-toggle"
+    assert by_id["dom-1"]["dom_index"] == 1
+    # Non-DOM elements never carry a dom_selector key.
+    assert "dom_selector" not in by_id["geom-w1"]
+
+
 def test_b4_prior_computer_use_suite_pass_count_stays_exact() -> None:
     root = Path(__file__).resolve().parent.parent
     prior_files = [

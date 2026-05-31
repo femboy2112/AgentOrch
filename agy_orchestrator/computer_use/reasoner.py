@@ -111,6 +111,8 @@ Analyze the structured perception snapshots (windows, AT-SPI elements, geometry,
 
 navigate opens an agent-owned CDP browser (registered via ProcessSupervisor); use target {kind:'dom', selector:'...', index:N (1-based)} on click/type to actuate DOM elements and auto-follow new tabs (ctx.pages[-1]). The browser is always the agent's child — no real_act prompt required.
 
+DOM TARGETING (STRONGLY PREFERRED): perceived DOM elements carry "dom_selector" and "dom_index". When acting on such an element, you MUST emit target {kind:'dom', selector:<dom_selector>, index:<dom_index>} — copy those two fields verbatim from the element. A DOM click fires the element's own handler reliably; coordinate {kind:'coordinate', x, y} clicks are a last resort that frequently MISS on the headless render surface (a known failure mode where toggles/buttons never activate). Only fall back to coordinates for an element that has no dom_selector.
+
 HARD SAFETY CONSTRAINTS (VIOLATIONS ARE NEVER ACCEPTABLE)
 - action.display_scope MUST be the literal string "isolated". Never target real :0 or any other display.
 - For spatial actions (click, double_click, type, scroll, drag) a target is REQUIRED: either a valid element handle_id from the current snapshots or explicit {kind:"coordinate", x, y, ...}.

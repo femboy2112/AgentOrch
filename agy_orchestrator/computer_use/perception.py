@@ -221,11 +221,13 @@ class BrowserDOMCollector:
             "[data-status]", "h1", "h2", "h3"];
           const out = [];
           const seen = new Set();
+          const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : s;
           for (const sel of sels) {
             let nodes;
             try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
-            for (const n of nodes) {
+            for (let ni = 0; ni < nodes.length; ni++) {
               if (out.length >= 120) break;
+              const n = nodes[ni];
               const r = n.getBoundingClientRect();
               const tag = (n.tagName || "").toLowerCase();
               let text = (n.innerText || n.getAttribute("aria-label") ||
@@ -235,7 +237,14 @@ class BrowserDOMCollector:
                 Math.round(r.x) + "," + Math.round(r.y);
               if (seen.has(key)) continue;
               seen.add(key);
+              // Actuation-ready selector: prefer a unique #id (index 1); else the
+              // matching selector + this node's 1-based position within it (the exact
+              // pair BrowserController.click_dom resolves via querySelectorAll(sel)[i]).
+              let dsel, didx;
+              if (n.id) { dsel = "#" + esc(n.id); didx = 1; }
+              else { dsel = sel; didx = ni + 1; }
               out.push({tag: tag, text: text.slice(0,200), sel: sel,
+                dsel: dsel, didx: didx,
                 x: Math.round(r.x), y: Math.round(r.y),
                 w: Math.round(r.width), h: Math.round(r.height)});
             }
@@ -259,6 +268,9 @@ class BrowserDOMCollector:
                     bbox_d = {"x": int(row.get("x", 0) or 0), "y": int(row.get("y", 0) or 0), "w": w, "h": h}
                 text = (row.get("text") or "").strip()
                 tag = (row.get("tag") or "").strip()
+                dsel = (row.get("dsel") or "").strip() or None
+                didx_raw = row.get("didx")
+                didx = int(didx_raw) if isinstance(didx_raw, (int, float)) and int(didx_raw) > 0 else None
                 out.append(
                     ElementHandle(
                         source=ElementSource.DOM.value,
@@ -268,6 +280,8 @@ class BrowserDOMCollector:
                         bbox=bbox_d,
                         confidence=0.9,
                         provenance=[f"BrowserDOMCollector:{row.get('sel', '')}"],
+                        dom_selector=dsel,
+                        dom_index=didx,
                     )
                 )
             except Exception:
@@ -401,7 +415,14 @@ class PerceptionPipeline:
             # values are uppercase ("DOM"/"GEOMETRY"/...); the reasoner-facing snapshot
             # dict expects "dom"/"geometry"/... so the loop can select DOM elements.
             src = el.source.lower() if isinstance(el.source, str) else el.source
-            se.append({"handle_id": el.handle_id, "source": src, "role": el.role, "name": el.name, "bbox": dict(el.bbox), "confidence": el.confidence})
+            ed: Dict[str, Any] = {"handle_id": el.handle_id, "source": src, "role": el.role, "name": el.name, "bbox": dict(el.bbox), "confidence": el.confidence}
+            # Surface the actuation-ready DOM selector so the reasoner targets
+            # {kind:'dom', selector, index} instead of bbox coordinates. Only present
+            # for DOM elements that carry one (keeps non-DOM summaries unchanged).
+            if el.dom_selector:
+                ed["dom_selector"] = el.dom_selector
+                ed["dom_index"] = el.dom_index if el.dom_index else 1
+            se.append(ed)
         return SnapshotSummary(snapshot_id=snap.snapshot_id, captured_at=snap.captured_at, scope=snap.scope, windows=[dict(w) for w in snap.windows], elements=se, raw_text_blocks=[dict(b) for b in snap.raw_text_blocks])
 
 
