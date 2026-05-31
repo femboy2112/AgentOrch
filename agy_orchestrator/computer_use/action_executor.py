@@ -246,11 +246,14 @@ class ActionExecutor:
                     resolved = {"index": int(out.get("index", index))}
                     landed_url = out.get("landed_url")
                     child_url = out.get("child_page_url")
+                    click_method = out.get("click_method")
                     art = []
                     if landed_url:
                         art.append(f"landed_url:{landed_url}")
                     if child_url:
                         art.append(f"child_page_url:{child_url}")
+                    if click_method:
+                        art.append(f"click_method:{click_method}")
                     artifacts = art or None
                 elif out.get("error_code") == "browser_not_open":
                     return ActionResult(

@@ -343,6 +343,14 @@ class BrowserController:
             slow_mo=0,
             viewport=None if not headless else {"width": 1280, "height": 900},
             locale="en-US",
+            # Emulate prefers-reduced-motion. A computer-use worker perceives via
+            # screenshots/CDP; infinite CSS animations (e.g. a pulsing status icon)
+            # peg a software-GL (swiftshader) compositor so hard that frames never
+            # stabilize -- CDP captureScreenshot/Runtime.evaluate then hang and the
+            # page may fail to repaint at all. Reduced-motion lets motion-respecting
+            # CSS drop those animations, keeping perception stable and cheap. (The
+            # site must honor the media query; ours does.)
+            reduced_motion="reduce",
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -427,8 +435,55 @@ class BrowserController:
             target = active.locator(sel).nth(idx)
             before_pages = len(self._context.pages)
 
-            target.scroll_into_view_if_needed(timeout=4000)
-            target.click(timeout=8000)
+            # Graded actuation, ordered by robustness-on-this-environment.
+            #
+            # The worker drives the operator's real display, which here is a
+            # software-GL (swiftshader) X server. On that display the entire
+            # Playwright *locator* path — selector-engine injection + actionability
+            # polling — WEDGES: even a bare locator.count() hangs, and the per-call
+            # timeout never fires because the driver message loop is blocked (so a
+            # locator click can hang the whole single-threaded run loop, not just
+            # fail). A plain page.evaluate (Runtime.evaluate), by contrast, returns
+            # normally on the same display. So we LEAD with a direct in-page click
+            # via evaluate — it fires the element's own click() with zero locator
+            # machinery and lands a JS-only control (e.g. an SPA toggle) reliably.
+            #
+            # The trusted locator clicks (a real CDP input event Playwright will
+            # scroll to and hit-test) are kept as fallbacks for the rare control
+            # that ignores a synthetic click and demands a trusted event; they only
+            # run if the evaluate tier could not find/click the element. On a
+            # hardware-GL display they work normally; on software-GL they are simply
+            # never reached because the evaluate tier already succeeded. First tier
+            # that lands wins.
+            click_method: Optional[str] = None
+            last_err: Optional[Exception] = None
+            for method in ("evaluate", "force", "normal"):
+                try:
+                    if method == "evaluate":
+                        clicked = active.evaluate(
+                            "(a) => { const el = document.querySelectorAll(a.sel)[a.idx];"
+                            " if (!el) return false; el.click(); return true; }",
+                            {"sel": sel, "idx": idx},
+                        )
+                        if not clicked:
+                            raise RuntimeError("evaluate click: no element at selector/index")
+                    elif method == "force":
+                        target.click(force=True, timeout=4000)
+                    else:
+                        target.scroll_into_view_if_needed(timeout=4000)
+                        target.click(timeout=8000)
+                    click_method = method
+                    break
+                except Exception as e:  # try the next fallback tier
+                    last_err = e
+                    continue
+            if click_method is None:
+                return {
+                    "ok": False,
+                    "error_code": "dom_actuation_failed",
+                    "index": index,
+                    "error": str(last_err) if last_err else "all click tiers failed",
+                }
 
             # Give the navigation / new-tab a moment
             try:
@@ -449,6 +504,7 @@ class BrowserController:
                 "ok": True,
                 "index": index,
                 "selector": sel,
+                "click_method": click_method,
                 "landed_url": landed_page.url,
                 "child_page_url": landed_page.url if len(self._context.pages) > before_pages else None,
                 "new_tab": len(self._context.pages) > before_pages,

@@ -520,7 +520,15 @@ input[type="text"], textarea, select {
 
 .plan-node[data-status="active"] .plan-node-icon {
     color: var(--plan-active);
-    animation: plan-pulse 1.2s ease-in-out infinite;
+}
+
+/* Pulse the active-step icon only when motion is welcomed. An infinite animation
+   pegs software-GL compositors (e.g. swiftshader) and never lets the frame settle,
+   which also breaks automated/computer-use perception of the view. */
+@media (prefers-reduced-motion: no-preference) {
+    .plan-node[data-status="active"] .plan-node-icon {
+        animation: plan-pulse 1.2s ease-in-out infinite;
+    }
 }
 
 .plan-node[data-status="done"] .plan-node-icon {

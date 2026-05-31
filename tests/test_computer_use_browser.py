@@ -292,6 +292,114 @@ def test_cli_flags_roundtrip_to_runrequest(monkeypatch: pytest.MonkeyPatch) -> N
     assert req.browser_display == ":0"
 
 
+class _FakeLocator:
+    """A locator whose click tiers fail until a configured one succeeds.
+
+    `fail_through` lists the tiers ("normal", "force") that raise, simulating a
+    JS-only / ungeometried control on a software-GL display where the Playwright
+    locator path stalls. The "evaluate" tier is on the page, not the locator.
+    """
+
+    def __init__(self, fail_through: set, calls: List[str]) -> None:
+        self.fail_through = fail_through
+        self.calls = calls
+
+    def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+        self.calls.append("scroll")
+
+    def click(self, timeout: int = 0, force: bool = False) -> None:
+        tier = "force" if force else "normal"
+        self.calls.append(f"click:{tier}")
+        if tier in self.fail_through:
+            raise RuntimeError(f"{tier} click failed (locator path stalled)")
+
+
+class _FakePage:
+    def __init__(self, locator: _FakeLocator, calls: List[str], url: str = "http://localhost/#/runs/x") -> None:
+        self._locator = locator
+        self._calls = calls
+        self.url = url
+
+    def locator(self, sel: str) -> "_FakeLocatorNth":
+        return _FakeLocatorNth(self._locator)
+
+    def evaluate(self, expr: str, arg: Any = None) -> bool:
+        # Mirrors the in-page click tier: returns True (element found + clicked)
+        # unless this tier is configured to fail.
+        self._calls.append("evaluate:click")
+        if "evaluate" in self._locator.fail_through:
+            raise RuntimeError("evaluate click failed")
+        return True
+
+    def wait_for_timeout(self, ms: int) -> None:
+        pass
+
+    def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+        pass
+
+
+class _FakeLocatorNth:
+    def __init__(self, locator: _FakeLocator) -> None:
+        self._locator = locator
+
+    def nth(self, idx: int) -> _FakeLocator:
+        return self._locator
+
+
+class _FakeContext:
+    def __init__(self, page: _FakePage) -> None:
+        self.pages = [page]
+
+
+def _mk_controller_with_page(fail_through: set) -> "tuple[BrowserController, List[str]]":
+    """A BrowserController whose Playwright handles are pure fakes (no real browser)."""
+    calls: List[str] = []
+    locator = _FakeLocator(fail_through, calls)
+    bc = object.__new__(BrowserController)
+    page = _FakePage(locator, calls)
+    bc._context = _FakeContext(page)  # type: ignore[attr-defined]
+    bc._page = page  # type: ignore[attr-defined]
+    bc._closed = False  # type: ignore[attr-defined]
+    bc._cdp_timeout = 30000.0  # type: ignore[attr-defined]
+    return bc, calls
+
+
+def test_click_dom_leads_with_in_page_evaluate_click() -> None:
+    # The evaluate tier is tried FIRST: a direct in-page el.click() that lands on
+    # any display (and is the only path that works on software-GL). When it
+    # succeeds the trusted locator fallbacks are never touched.
+    bc, calls = _mk_controller_with_page(fail_through=set())
+    out = bc._click_dom_impl(selector="#presentation-toggle", index=1)
+    assert out["ok"] is True
+    assert out["click_method"] == "evaluate"
+    assert calls == ["evaluate:click"]
+
+
+def test_click_dom_falls_back_to_force_when_evaluate_cannot_click() -> None:
+    # If the in-page click can't act (element rejects synthetic click / not found),
+    # fall back to a trusted forced input click.
+    bc, calls = _mk_controller_with_page(fail_through={"evaluate"})
+    out = bc._click_dom_impl(selector="#x", index=1)
+    assert out["ok"] is True
+    assert out["click_method"] == "force"
+    assert calls == ["evaluate:click", "click:force"]
+
+
+def test_click_dom_falls_back_to_normal_scrolled_click_last() -> None:
+    bc, calls = _mk_controller_with_page(fail_through={"evaluate", "force"})
+    out = bc._click_dom_impl(selector="#x", index=1)
+    assert out["ok"] is True
+    assert out["click_method"] == "normal"
+    assert calls == ["evaluate:click", "click:force", "scroll", "click:normal"]
+
+
+def test_click_dom_reports_actuation_failure_when_all_tiers_fail() -> None:
+    bc, _calls = _mk_controller_with_page(fail_through={"normal", "force", "evaluate"})
+    out = bc._click_dom_impl(selector="#x", index=1)
+    assert out["ok"] is False
+    assert out["error_code"] == "dom_actuation_failed"
+
+
 def test_b4_prior_computer_use_suite_pass_count_stays_exact() -> None:
     root = Path(__file__).resolve().parent.parent
     prior_files = [
