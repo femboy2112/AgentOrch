@@ -118,7 +118,7 @@ def get_dispatch_budget(
     generator_chain = _parse_chain_csv(generator, list(roles.GENERATOR_CHAIN))
     critic_chain = _parse_chain_csv(critic, list(roles.CRITIC_CHAIN))
     workers: list[str] = list(generator_chain)
-    if mode == "adversarial":
+    if mode in {"adversarial", "master"}:
         workers.extend(critic_chain)
 
     seen: set[str] = set()

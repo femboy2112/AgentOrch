@@ -17,13 +17,13 @@ export async function renderLive(container) {
         const resp = await getLive();
         runs = resp.running || [];
     } catch (_err) {
-        container.innerHTML += `<p style="color:var(--bad)">Failed to load live runs.</p>`;
+        container.innerHTML += `<p style="color:var(--bad)" title="The live endpoint did not return active dispatch data.">Failed to load live runs. Refresh and try again.</p>`;
         return;
     }
 
     const list = document.getElementById('live-list');
     if (runs.length === 0) {
-        list.innerHTML = '<p>No running dispatches.</p>';
+        list.innerHTML = '<p title="No dispatch currently reports as running from the dashboard API.">No active dispatches right now.</p>';
         return;
     }
     list.innerHTML = '';

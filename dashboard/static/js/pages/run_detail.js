@@ -33,6 +33,18 @@ function formatChain(value) {
     return String(value || '');
 }
 
+function renderEmptyState(label, title) {
+    return `<span title="${esc(title)}">${esc(label)}</span>`;
+}
+
+function renderMetaValue(value, label, title) {
+    const text = String(value || '').trim();
+    if (text) {
+        return esc(text);
+    }
+    return renderEmptyState(label, title);
+}
+
 export async function renderRunDetail(container, runId) {
     container.innerHTML = '<h2>Run Detail</h2><div class="card">Loading...</div>';
 
@@ -50,9 +62,9 @@ export async function renderRunDetail(container, runId) {
     container.innerHTML = `
         <h2>Run ${esc(runId)}</h2>
         <div class="card run-header">
-            <div><strong>Mode:</strong> ${esc(meta.mode || '')}</div>
-            <div><strong>Generator:</strong> ${esc(formatChain(meta.generator))}</div>
-            <div><strong>Critic:</strong> ${esc(formatChain(meta.critic || ''))}</div>
+            <div><strong>Mode:</strong> ${renderMetaValue(meta.mode, 'Mode not recorded', 'Run metadata did not include a mode value.')}</div>
+            <div><strong>Generator:</strong> ${renderMetaValue(formatChain(meta.generator), 'Generator chain not recorded', 'Run metadata did not include a generator chain.')}</div>
+            <div><strong>Critic:</strong> ${renderMetaValue(formatChain(meta.critic || ''), 'Critic chain not used', 'This run mode may not use a critic chain, or it was not recorded.')}</div>
             <div><strong>Duration:</strong> ${Number(meta.duration_s || 0).toFixed(2)}s</div>
             <div><strong>Status:</strong> ${meta.success ? 'ok' : 'fail'}</div>
             <div><strong>Changed Files:</strong> ${Array.isArray(meta.changed_files) ? meta.changed_files.length : 0}</div>
@@ -116,7 +128,7 @@ export async function renderRunDetail(container, runId) {
         };
         const artifact = artifactMap[tab];
         if (!artifact) {
-            bodyEl.innerHTML = '<p>Unknown tab.</p>';
+            bodyEl.innerHTML = '<p title="The selected tab is not mapped to a run artifact.">Unknown tab selection.</p>';
             return;
         }
 
@@ -125,7 +137,7 @@ export async function renderRunDetail(container, runId) {
             const raw = await getArtifact(runId, artifact);
             bodyEl.innerHTML = `<pre class="artifact-text">${esc(raw)}</pre>`;
         } catch (_err) {
-            bodyEl.innerHTML = '<p>Artifact unavailable.</p>';
+            bodyEl.innerHTML = `<p title="The ${esc(artifact)} artifact does not exist for this run.">${esc(artifact)} artifact unavailable.</p>`;
         }
     }
 

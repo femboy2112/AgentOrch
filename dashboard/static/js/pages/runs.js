@@ -9,15 +9,45 @@ function esc(value) {
         .replaceAll("'", '&#39;');
 }
 
+function chainToText(value) {
+    if (Array.isArray(value)) {
+        return value.join(',');
+    }
+    return String(value || '').trim();
+}
+
+function renderEmptyState(label, title) {
+    return `<span title="${esc(title)}">${esc(label)}</span>`;
+}
+
+function renderChainCell(value, roleName) {
+    const text = chainToText(value);
+    if (text) {
+        return esc(text);
+    }
+    return renderEmptyState(
+        `${roleName} chain not recorded`,
+        `This run metadata did not include a ${roleName.toLowerCase()} chain.`,
+    );
+}
+
 function formatStart(ts) {
     if (!ts) {
-        return 'n/a';
+        return null;
     }
     const date = new Date(Number(ts) * 1000);
     if (Number.isNaN(date.getTime())) {
-        return 'n/a';
+        return null;
     }
     return date.toLocaleString();
+}
+
+function renderStartCell(ts) {
+    const text = formatStart(ts);
+    if (text) {
+        return esc(text);
+    }
+    return renderEmptyState('Start time unavailable', 'No valid start timestamp was recorded for this run.');
 }
 
 export async function renderRuns(container) {
@@ -110,7 +140,7 @@ export async function renderRuns(container) {
         try {
             payload = await getRuns(params);
         } catch (_err) {
-            bodyEl.innerHTML = '<tr><td colspan="8">Failed to load runs.</td></tr>';
+            bodyEl.innerHTML = '<tr><td colspan="8"><span title="The runs list endpoint did not return data.">Failed to load runs. Try again.</span></td></tr>';
             moreBtn.style.display = 'none';
             return;
         }
@@ -121,7 +151,7 @@ export async function renderRuns(container) {
 
         const rows = payload.runs || [];
         if (rows.length === 0 && reset) {
-            bodyEl.innerHTML = '<tr><td colspan="8">No matching runs.</td></tr>';
+            bodyEl.innerHTML = '<tr><td colspan="8"><span title="No rows matched the current filters.">No runs match these filters.</span></td></tr>';
         }
 
         for (const row of rows) {
@@ -131,12 +161,12 @@ export async function renderRuns(container) {
             tr.innerHTML = `
                 <td>${esc(row.run_id)}</td>
                 <td>${esc(row.mode)}</td>
-                <td>${esc(row.generator || '')}</td>
-                <td>${esc(row.critic || '')}</td>
+                <td>${renderChainCell(row.generator, 'Generator')}</td>
+                <td>${renderChainCell(row.critic, 'Critic')}</td>
                 <td>${Number(row.duration_s || 0).toFixed(2)}s</td>
                 <td>${row.success ? 'ok' : 'fail'}</td>
                 <td>${Number(row.changed_files_count || 0)}</td>
-                <td>${esc(formatStart(row.started_at))}</td>
+                <td>${renderStartCell(row.started_at)}</td>
             `;
             tr.addEventListener('click', () => {
                 window.location.hash = `#/runs/${row.run_id}`;

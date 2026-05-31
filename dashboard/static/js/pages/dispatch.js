@@ -11,6 +11,14 @@ function csvToList(raw) {
         .filter(Boolean);
 }
 
+function parsePositiveInt(raw, fallback) {
+    const value = Number.parseInt(String(raw || ''), 10);
+    if (!Number.isFinite(value) || value < 1) {
+        return fallback;
+    }
+    return value;
+}
+
 export function renderDispatch(container) {
     container.innerHTML = `
         <h2>Dispatch</h2>
@@ -36,6 +44,18 @@ export function renderDispatch(container) {
             <div class="form-group" id="d-critic-group">
                 <label for="d-critic">Critic Chain</label>
                 <input type="text" id="d-critic" list="workers" value="agy,codex,grok">
+            </div>
+            <div class="form-group" id="d-cycles-group">
+                <label for="d-cycles" title="Number of cycle passes for cascade/master workflows.">Cycles</label>
+                <input type="number" id="d-cycles" min="1" step="1" value="2">
+            </div>
+            <div class="form-group" id="d-max-iterations-group">
+                <label for="d-max-iterations" title="Maximum generator/critic rounds for adversarial/master workflows.">Max Iterations</label>
+                <input type="number" id="d-max-iterations" min="1" step="1" value="5">
+            </div>
+            <div class="form-group" id="d-branches-group">
+                <label for="d-branches" title="Master workflow branch fan-out used by the planner.">Branches</label>
+                <input type="number" id="d-branches" min="1" step="1" value="3">
             </div>
             <datalist id="workers">
                 ${WORKERS.map((w) => `<option value="${w}"></option>`).join('')}
@@ -64,6 +84,12 @@ export function renderDispatch(container) {
     const genEl = document.getElementById('d-gen');
     const criticEl = document.getElementById('d-critic');
     const criticGroup = document.getElementById('d-critic-group');
+    const cyclesEl = document.getElementById('d-cycles');
+    const cyclesGroup = document.getElementById('d-cycles-group');
+    const maxIterationsEl = document.getElementById('d-max-iterations');
+    const maxIterationsGroup = document.getElementById('d-max-iterations-group');
+    const branchesEl = document.getElementById('d-branches');
+    const branchesGroup = document.getElementById('d-branches-group');
     const budgetEl = document.getElementById('d-budget');
 
     async function loadLast3() {
@@ -96,7 +122,16 @@ export function renderDispatch(container) {
 
     async function updateBudget() {
         const mode = modeEl.value;
-        criticGroup.style.display = mode === 'adversarial' ? 'block' : 'none';
+        const showCritic = mode === 'adversarial' || mode === 'master';
+        const showCycles = mode === 'cascade' || mode === 'master';
+        const showMaxIterations = mode === 'adversarial' || mode === 'master';
+        const showBranches = mode === 'master';
+
+        criticGroup.style.display = showCritic ? 'block' : 'none';
+        cyclesGroup.style.display = showCycles ? 'block' : 'none';
+        maxIterationsGroup.style.display = showMaxIterations ? 'block' : 'none';
+        branchesGroup.style.display = showBranches ? 'block' : 'none';
+
         const b = await getBudget(mode, genEl.value, criticEl.value);
         if (b && b.rows) {
             budgetEl.innerHTML = '<strong>Budget:</strong> ' + b.rows.map((r) =>
@@ -123,6 +158,9 @@ export function renderDispatch(container) {
         const webSearch = document.getElementById('d-web').checked;
         const testCmd = document.getElementById('d-test-cmd').value.trim();
         const outDir = document.getElementById('d-out-dir').value.trim();
+        const cycles = parsePositiveInt(cyclesEl.value, 2);
+        const maxIterations = parsePositiveInt(maxIterationsEl.value, 5);
+        const branches = parsePositiveInt(branchesEl.value, 3);
 
         const payload = {
             instruction: inst,
@@ -132,8 +170,17 @@ export function renderDispatch(container) {
             web_search: webSearch,
             test_cmd: testCmd || undefined,
         };
-        if (mode === 'adversarial') {
+        if (mode === 'adversarial' || mode === 'master') {
             payload.critic_chain = critic.length ? critic : undefined;
+        }
+        if (mode === 'cascade' || mode === 'master') {
+            payload.cycles = cycles;
+        }
+        if (mode === 'adversarial' || mode === 'master') {
+            payload.max_iterations = maxIterations;
+        }
+        if (mode === 'master') {
+            payload.branches = branches;
         }
         if (outDir) {
             payload.out_dir = outDir;
