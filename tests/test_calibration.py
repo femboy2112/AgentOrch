@@ -70,8 +70,31 @@ def test_budget_tightens_with_enough_passing_rows():
     p95_tokens = max(r["out_tokens"] for r in rows)
     expected = max(int(p95_tokens * BYTES_PER_TOKEN * 5.0), 8_000)
     assert max_bytes == expected
-    # Stall budget should reflect p95 wall_ms * multiplier, floored at 30s.
-    assert stall >= 30.0
+    # Stall budget = max(p95 wall_ms * multiplier, per-worker default). Here
+    # p95 wall ~5.4s * 5 = 27s, well below claude's 180s floor, so it floors at
+    # the per-worker default — NOT a hardcoded 30s. (Issue #29.)
+    assert stall == DEFAULT_STALL_SECONDS_BY_WORKER["claude"]
+
+
+def test_calibrated_stall_never_below_per_worker_default():
+    """Regression for #29: a calibrated config must never get a *tighter* stall
+    window than the uncalibrated cold-start default. A fast-returning codex
+    config (tiny p95 wall) used to floor at a hardcoded 30s — far below codex's
+    600s cold-start default — which killed silent high-effort reasoning workers
+    before their first token. The floor is now the per-worker default."""
+    t = CalibrationTable(multiplier=5.0)
+    # 4 fast codex:high runs: p95 wall 2s * 5 = 10s, below the old 30s floor and
+    # far below codex's 600s default.
+    rows = [{"worker": "codex", "model": "standard", "effort": "high",
+             "ok": True, "out_tokens": 50, "wall_ms": 2000} for _ in range(4)]
+    t.ingest(rows)
+    assert t.has_data_for("codex", "standard", "high")
+    _, calibrated_stall = t.budget_for("codex", "standard", "high")
+    # Must NOT collapse to 30s — floors at codex's cold-start default.
+    assert calibrated_stall == DEFAULT_STALL_SECONDS_BY_WORKER["codex"]
+    # Invariant: calibrated >= uncalibrated for the same config.
+    _, uncalibrated_stall = CalibrationTable().budget_for("codex", "standard", "high")
+    assert calibrated_stall >= uncalibrated_stall
 
 
 def test_load_missing_file_returns_empty_table(tmp_path):

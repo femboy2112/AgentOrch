@@ -166,8 +166,12 @@ class CalibrationTable:
             p95_wall_ms = quantiles(wall_samples, n=20)[-1] if len(wall_samples) >= 20 else max(wall_samples)
             # Stall ceiling: a successful run took p95 ms; if a new run has produced
             # NO output for >p95 wall, it's almost certainly stalled. Multiply for
-            # safety; floor at 30s so tiny tasks don't ship a 5s stall budget.
-            stall_seconds = max(p95_wall_ms / 1000 * self.multiplier, 30.0)
+            # safety. Floor at the per-worker cold-start default (NOT a hardcoded
+            # 30s): a calibrated config must never get a *tighter* stall window than
+            # an uncalibrated one, or gathering data would make the watchdog more
+            # trigger-happy and kill silent high-effort reasoning workers (e.g. codex
+            # effort=high) before their first token. See issue #29.
+            stall_seconds = max(p95_wall_ms / 1000 * self.multiplier, default_stall)
         return (max_bytes, stall_seconds)
 
     def has_data_for(self, worker: str, model: str, effort: Optional[str]) -> bool:
