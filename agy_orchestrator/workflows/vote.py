@@ -390,21 +390,87 @@ class VoteWorkflow:
 
     @staticmethod
     def _preflight_refusal(pristine) -> str:
+        """Build the refusal message, branched on the pristine verifier's exit
+        code (#35).
+
+        The two failure modes have different root causes and need different
+        guidance — conflating them misdiagnoses the now-common post-#34 path:
+
+          * exit 127/126 (command not found / not executable) -> the verifier
+            BINARY never started: environmental by definition (the absent
+            `.venv/bin/pytest` of a stripped editable-install workspace).
+          * any other non-zero -> the verifier RAN but the suite FAILED: the
+            isolated/bootstrapped env didn't reproduce the working tree's
+            passing state (most often an undeclared/transitive dependency the
+            `--candidate-setup` didn't install, or a suite that depends on
+            untracked files / CWD / external state).
+
+        Either way include the verifier's captured output tail so the failing
+        tests are visible without a manual repro (#35 defect 2).
+        """
         msg = (pristine.message or "").strip()
+        rc = getattr(pristine, "returncode", None)
+        output = VoteWorkflow._verifier_output_tail(pristine)
+        diag = f"Pristine-workspace verifier said: {msg[:300]}"
+        if output:
+            diag += f"\n--- pristine verifier output (tail) ---\n{output}"
+
+        # "command not found" can surface as 127, "not executable" as 126; some
+        # shells/tools also spell it in the message — treat all as env-absent.
+        msg_lower = msg.lower()
+        env_absent = rc in (126, 127) or "command not found" in msg_lower
+
+        if env_absent:
+            return (
+                "vote preflight refused: an isolated candidate workspace can't "
+                "even START the verifier (exit "
+                f"{rc if rc is not None else '127'} = command not found), but the "
+                "real tree passes — so the isolation strips a tool the gate "
+                "needs. The common cause is a git-ignored .venv with an editable "
+                "install (`pip install -e .`): a git worktree (or a copy, which "
+                "skips .venv) checks out tracked files only, so `.venv/bin/pytest` "
+                "is absent and EVERY candidate would fail for environmental — not "
+                "code — reasons (0/K). Refusing now instead of burning a long "
+                "run. Fix: configure `--candidate-setup` to rebuild the env in "
+                "each workspace (e.g. `python -m venv .venv && .venv/bin/pip "
+                "install -e .`), use `--mode master` (it operates on the real "
+                "tree with its real venv + editable install and verifies "
+                "serially), or give the target a self-contained verifier (e.g. "
+                "`python -m pytest`, no editable install). "
+                f"{diag}"
+            )
+
         return (
-            "vote preflight refused: an isolated candidate workspace fails the "
-            "verifier that the real tree passes, so the isolation strips "
-            "something the gate needs. The common cause is a git-ignored .venv "
-            "with an editable install (`pip install -e .`): a git worktree (or a "
-            "copy, which skips .venv) checks out tracked files only, so "
-            "`.venv/bin/pytest` is absent and EVERY candidate would fail for "
-            "environmental — not code — reasons (0/K). Refusing now instead of "
-            "burning a long run. Fix: use `--mode master` (it operates on the "
-            "real tree with its real venv + editable install and verifies "
-            "serially), or give the target a self-contained verifier (e.g. "
-            "`python -m pytest`, no editable install). "
-            f"Pristine-workspace verifier said: {msg[:300]}"
+            "vote preflight refused: an isolated candidate workspace BUILT and "
+            f"the verifier RAN, but it FAILED (exit {rc}), while the real tree "
+            "passes — so the bootstrapped candidate environment did not reproduce "
+            "the working tree's passing state. This is NOT the missing-.venv case "
+            "(the verifier started and ran tests); the most likely cause is an "
+            "undeclared or transitive dependency present in the real environment "
+            "but not installed by your `--candidate-setup` (compare with a "
+            "`pip freeze` diff between the real venv and a freshly bootstrapped "
+            "one), or a suite that depends on untracked files / CWD / external "
+            "state. Refusing now instead of returning 0/K after a long run. Fix: "
+            "make `--candidate-setup` reproduce the real env (declare the missing "
+            "dep in your project's extras, or install it in the setup command), "
+            "or use `--mode master` (it verifies the real tree in place). "
+            f"{diag}"
         )
+
+    @staticmethod
+    def _verifier_output_tail(result, limit: int = 1200) -> str:
+        """Last `limit` chars of the verifier's captured stdout/stderr — the
+        actual failing test names — so the refusal is diagnosable without a
+        manual repro (#35). Returns '' when nothing was captured."""
+        parts = []
+        for label, attr in (("stdout", "stdout_tail"), ("stderr", "stderr_tail")):
+            text = (getattr(result, attr, "") or "").strip()
+            if text:
+                parts.append(f"[{label}]\n{text}")
+        if not parts:
+            return ""
+        combined = "\n".join(parts)
+        return combined[-limit:]
 
     async def _run_one(
         self, idx: int, gen: AgentInstance, ws: _ManagedWorkspace,
