@@ -54,6 +54,7 @@ class AdversarialReview:
         diff_only: bool = False,
         working_directory: str = ".",
         critic_preamble: str = "",
+        critic_requirement: Optional[str] = None,
         event_callback: Optional[Callable[[dict], None]] = None,
     ):
         self.generator = generator_instance
@@ -71,6 +72,11 @@ class AdversarialReview:
         self.working_directory = working_directory
         # When non-empty, this text is prepended to the critic prompt to push the review toward catastrophic-failure focus (opt-in, e.g. mission-critical dispatches).
         self.critic_preamble = critic_preamble
+        # The requirement the critic judges against. None => use initial_prompt (the
+        # generator's full prompt). The harness passes a preamble-stripped view here
+        # so the critic isn't re-reading worker process-discipline boilerplate every
+        # iteration (win 4). The GENERATOR still gets the full initial_prompt.
+        self.critic_requirement = critic_requirement
         # Quality signals, populated by execute() for the run ledger (task #9).
         self.iterations_used = 0
         self.approved = False
@@ -172,9 +178,10 @@ class AdversarialReview:
                 continue
 
             # LLM Critic Gate
+            critic_requirement = self.critic_requirement or initial_prompt
             critic_prompt = (
                 f"Please review the following output against the original requirement.\n"
-                f"Original Requirement:\n{initial_prompt}\n\n"
+                f"Original Requirement:\n{critic_requirement}\n\n"
                 f"Generated Output:\n{last_output}\n\n"
                 f"CRITICAL REVIEW INSTRUCTIONS:\n"
                 f"1. CORRECTNESS: Verify the output fully and accurately satisfies the requirement. "

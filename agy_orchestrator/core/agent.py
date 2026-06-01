@@ -357,13 +357,33 @@ class AgentInstance(ABC):
             if buf:
                 _emit_line(bytes(buf), echo, stream)
 
+        # Signalled the instant the child is reaped, so the watchdog stops waiting
+        # immediately on a finished call instead of holding it for up to a full 2s
+        # poll slice (the residual streaming tail — issue: single-run speed). The 2s
+        # cadence is PRESERVED for the stall/verbose budget checks via the timeout.
+        exited = asyncio.Event()
+
+        async def _await_exit() -> None:
+            try:
+                await process.wait()
+            finally:
+                exited.set()
+
         async def _watchdog() -> None:
-            # Poll every 2s; cheap relative to subprocess scheduling, fine-grained
-            # enough that a runaway emitting 10KB/s trips within one tick of budget.
+            # Wake on child-exit OR every 2s, whichever comes first; 2s is cheap
+            # relative to subprocess scheduling, fine-grained enough that a runaway
+            # emitting 10KB/s trips within one tick of budget.
             if max_output_bytes <= 0 and stall_seconds <= 0:
                 return
             while process.returncode is None:
-                await asyncio.sleep(2.0)
+                try:
+                    await asyncio.wait_for(exited.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+                # Child finished within the slice — exit now, no spurious budget
+                # check, no tail. (process.wait() in _await_exit set the returncode.)
+                if process.returncode is not None:
+                    return
                 if max_output_bytes > 0 and out_total[0] > max_output_bytes:
                     self._watchdog_reason = WATCHDOG_VERBOSE
                     logger.warning("watchdog: VERBOSE trip — %d bytes > budget %d; killing",
@@ -389,8 +409,20 @@ class AgentInstance(ABC):
             _drain(process.stdout, out_chunks, echo=False, count=True, stream="stdout"),
             _drain(process.stderr, err_chunks, echo=True, count=False, stream="stderr"),
             _watchdog(),
+            _await_exit(),
         )
         await process.wait()
+        # Verbose-runaway is a trip even when the child dumped a pathological amount
+        # of output and then EXITED before a 2s poll tick caught it (the watchdog now
+        # wakes immediately on exit, so it no longer trips post-hoc inside the loop).
+        # out_total is fully drained here, so do the final budget check — preserves
+        # the FallbackAgent re-route on a completed runaway. Stall is deliberately
+        # NOT re-checked: a child that exited is not stalled.
+        if (not self._watchdog_reason and max_output_bytes > 0
+                and out_total[0] > max_output_bytes):
+            self._watchdog_reason = WATCHDOG_VERBOSE
+            logger.warning("watchdog: VERBOSE trip (post-exit) — %d bytes > budget %d",
+                           out_total[0], max_output_bytes)
         self.last_out_bytes = out_total[0]
         return b"".join(out_chunks), b"".join(err_chunks)
 

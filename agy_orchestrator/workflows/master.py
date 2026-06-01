@@ -496,6 +496,10 @@ class MasterWorkflow:
                     tot_evaluator,
                     selector=self.selector,
                     event_callback=self.event_callback,
+                    # Ground branch scoring in THIS step's task so the judge picks
+                    # the branch that best solves the step, not the most internally
+                    # polished one (win 5).
+                    requirement=task,
                 )
                 best_tot_output = await tot.execute()
 

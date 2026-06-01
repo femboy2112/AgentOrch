@@ -1,0 +1,4 @@
+Add a small pure-Python utility module `textstats.py` exposing `word_count(s: str) -> int`
+and `char_histogram(s: str) -> dict[str, int]`, with type hints and docstrings, plus a
+focused pytest covering empty input, unicode, and repeated characters. Keep it minimal
+and match the surrounding code style.
