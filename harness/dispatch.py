@@ -340,6 +340,7 @@ async def _run_workflow(
     post_construct_hook: Optional[roles.RolePostConstructHook] = None,
     working_directory: str = ".",
     mission_critical: bool = False,
+    baseline_result: Optional[VerifierResult] = None,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
@@ -482,6 +483,9 @@ async def _run_workflow(
             generators=vote_generators,
             verifier=verifier,
             working_directory=working_directory,
+            # Reuse the baseline gate the harness just ran on the unchanged base
+            # tree (#33) — lets the preflight skip a redundant full-suite re-run.
+            baseline_ok=(baseline_result.ok if baseline_result is not None else None),
         )
         return await wf.execute(prompt), wf
 
@@ -782,6 +786,7 @@ async def dispatch_async(
                 post_construct_hook=_post_construct_hook,
                 working_directory=str(work_dir),
                 mission_critical=mission_critical,
+                baseline_result=baseline_result,
             )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False

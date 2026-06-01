@@ -113,6 +113,7 @@ class VoteWorkflow:
         prefer_worktree: bool = True,
         verifier_concurrency: int = 1,
         preflight: bool = True,
+        baseline_ok: Optional[bool] = None,
     ):
         if not generators:
             raise ValueError("VoteWorkflow needs at least one generator")
@@ -135,6 +136,12 @@ class VoteWorkflow:
         # Fail-fast preflight (issue #32 defect 1): refuse before fanning out
         # K candidates if an isolated workspace can't even run the verifier.
         self.preflight = preflight
+        # Reusable baseline verifier outcome on the UNCHANGED base tree, if the
+        # caller already computed it (the harness runs a baseline gate seconds
+        # before us). Lets the preflight skip a redundant full-suite re-run of
+        # the base (#33). None = unknown; the preflight probes the base if it
+        # needs to disambiguate a non-127 failure.
+        self.baseline_ok = baseline_ok
         self._verify_sem: Optional[asyncio.Semaphore] = None
         # Ledger signals.
         self.verified = False
@@ -254,20 +261,29 @@ class VoteWorkflow:
         for environmental — not code — reasons, so vote silently returns 0/K
         after a long, expensive run.
 
-        Detect this generally (no venv-specific hardcoding) by comparing the
-        verifier outcome on a PRISTINE isolated workspace vs the real base tree:
+        Detect this generally (no venv-specific hardcoding) by checking a
+        PRISTINE isolated workspace against the real base tree:
 
           * pristine workspace passes      -> environment is fine; proceed.
-          * pristine fails AND base fails  -> genuine red baseline; vote is
-                                              legitimately being used to fix
-                                              it, so proceed (don't refuse).
-          * pristine fails BUT base passes -> isolation stripped something the
+          * pristine fails with exit 127   -> the verifier binary is absent from
+            ("command not found")             the workspace = environmental by
+                                              definition; refuse immediately, no
+                                              base run needed (#33).
+          * pristine fails (other) AND
+            base fails                     -> genuine red baseline; vote is
+                                              legitimately being used to fix it,
+                                              so proceed (don't refuse).
+          * pristine fails (other) BUT
+            base passes                    -> isolation stripped something the
                                               gate needs; every candidate would
                                               fail environmentally. Refuse.
 
-        Cost: one verifier run on a pristine workspace always; a second on the
-        base tree only when the first fails. Both serial — far cheaper than the
-        K generations + K verifiers a doomed run would burn.
+        Cost: one verifier run on a pristine workspace always (instant in the
+        common exit-127 case). The base half is taken from the caller-supplied
+        baseline when available (#33 — the harness ran it seconds ago on the
+        same unchanged tree); only a non-127 failure with no reusable baseline
+        pays a base re-run. Far cheaper than the K generations + K verifiers a
+        doomed run would burn.
         """
         try:
             async with candidate_workspace(
@@ -285,16 +301,30 @@ class VoteWorkflow:
         if pristine.ok:
             return None
 
-        # Pristine workspace failed. Distinguish a broken isolated environment
-        # from a genuinely red baseline by checking the real tree.
-        base = await self.verifier.verify(working_directory=self.working_directory)
-        if not base.ok:
-            logger.info(
-                "Vote preflight: verifier red on both the pristine workspace and "
-                "the base tree — treating as a genuine red baseline; proceeding."
-            )
-            return None
+        # Exit 127 = the verifier command itself couldn't start (missing binary,
+        # e.g. the absent `.venv/bin/pytest`). That's environmental by
+        # definition, so refuse without re-running the base tree (#33).
+        if pristine.returncode != 127:
+            # Other non-zero exit: distinguish a broken isolated environment
+            # from a genuinely red baseline. Reuse the caller's baseline if we
+            # have it (no redundant base run); otherwise probe the base once.
+            base_ok = self.baseline_ok
+            if base_ok is None:
+                base = await self.verifier.verify(
+                    working_directory=self.working_directory,
+                )
+                base_ok = base.ok
+            if not base_ok:
+                logger.info(
+                    "Vote preflight: verifier red on both the pristine workspace "
+                    "and the base tree — genuine red baseline; proceeding."
+                )
+                return None
 
+        return self._preflight_refusal(pristine)
+
+    @staticmethod
+    def _preflight_refusal(pristine) -> str:
         msg = (pristine.message or "").strip()
         return (
             "vote preflight refused: an isolated candidate workspace fails the "
