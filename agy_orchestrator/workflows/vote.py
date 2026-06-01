@@ -111,6 +111,8 @@ class VoteWorkflow:
         verifier: QualityVerifier,
         working_directory: str = ".",
         prefer_worktree: bool = True,
+        verifier_concurrency: int = 1,
+        preflight: bool = True,
     ):
         if not generators:
             raise ValueError("VoteWorkflow needs at least one generator")
@@ -124,6 +126,16 @@ class VoteWorkflow:
         self.verifier = verifier
         self.working_directory = working_directory
         self.prefer_worktree = prefer_worktree
+        # Host safety (issue #32 defect 2): K candidates generate concurrently
+        # (remote-API-bound, cheap locally) but their verifiers are the local
+        # spike — a full `make check` × K can OOM/freeze a small-RAM box. Cap
+        # how many verifier runs execute at once; default 1 keeps verifiers
+        # serial (like master mode) while generation stays parallel.
+        self.verifier_concurrency = max(1, int(verifier_concurrency))
+        # Fail-fast preflight (issue #32 defect 1): refuse before fanning out
+        # K candidates if an isolated workspace can't even run the verifier.
+        self.preflight = preflight
+        self._verify_sem: Optional[asyncio.Semaphore] = None
         # Ledger signals.
         self.verified = False
         self.n_candidates = len(self.generators)
@@ -135,6 +147,20 @@ class VoteWorkflow:
         self.candidate_outcomes: List[Tuple[bool, Optional[str]]] = []
 
     async def execute(self, prompt: str) -> str:
+        # Bind the verifier concurrency gate to the running loop.
+        self._verify_sem = asyncio.Semaphore(self.verifier_concurrency)
+
+        # Fail fast if the isolated-workspace environment can't honestly run
+        # the verifier (e.g. git-ignored .venv + editable install) — refusing
+        # here is far cheaper than burning K generations + K verifiers for 0/K.
+        if self.preflight:
+            reason = await self._preflight_environment_check()
+            if reason:
+                self.verified = False
+                self.n_passed = 0
+                self.winner_index = -1
+                raise RuntimeError(reason)
+
         # Seed every generator with the same prompt; differences come from
         # model temperature + provider variation, not prompt drift.
         for gen in self.generators:
@@ -216,6 +242,75 @@ class VoteWorkflow:
                 *[ws.close() for ws in workspaces], return_exceptions=True,
             )
 
+    async def _preflight_environment_check(self) -> Optional[str]:
+        """Return a human-readable refusal reason if an isolated candidate
+        workspace cannot honestly run the verifier, else None.
+
+        Issue #32 defect 1: a candidate workspace is a `git worktree`
+        (tracked files only) or a copy that deliberately skips `.venv`
+        (workspace.py COPY_IGNORE_PATTERNS). A target whose verifier resolves
+        its tools out of a git-ignored venv (`make check` -> `.venv/bin/pytest`,
+        the common editable-install layout) therefore fails in EVERY candidate
+        for environmental — not code — reasons, so vote silently returns 0/K
+        after a long, expensive run.
+
+        Detect this generally (no venv-specific hardcoding) by comparing the
+        verifier outcome on a PRISTINE isolated workspace vs the real base tree:
+
+          * pristine workspace passes      -> environment is fine; proceed.
+          * pristine fails AND base fails  -> genuine red baseline; vote is
+                                              legitimately being used to fix
+                                              it, so proceed (don't refuse).
+          * pristine fails BUT base passes -> isolation stripped something the
+                                              gate needs; every candidate would
+                                              fail environmentally. Refuse.
+
+        Cost: one verifier run on a pristine workspace always; a second on the
+        base tree only when the first fails. Both serial — far cheaper than the
+        K generations + K verifiers a doomed run would burn.
+        """
+        try:
+            async with candidate_workspace(
+                Path(self.working_directory),
+                candidate_id="vote-preflight",
+                prefer_worktree=self.prefer_worktree,
+            ) as (ws_path, _backend):
+                pristine = await self.verifier.verify(working_directory=str(ws_path))
+        except Exception as exc:
+            # Couldn't even build/probe the workspace — let the real run
+            # surface the error rather than guessing at a refusal here.
+            logger.warning("Vote preflight probe failed to run (%s); skipping", exc)
+            return None
+
+        if pristine.ok:
+            return None
+
+        # Pristine workspace failed. Distinguish a broken isolated environment
+        # from a genuinely red baseline by checking the real tree.
+        base = await self.verifier.verify(working_directory=self.working_directory)
+        if not base.ok:
+            logger.info(
+                "Vote preflight: verifier red on both the pristine workspace and "
+                "the base tree — treating as a genuine red baseline; proceeding."
+            )
+            return None
+
+        msg = (pristine.message or "").strip()
+        return (
+            "vote preflight refused: an isolated candidate workspace fails the "
+            "verifier that the real tree passes, so the isolation strips "
+            "something the gate needs. The common cause is a git-ignored .venv "
+            "with an editable install (`pip install -e .`): a git worktree (or a "
+            "copy, which skips .venv) checks out tracked files only, so "
+            "`.venv/bin/pytest` is absent and EVERY candidate would fail for "
+            "environmental — not code — reasons (0/K). Refusing now instead of "
+            "burning a long run. Fix: use `--mode master` (it operates on the "
+            "real tree with its real venv + editable install and verifies "
+            "serially), or give the target a self-contained verifier (e.g. "
+            "`python -m pytest`, no editable install). "
+            f"Pristine-workspace verifier said: {msg[:300]}"
+        )
+
     async def _run_one(
         self, idx: int, gen: AgentInstance, ws: _ManagedWorkspace,
     ) -> Tuple[Optional[str], bool, Optional[str]]:
@@ -234,7 +329,10 @@ class VoteWorkflow:
             )
             return None, False, f"{type(exc).__name__}: {exc}"
         try:
-            result = await self.verifier.verify(working_directory=str(ws.path))
+            # Throttle concurrent verifier runs — the local resource spike.
+            assert self._verify_sem is not None  # set in execute()
+            async with self._verify_sem:
+                result = await self.verifier.verify(working_directory=str(ws.path))
         except Exception as exc:
             logger.warning(
                 "Vote candidate %d (%s) verifier raised: %s",

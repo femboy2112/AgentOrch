@@ -109,6 +109,11 @@ class _ScriptedVerifier:
         for path in Path(working_directory).rglob("*"):
             if not path.is_file():
                 continue
+            # A real verifier (make/pytest) never greps .git; skip it so the
+            # worktree-vs-base asymmetry (.git is a dir in base, a file in a
+            # worktree) can't produce a phantom match.
+            if ".git" in path.parts:
+                continue
             try:
                 content = path.read_text()
             except (OSError, UnicodeDecodeError):
