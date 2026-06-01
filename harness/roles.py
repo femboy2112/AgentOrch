@@ -43,6 +43,23 @@ AGENT_CLASSES: Dict[str, Type[AgentInstance]] = {
     # Step 12: 'computer-use' resolves via special-case below (shim, not AgentInstance subclass)
 }
 
+
+def _class_for(name: str) -> Type[AgentInstance]:
+    """Resolve a worker token to its agent class.
+
+    Single factory indirection for the speed benchmark: with ``AGY_BENCH_MOCK=1``
+    every real worker class is swapped for a hermetic ``MockAgent`` bound to that
+    worker name, so a dispatch runs end-to-end (prompt construction, baseline
+    verify, streaming/watchdog, usage events, meta.json) with ZERO network and ZERO
+    contention on the codex/agy/grok pool. The mock class is stable per name, so it
+    keys ``configs_by_cls``/``name_by_cls`` consistently with instantiation. No
+    effect on a normal run (env unset → the real class).
+    """
+    if os.environ.get("AGY_BENCH_MOCK"):
+        from agy_orchestrator.core.agents.mock_agent import mock_agent_class_for
+        return mock_agent_class_for(name)
+    return AGENT_CLASSES[name]
+
 # computer-use is a standard selectable worker token (Step 12 wiring).
 # It does not resolve to an LLM AgentInstance; dispatch short-circuits to
 # ComputerUseWorkerAdapter for --generator computer-use (direct mode).
@@ -195,7 +212,7 @@ def _configs_for(
         name, cfg = _cfg_for_token(token, codex_config, overrides)
         if name == COMPUTER_USE_TOKEN:
             continue  # Step 12: cu never participates in LLM fallback dicts
-        out[AGENT_CLASSES[name]] = cfg
+        out[_class_for(name)] = cfg
     return out
 
 
@@ -247,7 +264,7 @@ def build_role_agent(
         return agent  # type: ignore[return-value]
 
     if not fallback or len(chain) == 1:
-        cls = AGENT_CLASSES[lead_name]
+        cls = _class_for(lead_name)
         agent = cls(prompt=prompt, **lead_cfg)
         _arm_watchdog(agent, lead_name, lead_cfg, scale=watchdog_scale)
         if post_construct_hook is not None:
@@ -257,13 +274,13 @@ def build_role_agent(
                 pass
         return agent
 
-    classes = [AGENT_CLASSES[name] for name in chain]
+    classes = [_class_for(name) for name in chain]
     configs_by_cls = _configs_for(chain, codex_config, overrides)
     # name_by_cls maps each agent class back to its worker token so the hook can
     # look up the right (worker, model, effort) budget for whichever sub the
     # FallbackAgent instantiates this attempt.
     name_by_cls: Dict[Type[AgentInstance], str] = {
-        AGENT_CLASSES[name]: name for name in chain
+        _class_for(name): name for name in chain
     }
 
     def arm_hook(sub: AgentInstance, agent_cls: Type[AgentInstance]) -> None:
@@ -312,7 +329,7 @@ def build_master_agent_class(
         # cu not supported in master workflows; return a stub class for graceful fail
         return ComputerUseShim, lead_cfg["model"], lead_cfg["effort"]
     if not fallback or len(chain) == 1:
-        cls = AGENT_CLASSES[lead_name]
+        cls = _class_for(lead_name)
         if post_construct_hook is None:
             return cls, lead_cfg["model"], lead_cfg["effort"]
 
@@ -326,10 +343,10 @@ def build_master_agent_class(
 
         HookedLead.__name__ = f"Hooked{cls.__name__}"
         return HookedLead, lead_cfg["model"], lead_cfg["effort"]
-    classes = [AGENT_CLASSES[name] for name in chain]
+    classes = [_class_for(name) for name in chain]
     configs_by_cls = _configs_for(chain, codex_config, overrides)
     name_by_cls: Dict[Type[AgentInstance], str] = {
-        AGENT_CLASSES[name]: name for name in chain
+        _class_for(name): name for name in chain
     }
 
     def arm_hook(sub: AgentInstance, agent_cls: Type[AgentInstance]) -> None:

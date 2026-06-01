@@ -80,12 +80,17 @@ def _vr(ok: bool, *, returncode: int = 0, error_hash: Optional[str] = None,
     )
 
 
-def _run_feedback(tmp_path: Path, monkeypatch, scripted: List[object]):
+def _run_feedback(tmp_path: Path, monkeypatch, scripted: List[object],
+                  baseline_gate: bool = True):
     monkeypatch.setattr(dispatch_mod, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(dispatch_mod, "QualityVerifier", _ScriptedVerifier)
     _ScriptedVerifier.scripted = scripted
     _ScriptedVerifier.seen_cwds = []
     out_dir = tmp_path / "work"
+    # The verifier-delta telemetry derives from the pre-run baseline, which is now
+    # opt-in for non-vote modes (single-run speed: it's skipped by default so a full
+    # --test-cmd suite doesn't sit on the critical path). These tests exercise that
+    # telemetry path, so they request it explicitly via baseline_gate=True.
     return dispatch_mod.dispatch(
         "noop",
         mode="feedback",
@@ -93,6 +98,7 @@ def _run_feedback(tmp_path: Path, monkeypatch, scripted: List[object]):
         test_cmd="true",
         max_iterations=1,
         out_dir=out_dir,
+        baseline_gate=baseline_gate,
     )
 
 
@@ -134,6 +140,21 @@ def test_baseline_failing_final_failing_is_unchanged(tmp_path, monkeypatch):
     assert result.success is True
     assert result.quality["verifier_delta"] == "unchanged"
     assert result.quality["baseline_ok"] is False
+
+
+def test_baseline_skipped_by_default_no_delta(tmp_path, monkeypatch):
+    # Single-run speed (rank-1): without --baseline-gate the pre-run baseline does
+    # NOT run for non-vote modes, so only the in-loop workflow verifier executes
+    # (one scripted call) and there is no verifier_delta telemetry. The real gate
+    # still runs, so success is unaffected.
+    result = _run_feedback(
+        tmp_path, monkeypatch, [_vr(True, duration_ms=2)], baseline_gate=False,
+    )
+    assert result.success is True
+    assert result.quality.get("verifier_delta") is None
+    assert result.quality.get("baseline_ok") is None
+    # Exactly one verify happened (the in-loop gate), not two (baseline + gate).
+    assert len(_ScriptedVerifier.seen_cwds) == 1
 
 
 def test_no_verifier_means_no_delta(tmp_path, monkeypatch):

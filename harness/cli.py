@@ -218,6 +218,7 @@ def _cmd_do(args) -> int:
         watchdog_scale=args.watchdog_scale,
         max_parallel_workers=args.max_parallel_workers,
         worker_mem_max=args.worker_mem_max,
+        baseline_gate=args.baseline_gate,
         reconcile=args.reconcile,
         reconcile_disposition=args.reconcile_disposition,
         web_search=args.web_search,
@@ -455,6 +456,12 @@ def main(argv=None) -> int:
                      help="Per-candidate verifier memory cap for vote/tot (e.g. 4G), run "
                           "in its own systemd scope like --verifier-mem-max (#39). Guards "
                           "against an OOM/freeze when --branches>1 verify in parallel.")
+    eff.add_argument("--baseline-gate", action="store_true",
+                     help="Run the pre-run baseline verifier (the FULL --test-cmd suite on "
+                          "the unchanged tree) for non-vote modes too. Off by default: the "
+                          "baseline only feeds telemetry outside vote mode, so skipping it "
+                          "removes a serial test-suite from the critical path. Set this to "
+                          "restore the verifier_delta (preserved/regressed/fixed) telemetry.")
     # Reconciliation / Integration-Skeptic station (#43).
     rec = do.add_argument_group("reconciliation station (#43)")
     rec.add_argument("--reconcile", action="store_true",

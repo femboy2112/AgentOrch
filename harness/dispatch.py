@@ -779,6 +779,10 @@ async def dispatch_async(
     watchdog_scale: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     worker_mem_max: Optional[str] = None,
+    # Pre-run baseline verifier gate (single-run speed: skip the full --test-cmd
+    # suite on the unchanged tree for non-vote modes, where it only feeds telemetry).
+    # True restores the always-run baseline (and its verifier_delta telemetry).
+    baseline_gate: bool = False,
     # Reconciliation / Integration-Skeptic station (#43)
     reconcile: bool = False,
     reconcile_disposition: Optional[str] = None,
@@ -1048,7 +1052,16 @@ async def dispatch_async(
     else:
         verifier = None
     baseline_result: Optional[VerifierResult] = None
-    if verifier is not None:
+    # Single-run speed: the pre-run baseline runs the FULL --test-cmd suite on the
+    # unchanged tree before any worker starts. Only vote mode consumes its result
+    # for a real decision (its red-on-both / skip-redundant-rerun preflight, line
+    # ~630). For every other mode it feeds telemetry ONLY — verifier_delta
+    # (_derive_verifier_delta returns None when baseline is None), three meta
+    # fields, and an OOM-vs-fail notification label — all of which already handle a
+    # None baseline (it is set None on exception today). So skip the baseline for
+    # non-vote modes unless the operator opts back in via --baseline-gate.
+    _run_baseline = verifier is not None and (mode == "vote" or baseline_gate)
+    if _run_baseline:
         try:
             baseline_result = await verifier.verify(working_directory=str(work_dir))
             if baseline_result.ok:
@@ -1414,6 +1427,7 @@ def dispatch(
     watchdog_scale: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     worker_mem_max: Optional[str] = None,
+    baseline_gate: bool = False,
     reconcile: bool = False,
     reconcile_disposition: Optional[str] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
@@ -1468,6 +1482,7 @@ def dispatch(
             watchdog_scale=watchdog_scale,
             max_parallel_workers=max_parallel_workers,
             worker_mem_max=worker_mem_max,
+            baseline_gate=baseline_gate,
             reconcile=reconcile,
             reconcile_disposition=reconcile_disposition,
             computer_use_mode=computer_use_mode,
