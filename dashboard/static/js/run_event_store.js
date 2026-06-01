@@ -23,6 +23,17 @@ function truncateText(value, maxLen = 160) {
     return `${raw.slice(0, Math.max(0, maxLen - 3)).trimEnd()}...`;
 }
 
+function normalizeStreamLine(event) {
+    const text = truncateText(event?.text, 200);
+    if (!text) {
+        return null;
+    }
+    const data = event?.data && typeof event.data === 'object' ? event.data : {};
+    const worker = String(event?.worker || data.worker || '').trim();
+    const model = String(event?.model || data.model || '').trim();
+    return { worker, model, text };
+}
+
 function usageFromEvent(event) {
     const textUsage = usageFromText(event.text);
     const inTokens = toNumber(event.data?.in_tokens) || textUsage.in_tokens;
@@ -161,6 +172,24 @@ export class RunEventStore {
                 ended_ts: event.ts,
                 meta: { step_total: state.step_total, stepTitles },
             });
+            if (Array.isArray(stepTitles) && stepTitles.length > 0) {
+                const stepTotalFromTitles = stepTitles.length;
+                for (let i = 0; i < stepTotalFromTitles; i += 1) {
+                    const idx = i + 1;
+                    const nodeId = `step:${idx}`;
+                    this._setNode(state, nodeId, {
+                        type: 'step',
+                        label: `Step ${idx}/${stepTotalFromTitles}`,
+                        status: 'pending',
+                        meta: {
+                            title: stepTitles[i],
+                            step_index: idx,
+                            step_total: stepTotalFromTitles,
+                        },
+                    });
+                    this._ensureEdge(state, 'plan', nodeId);
+                }
+            }
             return true;
         }
         if (phase === 'plan' && action === 'started') {
@@ -383,13 +412,22 @@ export class RunEventStore {
             node.meta.inTokens = 0;
             node.meta.outTokens = 0;
             node.meta.costUsd = 0;
+            node.meta.stream = [];
             node._usageWindowEndTs = endedTs || nextStartedTs || (node.status === 'active' ? Number.POSITIVE_INFINITY : undefined);
         }
 
-        for (const event of state.events) {
-            if (event.kind !== 'usage') {
-                continue;
+        const liveTail = [];
+        const pushLiveTail = (line) => {
+            if (!line) {
+                return;
             }
+            liveTail.push(line);
+            if (liveTail.length > 40) {
+                liveTail.splice(0, liveTail.length - 40);
+            }
+        };
+
+        const findOwningStep = (eventTs) => {
             for (const node of stepNodes) {
                 const startedTs = Number(node.meta.startedTs || 0);
                 const windowEnd = Number(node._usageWindowEndTs);
@@ -397,17 +435,50 @@ export class RunEventStore {
                 if (!Number.isFinite(startedTs) || !hasWindowEnd) {
                     continue;
                 }
-                if (event.ts < startedTs) {
+                if (eventTs < startedTs) {
                     continue;
                 }
-                if (event.ts > windowEnd) {
+                if (eventTs > windowEnd) {
+                    continue;
+                }
+                return node;
+            }
+            return null;
+        };
+
+        for (const event of state.events) {
+            if (event.kind === 'usage') {
+                const owner = findOwningStep(event.ts);
+                if (!owner) {
                     continue;
                 }
                 const usage = usageFromEvent(event);
-                node.meta.inTokens += usage.inTokens;
-                node.meta.outTokens += usage.outTokens;
-                node.meta.costUsd += usage.cost;
-                break;
+                owner.meta.inTokens += usage.inTokens;
+                owner.meta.outTokens += usage.outTokens;
+                owner.meta.costUsd += usage.cost;
+                continue;
+            }
+            if (event.kind === 'stderr') {
+                const line = normalizeStreamLine(event);
+                pushLiveTail(line);
+                const owner = findOwningStep(event.ts);
+                if (owner && line) {
+                    owner.meta.stream.push(line);
+                    if (owner.meta.stream.length > 40) {
+                        owner.meta.stream.splice(0, owner.meta.stream.length - 40);
+                    }
+                }
+                continue;
+            }
+            if (event.kind === 'message' && event.worker !== 'orchestrator') {
+                const owner = findOwningStep(event.ts);
+                const line = normalizeStreamLine(event);
+                if (owner && line) {
+                    owner.meta.stream.push(line);
+                    if (owner.meta.stream.length > 40) {
+                        owner.meta.stream.splice(0, owner.meta.stream.length - 40);
+                    }
+                }
             }
         }
 
@@ -445,6 +516,9 @@ export class RunEventStore {
             }
             if (node.meta.costUsd <= 0) {
                 delete node.meta.costUsd;
+            }
+            if (!Array.isArray(node.meta.stream) || node.meta.stream.length === 0) {
+                delete node.meta.stream;
             }
             if (!node.meta.title) {
                 const idx = node.meta?.step_index ?? node.id.split(':')[1] ?? '?';
@@ -498,6 +572,8 @@ export class RunEventStore {
                 delete node.meta.effort;
             }
         }
+
+        return { liveTail };
     }
 
     _rebuildGraph(state) {
@@ -555,7 +631,7 @@ export class RunEventStore {
             .map((id) => state.nodes.get(id))
             .filter(Boolean)
             .map((node) => ({ ...node, meta: { ...(node.meta || {}) } }));
-        this._applyFrontendMeta(state, nodes);
+        const frontendMeta = this._applyFrontendMeta(state, nodes) || {};
         const counters = {
             in_tokens: state.counters.in_tokens,
             out_tokens: state.counters.out_tokens,
@@ -570,6 +646,7 @@ export class RunEventStore {
             edges: state.edges.slice(),
             counters,
             inferred: Boolean(state.inferred),
+            liveTail: Array.isArray(frontendMeta.liveTail) ? frontendMeta.liveTail : [],
             limited_detail: Boolean(
                 state.has_orchestration
                 && state.steps_seen > 0
