@@ -205,6 +205,23 @@ def _as_int(value: Any) -> Optional[int]:
     return iv if iv >= 0 else None
 
 
+def _cache_read_ratio(cache_read: Optional[int], input_tokens: Optional[int]) -> Optional[float]:
+    """Prefix-cache hit rate = cache_read / (cache_read + fresh input).
+
+    ``input_tokens`` is treated as cache-EXCLUSIVE (the fresh, reprocessed input),
+    matching how the adapters split read-from-cache vs newly-processed tokens.
+    Returns None when either side is unknown (codex frequently reports only
+    total_tokens, leaving input None) so a missing denominator can't masquerade as
+    a 0% hit rate.
+    """
+    if cache_read is None or input_tokens is None:
+        return None
+    denom = int(cache_read) + int(input_tokens)
+    if denom <= 0:
+        return None
+    return round(int(cache_read) / denom, 4)
+
+
 def _summarize_token_usage(events_path: Path) -> dict:
     per_worker: Dict[str, Dict[str, Any]] = {}
     total_calls = 0
@@ -305,6 +322,11 @@ def _summarize_token_usage(events_path: Path) -> dict:
             "output_tokens": output_tokens,
             "cache_read_tokens": cache_read_tokens,
             "total_tokens": total_tokens,
+            # Prefix-cache hit rate over processed input (cache_read / fresh+cached
+            # input). Surfaced per-run so any caching optimization is verifiable
+            # from meta.json instead of being invisible. None when the denominator
+            # is unknown (e.g. codex reports only total_tokens, input=None).
+            "cache_read_ratio": _cache_read_ratio(cache_read_tokens, input_tokens),
         }
 
     return {
@@ -315,14 +337,24 @@ def _summarize_token_usage(events_path: Path) -> dict:
             "output_tokens": total_output if has_total_output else None,
             "cache_read_tokens": total_cache if has_total_cache else None,
             "total_tokens": total_total if has_total_total else None,
+            "cache_read_ratio": _cache_read_ratio(
+                total_cache if has_total_cache else None,
+                total_input if has_total_input else None,
+            ),
         },
     }
 
 
 def _build_prompt(
-    instruction: str, context: Optional[str], spec: Optional[str] = None
+    instruction: str, context: Optional[str], spec: Optional[str] = None,
+    *, include_preamble: bool = True,
 ) -> str:
-    parts = [WORKER_PREAMBLE, "\n## Instruction\n" + instruction.strip()]
+    # WORKER_PREAMBLE is process-discipline for the WORKER (don't sudo/pkill, don't
+    # re-run the full gate). The critic only judges output against the requirement,
+    # so its "Original Requirement" view drops the preamble (win 4) — same goal +
+    # spec + context, ~350-420 fewer tokens reprocessed every critic iteration.
+    parts = [WORKER_PREAMBLE] if include_preamble else []
+    parts.append("\n## Instruction\n" + instruction.strip())
     if spec:
         # An approved FloodSpec design doc: the authoritative source of truth.
         # Placed before free-form context so it dominates the worker's framing —
@@ -436,6 +468,7 @@ async def _run_workflow(
     critic_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
     max_parallel_workers: Optional[int] = None,
+    critic_requirement: Optional[str] = None,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger.
@@ -513,6 +546,7 @@ async def _run_workflow(
         wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations,
                                working_directory=working_directory,
                                critic_preamble=(CATASTROPHIC_FOCUS_PREAMBLE if mission_critical else ""),
+                               critic_requirement=critic_requirement,
                                event_callback=EVENT_BUS.publisher_for(
                                    run_id,
                                    worker="orchestrator",
@@ -914,6 +948,9 @@ async def dispatch_async(
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     prompt = _build_prompt(instruction, context, spec)
+    # Preamble-stripped view for the adversarial critic's "Original Requirement"
+    # (win 4): same goal/spec/context, minus the worker process-discipline boilerplate.
+    critic_requirement = _build_prompt(instruction, context, spec, include_preamble=False)
     (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
     gen_desc = roles.describe_chain(
@@ -1134,6 +1171,7 @@ async def dispatch_async(
                 critic_overrides=critic_overrides,
                 watchdog_scale=eff_watchdog_scale,
                 max_parallel_workers=max_parallel_workers,
+                critic_requirement=critic_requirement,
             ))
 
             # Reconciliation / Integration-Skeptic station (#43): runs AFTER the

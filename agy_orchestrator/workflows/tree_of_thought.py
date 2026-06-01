@@ -21,8 +21,29 @@ JUDGE_RUBRIC = (
     "Reply ONLY with the integer score.\n\n{noun_cap}:\n{solution}"
 )
 
+# Variant used when the caller can supply the REQUIREMENT the candidate must
+# satisfy. Without it the judge can only assess a branch's internal consistency,
+# blind to the goal — so a branch that is self-consistent but solves the wrong
+# problem scores as well as a correct one. Grounding the score in the requirement
+# is a strict improvement to selection quality (single-run speed audit, win 5).
+JUDGE_RUBRIC_WITH_REQ = (
+    "Evaluate the following {noun} on a scale of 1-10 by how fully and correctly it "
+    "satisfies the REQUIREMENT below, then by efficiency and best practices.\n"
+    "Penalize heavily (score < 5) for not meeting the requirement, incorrect results, "
+    "bugs, or identifiers, signatures, or interfaces that must match across files or "
+    "components but don't.\n"
+    "Reply ONLY with the integer score.\n\n"
+    "Requirement:\n{requirement}\n\n{noun_cap}:\n{solution}"
+)
 
-def build_judge_prompt(solution: str, noun: str = "solution") -> str:
+
+def build_judge_prompt(solution: str, noun: str = "solution",
+                       requirement: Optional[str] = None) -> str:
+    if requirement:
+        return JUDGE_RUBRIC_WITH_REQ.format(
+            noun=noun, noun_cap=noun.capitalize(), solution=solution,
+            requirement=requirement,
+        )
     return JUDGE_RUBRIC.format(noun=noun, noun_cap=noun.capitalize(), solution=solution)
 
 logger = logging.getLogger(__name__)
@@ -84,11 +105,16 @@ class TreeOfThought:
         evaluator_instance: AgentInstance,
         selector: str = "judge",
         event_callback: Optional[Callable[[dict], None]] = None,
+        requirement: Optional[str] = None,
     ):
         self.branch_instances = branch_instances
         self.evaluator = evaluator_instance
         self.selector = selector
         self.event_callback = event_callback
+        # The goal each branch must satisfy. When provided, the judge scores
+        # branches AGAINST it instead of blind (win 5). None preserves the prior
+        # requirement-free rubric (e.g. generate_and_rank).
+        self.requirement = requirement
 
     def _emit_orchestration(self, **fields) -> None:
         cb = self.event_callback
@@ -166,7 +192,8 @@ class TreeOfThought:
         async def _score(out: str) -> int:
             judge = copy.copy(self.evaluator)
             judge.session_id = None  # independent: don't chain branch scorings
-            judge.prompt = build_judge_prompt(out, noun="solution")
+            judge.prompt = build_judge_prompt(out, noun="solution",
+                                              requirement=self.requirement)
             return _parse_score(await judge.run_async())
 
         results = await asyncio.gather(*[_score(o) for o in outputs],
