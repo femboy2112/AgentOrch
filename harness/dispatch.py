@@ -34,6 +34,7 @@ from agy_orchestrator.workflows.adversarial import (
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
 from agy_orchestrator.workflows.master import MasterWorkflow
 from agy_orchestrator.workflows.pat import PatWorkflow
+from agy_orchestrator.workflows.reconcile import ReconciliationReview
 from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
 from agy_orchestrator.workflows.vote import VoteWorkflow
 from dashboard.event_bus import EventBus
@@ -187,6 +188,11 @@ class DispatchResult:
     # "watchdog_scale": float}``. Persisted so "what did this run actually use"
     # is answerable from meta.json, not just the live event stream.
     resolved_config: Optional[Dict[str, Any]] = None
+    # Reconciliation / Integration-Skeptic verdict (#43), when --reconcile ran:
+    # the distinct goal-vs-runtime status (reconciled bool + per-mechanism
+    # findings). NEVER merged into ``success``/the verifier under the default
+    # "warn" disposition; only an explicit "fail" disposition flips success.
+    reconciliation: Optional[Dict[str, Any]] = None
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -684,6 +690,52 @@ async def _run_workflow(
     raise ValueError(f"unknown mode: {mode}")
 
 
+async def _run_reconciliation(
+    *,
+    run_id: str,
+    goal: str,
+    critic_chain: List[str],
+    fallback: bool,
+    codex_config: Optional[List[str]],
+    critic_overrides: Optional[Dict[str, Dict[str, str]]],
+    watchdog_scale: float,
+    post_construct_hook: Optional[roles.RolePostConstructHook],
+    working_directory: str,
+    disposition: str,
+) -> "ReconciliationResult":  # type: ignore[name-defined]
+    """Build an independent reviewer and run the reconciliation station (#43).
+
+    The reconciler runs on the CRITIC chain — a cross-provider reviewer distinct
+    from the generator that wrote the code — so the goal-vs-runtime trace is not
+    self-verification (the same independence principle as the adversarial critic).
+    Single trace pass; its verdict is returned for the caller to record alongside
+    (never folded into) the verifier's result."""
+    recon_agent = _build_role_agent_compat(
+        critic_chain,
+        prompt="",
+        fallback=fallback,
+        cycles=1,
+        codex_config=codex_config,
+        computer_use_config=None,
+        post_construct_hook=post_construct_hook,
+        overrides=critic_overrides,
+        watchdog_scale=watchdog_scale,
+    )
+    station = ReconciliationReview(
+        agent=recon_agent,
+        goal=goal,
+        working_directory=working_directory,
+        disposition=disposition,
+        event_callback=EVENT_BUS.publisher_for(
+            run_id,
+            worker="reconcile",
+            model=str(getattr(recon_agent, "model", "n/a") or "n/a"),
+            effort=str(getattr(recon_agent, "effort", "n/a") or "n/a"),
+        ),
+    )
+    return await station.execute()
+
+
 async def dispatch_async(
     instruction: str,
     *,
@@ -727,6 +779,9 @@ async def dispatch_async(
     watchdog_scale: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     worker_mem_max: Optional[str] = None,
+    # Reconciliation / Integration-Skeptic station (#43)
+    reconcile: bool = False,
+    reconcile_disposition: Optional[str] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -815,6 +870,19 @@ async def dispatch_async(
     }
     for _note in resolved.notes:
         logger.warning("override: %s", _note)
+
+    # Reconciliation / Integration-Skeptic station (#43). Opt-in via --reconcile
+    # or AGY_RECONCILE=1; default-ON for --mission-critical (the runs where dead
+    # wiring is most expensive to discover late). Disposition defaults to "warn"
+    # (report loudly as a distinct status + durable artifact, never fail the run)
+    # — including under --mission-critical, per the operator's chosen default; an
+    # operator who wants a hard gate passes --reconcile-disposition fail.
+    reconcile_enabled = bool(
+        reconcile
+        or mission_critical
+        or os.environ.get("AGY_RECONCILE", "").lower() in ("1", "true", "on")
+    )
+    recon_disposition = reconcile_disposition or "warn"
 
     # Where the worker actually writes files. Default = AgentOrch repo root,
     # which preserves the prior behaviour exactly.
@@ -1006,6 +1074,7 @@ async def dispatch_async(
     output = ""
     workflow = None
     run_outcome: Optional[str] = None
+    reconciliation_result = None  # #43: set after a converged build if --reconcile
     try:
         if _is_cu:
             # Step 12 minimal glue: exercise the real adapter (writes events.jsonl under runs/<id>/,
@@ -1053,6 +1122,31 @@ async def dispatch_async(
                 watchdog_scale=eff_watchdog_scale,
                 max_parallel_workers=max_parallel_workers,
             ))
+
+            # Reconciliation / Integration-Skeptic station (#43): runs AFTER the
+            # build converges (and, when a verifier gated it, only when GREEN) to
+            # trace each goal-named mechanism to the live execution path. The bus
+            # is still open here so its trace events stream + persist normally.
+            # Wrapped best-effort: a station failure must NEVER fail a good build.
+            verifier_green = verifier is None or bool(getattr(workflow, "verified", False))
+            if (reconcile_enabled and not plan_only and verifier_green
+                    and output and output.strip()):
+                try:
+                    reconciliation_result = await _run_reconciliation(
+                        run_id=run_id,
+                        goal=(spec or instruction),
+                        critic_chain=critic_chain,
+                        fallback=fallback,
+                        codex_config=codex_config,
+                        critic_overrides=critic_overrides,
+                        watchdog_scale=eff_watchdog_scale,
+                        post_construct_hook=_post_construct_hook,
+                        working_directory=str(work_dir),
+                        disposition=recon_disposition,
+                    )
+                except Exception as rexc:  # best-effort: never fail a good build
+                    logger.warning("Reconciliation station errored (continuing): %s: %s",
+                                   type(rexc).__name__, rexc)
     except RunStalled as exc:  # run watchdog aborted: classify, never crash
         success = False
         run_outcome = exc.reason
@@ -1142,6 +1236,40 @@ async def dispatch_async(
                 run_id, len(protect_violations),
                 "; ".join(f"{v['path']} ({v['reason']})" for v in protect_violations),
             )
+
+    # Reconciliation verdict (#43): a DISTINCT status, never folded into the
+    # verifier's ok. Persist the durable artifact and surface findings. Under the
+    # default "warn" disposition the run's success is untouched; only an explicit
+    # "fail" disposition (operator opt-in) flips it; "open-task" warns + records a
+    # follow-up recommendation (we do NOT auto-file an outward GitHub issue here —
+    # that's an outward action left to the operator, see reconcile.json).
+    reconciliation: Optional[Dict[str, Any]] = None
+    if reconciliation_result is not None:
+        reconciliation = reconciliation_result.to_dict()
+        (run_dir / "reconcile.json").write_text(
+            json.dumps(reconciliation, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        dead = reconciliation_result.findings()
+        if reconciliation_result.should_fail_run:
+            success = False
+            recon_err = (
+                f"reconciliation failed: {len(dead)} exists-but-not-load-bearing "
+                f"finding(s) (" + ", ".join(f"{f.name}:{f.sub_kind}" for f in dead) + ")"
+            )
+            error = f"{error}; {recon_err}" if error else recon_err
+        elif dead:
+            logger.warning(
+                "Dispatch %s reconciliation=%s: %d dead-wiring finding(s) "
+                "[disposition=%s] — see %s/reconcile.json",
+                run_id, reconciliation_result.verdict, len(dead),
+                reconciliation_result.disposition, run_dir,
+            )
+            if reconciliation_result.disposition == "open-task":
+                logger.warning(
+                    "Dispatch %s: follow-up build task recommended for %d finding(s) "
+                    "(auto-filing is opt-in/outward; findings recorded in reconcile.json)",
+                    run_id, len(dead),
+                )
 
     # Notify on anomalies + finish (#40). The stall ping already fired from the
     # watchdog; here we cover OOM / verifier-fail / a clean finish, now that
@@ -1236,6 +1364,7 @@ async def dispatch_async(
         protect_violations=protect_violations,
         run_outcome=run_outcome,
         resolved_config=resolved_config,
+        reconciliation=reconciliation,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
@@ -1285,6 +1414,8 @@ def dispatch(
     watchdog_scale: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     worker_mem_max: Optional[str] = None,
+    reconcile: bool = False,
+    reconcile_disposition: Optional[str] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -1337,6 +1468,8 @@ def dispatch(
             watchdog_scale=watchdog_scale,
             max_parallel_workers=max_parallel_workers,
             worker_mem_max=worker_mem_max,
+            reconcile=reconcile,
+            reconcile_disposition=reconcile_disposition,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,

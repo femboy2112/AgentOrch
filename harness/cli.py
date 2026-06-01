@@ -74,6 +74,16 @@ def _print_result(result) -> None:
             parts = [f"{p}={c.get('model')}/{c.get('effort')}" for p, c in gen_cfg.items()]
             tail = f"  (watchdog x{scale})" if scale and scale != 1.0 else ""
             print(f"  {C_CYAN}effort    : {' '.join(parts)}{C_RESET}{tail}")
+    rec = getattr(result, "reconciliation", None)
+    if rec:
+        dead = [f for f in rec.get("findings", [])
+                if f.get("classification") == "exists_not_load_bearing"]
+        col = C_GREEN if rec.get("reconciled") else C_RED
+        print(f"  {col}reconcile : {rec.get('verdict')} "
+              f"({len(dead)} exists-but-not-load-bearing){C_RESET}")
+        for f in dead[:10]:
+            loc = f.get("location") or "?"
+            print(f"    {C_RED}⚠ {f.get('name')} [{f.get('sub_kind')}] {loc}{C_RESET}")
     if getattr(result, "run_outcome", None):
         print(f"  {C_RED}outcome   : {result.run_outcome} (run watchdog){C_RESET}")
     if result.error:
@@ -208,6 +218,8 @@ def _cmd_do(args) -> int:
         watchdog_scale=args.watchdog_scale,
         max_parallel_workers=args.max_parallel_workers,
         worker_mem_max=args.worker_mem_max,
+        reconcile=args.reconcile,
+        reconcile_disposition=args.reconcile_disposition,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -443,6 +455,21 @@ def main(argv=None) -> int:
                      help="Per-candidate verifier memory cap for vote/tot (e.g. 4G), run "
                           "in its own systemd scope like --verifier-mem-max (#39). Guards "
                           "against an OOM/freeze when --branches>1 verify in parallel.")
+    # Reconciliation / Integration-Skeptic station (#43).
+    rec = do.add_argument_group("reconciliation station (#43)")
+    rec.add_argument("--reconcile", action="store_true",
+                     help="After a converged+green build, run the goal-vs-runtime "
+                          "reconciliation station: trace each goal-named mechanism to "
+                          "the live execution path and flag 'exists-but-not-load-bearing' "
+                          "defects (dead/stubbed/untrained/bypassed code that passes "
+                          "tests). Default-ON for --mission-critical; env AGY_RECONCILE=1. "
+                          "Writes runs/<id>/reconcile.json. Verdict is distinct — never "
+                          "folded into the verifier's pass/fail.")
+    rec.add_argument("--reconcile-disposition", choices=["warn", "fail", "open-task"],
+                     default=None,
+                     help="What a non-reconciled verdict does: 'warn' (default — report "
+                          "loudly + artifact, don't fail), 'fail' (flip the run to failed), "
+                          "'open-task' (warn + recommend a follow-up build task).")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",
