@@ -54,6 +54,10 @@ def _print_result(result) -> None:
             print(f"  verifier  : {dcol}{delta}{C_RESET}")
     if result.error:
         print(f"  {C_RED}error     : {result.error}{C_RESET}")
+    if getattr(result, "protect_violations", None):
+        print(f"  {C_RED}path policy: {len(result.protect_violations)} violation(s){C_RESET}")
+        for v in result.protect_violations:
+            print(f"    {C_RED}✗ {v['path']} — {v['reason']}{C_RESET}")
     if result.changed_files:
         print(f"  {C_BOLD}changed   : {len(result.changed_files)} file(s){C_RESET}")
         for f in result.added:
@@ -124,6 +128,8 @@ def _cmd_do(args) -> int:
         test_cmd=args.test_cmd,
         candidate_setup=args.candidate_setup,
         resume_policy=resume_policy,
+        protect_paths=[g for g in (args.protect_paths or "").split(",") if g.strip()] or None,
+        allow_paths=[g for g in (args.allow_paths or "").split(",") if g.strip()] or None,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -271,6 +277,15 @@ def main(argv=None) -> int:
                     help="master/pat: force resume from the salvage checkpoint even if "
                          "the out-dir diverged from the tree it was saved against "
                          "(default is to start fresh on divergence; #37)")
+    do.add_argument("--protect-paths", type=str, default=None, metavar="GLOB[,GLOB...]",
+                    help="Fail the run if any worker modifies a path matching these "
+                         "denylist globs (e.g. 'docs/core/**,**/*.lock,migrations/**'). "
+                         "Gated on the change set the harness already computes; "
+                         "violations are recorded in meta.json. ** spans directories.")
+    do.add_argument("--allow-paths", type=str, default=None, metavar="GLOB[,GLOB...]",
+                    help="Allowlist inverse of --protect-paths: fail the run if a worker "
+                         "writes any path OUTSIDE these globs (e.g. additive-only into a "
+                         "single subtree).")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",

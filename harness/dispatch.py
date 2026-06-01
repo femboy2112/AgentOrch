@@ -16,6 +16,8 @@ import hashlib
 import inspect
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -67,6 +69,66 @@ def _master_checkpoint_path(prompt: str) -> str:
     key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     return str(CHECKPOINT_DIR / f"{key}.json")
 
+def _glob_to_regex(glob: str) -> "re.Pattern[str]":
+    """Compile a path glob to an anchored regex (issue #38).
+
+    Git-style semantics on POSIX-relative paths: ``*`` matches within a single
+    path segment, ``**`` spans directories, ``**/`` matches zero or more leading
+    directories (so ``**/*.lock`` matches ``a/b/c.lock`` AND a root ``c.lock``),
+    ``?`` matches one non-slash char. Everything else is literal.
+    """
+    g = glob.strip()
+    if g.startswith("./"):
+        g = g[2:]
+    out: List[str] = []
+    i, n = 0, len(g)
+    while i < n:
+        if g.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif g.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif g[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif g[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(g[i]))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def evaluate_path_policy(
+    paths: List[str],
+    protect_globs: Optional[List[str]] = None,
+    allow_globs: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
+    """Return path-policy violations for a change set (issue #38).
+
+    A path violates the policy if it matches any ``protect`` (denylist) glob, or
+    if any ``allow`` (allowlist) globs are given and it matches NONE of them.
+    Returns ``[{"path", "reason"}, ...]`` (empty == clean). Matching is on
+    repo-relative POSIX paths.
+    """
+    protect_pats = [(_glob_to_regex(g), g) for g in (protect_globs or []) if g.strip()]
+    allow_pats = [_glob_to_regex(g) for g in (allow_globs or []) if g.strip()]
+    violations: List[Dict[str, str]] = []
+    for p in paths:
+        # Normalize to POSIX separators so globs match regardless of the host's
+        # os.sep (snapshot paths use os.sep; treat '\' as a separator too).
+        norm = p.replace(os.sep, "/").replace("\\", "/")
+        hit = next((g for pat, g in protect_pats if pat.match(norm)), None)
+        if hit is not None:
+            violations.append({"path": p, "reason": f"matches protected path glob '{hit}'"})
+            continue
+        if allow_pats and not any(pat.match(norm) for pat in allow_pats):
+            violations.append({"path": p, "reason": "outside every --allow-paths glob"})
+    return violations
+
+
 WORKER_PREAMBLE = (
     "You are a coding worker operating inside an existing project repository at the "
     "current working directory. Implement the instruction below by creating and "
@@ -112,6 +174,10 @@ class DispatchResult:
     quality: Optional[dict] = None
     # Per-dispatch token telemetry rollup from usage events.
     tokens: Optional[dict] = None
+    # Path-policy guard (#38): change-set entries that violated --protect-paths /
+    # --allow-paths. Non-empty forces success=False so a downstream consumer can
+    # gate on meta.json instead of a human reading the diff.
+    protect_violations: List[Dict[str, str]] = field(default_factory=list)
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -563,6 +629,8 @@ async def dispatch_async(
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
     resume_policy: str = "auto",
+    protect_paths: Optional[List[str]] = None,
+    allow_paths: Optional[List[str]] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -864,6 +932,23 @@ async def dispatch_async(
     after = take_snapshot(work_dir)
     diff = diff_snapshots(before, after)
 
+    # Path-policy guard (#38): fail the run if a worker touched an off-limits path
+    # (denylist) or wrote outside the allowed subtree (allowlist). Gate on the
+    # change set the snapshot already computed — no new instrumentation.
+    protect_violations: List[Dict[str, str]] = []
+    if protect_paths or allow_paths:
+        protect_violations = evaluate_path_policy(diff.changed, protect_paths, allow_paths)
+        if protect_violations:
+            success = False
+            offenders = ", ".join(v["path"] for v in protect_violations)
+            policy_err = f"path-policy violation: {offenders}"
+            error = f"{error}; {policy_err}" if error else policy_err
+            logger.warning(
+                "Dispatch %s VIOLATED path policy (%d file(s)): %s",
+                run_id, len(protect_violations),
+                "; ".join(f"{v['path']} ({v['reason']})" for v in protect_violations),
+            )
+
     (run_dir / "stdout.log").write_text(output, encoding="utf-8")
     (run_dir / "changed-files.diff").write_text(
         diff.unified or "(no file changes detected)\n", encoding="utf-8"
@@ -927,6 +1012,7 @@ async def dispatch_async(
         error=error,
         quality=quality,
         tokens=tokens,
+        protect_violations=protect_violations,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
@@ -954,6 +1040,8 @@ def dispatch(
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
     resume_policy: str = "auto",
+    protect_paths: Optional[List[str]] = None,
+    allow_paths: Optional[List[str]] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -985,6 +1073,8 @@ def dispatch(
             out_dir=out_dir,
             candidate_setup=candidate_setup,
             resume_policy=resume_policy,
+            protect_paths=protect_paths,
+            allow_paths=allow_paths,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,
