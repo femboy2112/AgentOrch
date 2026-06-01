@@ -409,9 +409,35 @@ async def _run_workflow(
     baseline_result: Optional[VerifierResult] = None,
     candidate_setup: Optional[str] = None,
     resume_policy: str = "auto",
+    plan_only: bool = False,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
+    # Plan-only / dry-run (#41): for master/pat, run JUST the planner and stop
+    # before any worker mutates the out-dir. pat's "plan" is the master planner,
+    # so both modes route through a plan-only MasterWorkflow — no verifier needed
+    # (the direct Stage-1 attempt, which would write, is skipped).
+    if plan_only and mode in ("master", "pat"):
+        agent_class, model, effort = roles.build_master_agent_class(
+            generator_chain, fallback=fallback, cycles=cycles,
+            codex_config=codex_config,
+            post_construct_hook=post_construct_hook,
+        )
+        wf = MasterWorkflow(
+            model=model,
+            effort=effort,
+            branches=branches,
+            max_iterations=max_iterations,
+            verifier=verifier,
+            agent_class=agent_class,
+            working_directory=working_directory,
+            plan_only=True,
+            event_callback=EVENT_BUS.publisher_for(
+                run_id, worker="orchestrator", model=model, effort=effort, branch=None,
+            ),
+        )
+        return await wf.execute(prompt), wf
+
     if mode == "direct":
         gen = _build_role_agent_compat(
             generator_chain,
@@ -631,6 +657,7 @@ async def dispatch_async(
     resume_policy: str = "auto",
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
+    plan_only: bool = False,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -866,6 +893,7 @@ async def dispatch_async(
                 baseline_result=baseline_result,
                 candidate_setup=candidate_setup,
                 resume_policy=resume_policy,
+                plan_only=plan_only,
             )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
@@ -953,6 +981,19 @@ async def dispatch_async(
     (run_dir / "changed-files.diff").write_text(
         diff.unified or "(no file changes detected)\n", encoding="utf-8"
     )
+
+    # Plan-only / dry-run (#41): persist the decomposed plan as a structured
+    # artifact so it can be reviewed/edited before a real run. The out-dir is
+    # untouched in this mode (the diff is empty by construction).
+    plan_steps = getattr(workflow, "plan_steps", None) if workflow else None
+    if plan_only and plan_steps is not None:
+        (run_dir / "plan.json").write_text(
+            json.dumps(
+                {"instruction": instruction, "n_steps": len(plan_steps), "steps": plan_steps},
+                indent=2, ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
     stage_used = getattr(workflow, "stage_used", None) if workflow else None
     n_candidates = getattr(workflow, "n_candidates", None) if workflow else None
@@ -1042,6 +1083,7 @@ def dispatch(
     resume_policy: str = "auto",
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
+    plan_only: bool = False,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -1075,6 +1117,7 @@ def dispatch(
             resume_policy=resume_policy,
             protect_paths=protect_paths,
             allow_paths=allow_paths,
+            plan_only=plan_only,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,

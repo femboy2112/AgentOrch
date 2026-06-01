@@ -51,6 +51,7 @@ class MasterWorkflow:
         recent_steps_verbatim: int = DEFAULT_RECENT_STEPS_VERBATIM,
         event_callback: Optional[Callable[[dict], None]] = None,
         resume_policy: str = "auto",
+        plan_only: bool = False,
     ):
         self.model = model
         self.effort = effort
@@ -89,6 +90,13 @@ class MasterWorkflow:
                 f"resume_policy must be 'auto', 'force', or 'never' (got {resume_policy!r})"
             )
         self.resume_policy = resume_policy
+        # Plan-only / dry-run (#41): run just the planner, emit the decomposed
+        # step plan, and exit BEFORE any worker mutates the out-dir. Lets the
+        # operator audit/approve the decomposition for the price of one planner
+        # call instead of an execute-then-reset cycle. `plan_steps` holds the
+        # emitted plan so the harness can serialize it to plan.json.
+        self.plan_only = plan_only
+        self.plan_steps: Optional[List[str]] = None
         # Session compaction: over a long chained run the resumed workflow session
         # (full transcript re-sent every step) and the growing project_context are the
         # token-cost drivers. Every ``compaction_interval`` steps, OR whenever
@@ -360,7 +368,73 @@ class MasterWorkflow:
         except Exception as exc:
             logger.warning("Could not write checkpoint %s: %s", self.checkpoint_path, exc)
 
+    async def _run_planner(self, initial_prompt: str) -> Tuple[List[str], Optional[str]]:
+        """Planner phase: decompose the project into a JSON list of step prompts.
+
+        Returns ``(tasks, session_id)``. Makes exactly one planner worker call and
+        writes NOTHING to the out-dir — so it is safe to run in plan-only/dry-run
+        mode (#41).
+        """
+        logger.info("Starting Master Workflow Planning Phase...")
+        planner_prompt = (
+            f"You are the Lead Architect. Break down the following complex project into a logical sequence of implementation steps.\n"
+            f"Output ONLY a valid JSON list of strings, where each string is a detailed prompt for a single step.\n"
+            f"Example: [\"Step 1: Setup project structure and core utilities...\", \"Step 2: Implement UI component X...\"]\n\n"
+            f"Project Request:\n{initial_prompt}"
+        )
+        planner = self.agent_class(prompt=planner_prompt, model=self.model, effort="high")
+        plan_output = await planner.run_async()
+
+        # Capture session established by planner for reuse across all subsequent calls
+        workflow_session_id = getattr(planner, "session_id", None)
+        if workflow_session_id:
+            logger.info("Workflow session established: %s", workflow_session_id)
+
+        # Extract JSON list from plan_output
+        tasks: List[str] = []
+        try:
+            start = plan_output.find('[')
+            end = plan_output.rfind(']') + 1
+            if start != -1 and end != 0:
+                tasks = json.loads(plan_output[start:end])
+            else:
+                raise ValueError("No JSON array found.")
+        except Exception as e:
+            logger.warning(f"Failed to parse Planner output as JSON: {e}. Defaulting to a single step.")
+            tasks = [initial_prompt]
+
+        logger.info(f"Project broken down into {len(tasks)} steps.")
+        return tasks, workflow_session_id
+
+    def _emit_plan(self, tasks: List[str]) -> None:
+        self._emit_orchestration(
+            phase="plan",
+            action="completed",
+            step_total=len(tasks),
+            step_titles=[_truncate_orch_title(task) for task in tasks],
+        )
+
     async def execute(self, initial_prompt: str) -> str:
+        # Plan-only / dry-run (#41): decompose, emit the plan, and STOP before any
+        # worker touches the out-dir. Ignores checkpoints (always re-plans) and
+        # writes no checkpoint, so it is fully side-effect-free on disk.
+        if self.plan_only:
+            tasks, _session_id = await self._run_planner(initial_prompt)
+            self._emit_plan(tasks)
+            self.plan_steps = list(tasks)
+            logger.info(
+                "Plan-only (dry-run): emitted %d-step plan; NOT executing — the "
+                "out-dir was not modified.", len(tasks),
+            )
+            lines = [
+                f"Plan-only dry-run: {len(tasks)} step(s). No worker wrote to the "
+                f"out-dir; pass without --plan-only to execute.",
+                "",
+            ]
+            for idx, task in enumerate(tasks, 1):
+                lines.append(f"  {idx}. {task}")
+            return "\n".join(lines)
+
         resumed = self._load_checkpoint(initial_prompt)
         if resumed is not None:
             tasks, start_index, project_context, workflow_session_id = resumed
@@ -370,46 +444,8 @@ class MasterWorkflow:
                 len(tasks),
             )
         else:
-            logger.info("Starting Master Workflow Planning Phase...")
-
-            # 1. Planner Phase
-            planner_prompt = (
-                f"You are the Lead Architect. Break down the following complex project into a logical sequence of implementation steps.\n"
-                f"Output ONLY a valid JSON list of strings, where each string is a detailed prompt for a single step.\n"
-                f"Example: [\"Step 1: Setup project structure and core utilities...\", \"Step 2: Implement UI component X...\"]\n\n"
-                f"Project Request:\n{initial_prompt}"
-            )
-
-            planner = self.agent_class(prompt=planner_prompt, model=self.model, effort="high")
-            plan_output = await planner.run_async()
-
-            # Capture session established by planner for reuse across all subsequent calls
-            workflow_session_id = getattr(planner, "session_id", None)
-            if workflow_session_id:
-                logger.info("Workflow session established: %s", workflow_session_id)
-
-            # Extract JSON list from plan_output
-            tasks = []
-            try:
-                start = plan_output.find('[')
-                end = plan_output.rfind(']') + 1
-                if start != -1 and end != 0:
-                    tasks = json.loads(plan_output[start:end])
-                else:
-                    raise ValueError("No JSON array found.")
-            except Exception as e:
-                logger.warning(f"Failed to parse Planner output as JSON: {e}. Defaulting to a single step.")
-                tasks = [initial_prompt]
-
-            logger.info(f"Project broken down into {len(tasks)} steps.")
-            step_titles = [_truncate_orch_title(task) for task in tasks]
-            self._emit_orchestration(
-                phase="plan",
-                action="completed",
-                step_total=len(tasks),
-                step_titles=step_titles,
-            )
-
+            tasks, workflow_session_id = await self._run_planner(initial_prompt)
+            self._emit_plan(tasks)
             project_context = f"Original Goal: {initial_prompt}\n\n=== Accumulated Implementation ===\n"
             start_index = 0
             self._save_checkpoint(initial_prompt, tasks, start_index, project_context, workflow_session_id)

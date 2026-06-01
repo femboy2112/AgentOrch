@@ -97,6 +97,15 @@ def _cmd_do(args) -> int:
     else:
         resume_policy = "auto"
 
+    # #41: --plan-only is a master/pat dry-run. Warn (don't fail) if used with a
+    # mode that has no planner phase — it would otherwise silently run for real.
+    if getattr(args, "plan_only", False) and args.mode not in ("master", "pat"):
+        print(
+            f"{C_YELLOW}warning: --plan-only only applies to --mode master/pat; "
+            f"ignoring it for --mode {args.mode}{C_RESET}",
+            file=sys.stderr,
+        )
+
     # Step 12: parse computer-use config (only has effect when generator chain leads with computer-use)
     cu_mode = getattr(args, "computer_use_mode", None)
     cu_priority = getattr(args, "computer_use_task_priority", None)
@@ -130,6 +139,7 @@ def _cmd_do(args) -> int:
         resume_policy=resume_policy,
         protect_paths=[g for g in (args.protect_paths or "").split(",") if g.strip()] or None,
         allow_paths=[g for g in (args.allow_paths or "").split(",") if g.strip()] or None,
+        plan_only=getattr(args, "plan_only", False),
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -277,6 +287,10 @@ def main(argv=None) -> int:
                     help="master/pat: force resume from the salvage checkpoint even if "
                          "the out-dir diverged from the tree it was saved against "
                          "(default is to start fresh on divergence; #37)")
+    do.add_argument("--plan-only", "--dry-run", dest="plan_only", action="store_true",
+                    help="master/pat: run only the planner, emit the decomposed step "
+                         "plan (stdout + events + runs/<id>/plan.json), and exit BEFORE "
+                         "any worker writes to the out-dir.")
     do.add_argument("--protect-paths", type=str, default=None, metavar="GLOB[,GLOB...]",
                     help="Fail the run if any worker modifies a path matching these "
                          "denylist globs (e.g. 'docs/core/**,**/*.lock,migrations/**'). "
