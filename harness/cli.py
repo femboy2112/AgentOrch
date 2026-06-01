@@ -135,6 +135,7 @@ def _cmd_do(args) -> int:
         max_iterations=args.max_iterations,
         branches=args.branches,
         test_cmd=args.test_cmd,
+        verifier_mem_max=args.verifier_mem_max,
         candidate_setup=args.candidate_setup,
         resume_policy=resume_policy,
         protect_paths=[g for g in (args.protect_paths or "").split(",") if g.strip()] or None,
@@ -273,6 +274,12 @@ def main(argv=None) -> int:
     do.add_argument("--branches", type=int, default=3, help="ToT branches (master mode)")
     do.add_argument("--test-cmd", type=str, default=None,
                     help="Optional verification command run as a quality gate")
+    do.add_argument("--verifier-mem-max", type=str, default=None, metavar="SIZE",
+                    help="Run --test-cmd inside its own memory-capped systemd scope "
+                         "(e.g. '3G') so a heavy gate is OOM-killed in its own scope "
+                         "instead of freezing the host / taking the orchestrator down. "
+                         "Opt-in; needs `systemd-run --user` (degrades to uncapped with "
+                         "a warning otherwise). Env: AGY_VERIFIER_MEM_MAX.")
     do.add_argument("--candidate-setup", type=str, default=None, metavar="CMD",
                     help="vote mode: shell command run inside each candidate's "
                          "isolated workspace BEFORE its verifier (e.g. "

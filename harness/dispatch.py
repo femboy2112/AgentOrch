@@ -648,6 +648,7 @@ async def dispatch_async(
     max_iterations: int = 5,
     branches: int = 3,
     test_cmd: Optional[str] = None,
+    verifier_mem_max: Optional[str] = None,
     web_search: bool = False,
     mission_critical: bool = False,
     spec: Optional[str] = None,
@@ -828,7 +829,16 @@ async def dispatch_async(
     logger.info("Dispatch %s | mode=%s | generator=%s%s",
                 run_id, mode, gen_desc, f" | critic={crit_desc}" if crit_desc else "")
 
-    verifier = QualityVerifier(test_commands=[test_cmd]) if test_cmd else None
+    if test_cmd:
+        # Pass mem_max only when a cap is actually requested, so the common path
+        # (and test doubles that swap in a narrower QualityVerifier) keep their
+        # original constructor signature.
+        _vkwargs = {"test_commands": [test_cmd]}
+        if verifier_mem_max:
+            _vkwargs["mem_max"] = verifier_mem_max
+        verifier = QualityVerifier(**_vkwargs)
+    else:
+        verifier = None
     baseline_result: Optional[VerifierResult] = None
     if verifier is not None:
         try:
@@ -1074,6 +1084,7 @@ def dispatch(
     max_iterations: int = 5,
     branches: int = 3,
     test_cmd: Optional[str] = None,
+    verifier_mem_max: Optional[str] = None,
     web_search: bool = False,
     mission_critical: bool = False,
     spec: Optional[str] = None,
@@ -1108,6 +1119,7 @@ def dispatch(
             max_iterations=max_iterations,
             branches=branches,
             test_cmd=test_cmd,
+            verifier_mem_max=verifier_mem_max,
             web_search=web_search,
             mission_critical=mission_critical,
             spec=spec,
