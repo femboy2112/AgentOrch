@@ -146,6 +146,54 @@ def test_reconcile_error_is_best_effort(tmp_path, monkeypatch):
     assert result.reconciliation is None
 
 
+def test_reconcile_runs_for_master_mode_when_green(tmp_path, monkeypatch):
+    # The station is wired at the dispatch layer, so master mode is covered:
+    # after a master build converges AND the verifier is GREEN
+    # (workflow.verified), reconciliation fires.
+    class _WF:
+        verified = True
+        plan_steps = None
+
+    async def _wf(*a, **k):
+        return ("master build output", _WF())
+
+    monkeypatch.setattr(dispatch_mod, "_run_workflow", _wf)
+    _patch_recon(monkeypatch, _canned(dead=True))  # warn default -> records, no fail
+
+    result = dispatch_mod.dispatch(
+        "build feature", mode="master", out_dir=str(tmp_path),
+        test_cmd="true", reconcile=True, heartbeat_interval=0,
+    )
+    assert result.success is True
+    assert result.reconciliation is not None
+    assert result.reconciliation["reconciled"] is False
+    assert (Path(result.run_dir) / "reconcile.json").exists()
+
+
+def test_reconcile_skipped_when_build_not_green(tmp_path, monkeypatch):
+    # A red build (verifier present but workflow NOT verified) is NOT reconciled —
+    # reconciling a build that already failed its gate adds only noise.
+    class _WF:
+        verified = False
+        plan_steps = None
+
+    async def _wf(*a, **k):
+        return ("partial output", _WF())
+
+    monkeypatch.setattr(dispatch_mod, "_run_workflow", _wf)
+
+    async def _boom(*a, **k):
+        raise AssertionError("must not reconcile a non-green build")
+
+    monkeypatch.setattr(dispatch_mod, "_run_reconciliation", _boom)
+
+    result = dispatch_mod.dispatch(
+        "build feature", mode="master", out_dir=str(tmp_path),
+        test_cmd="true", reconcile=True, heartbeat_interval=0,
+    )
+    assert result.reconciliation is None
+
+
 def test_reconcile_env_var_enables(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatch_mod, "_run_workflow", _ok_workflow_factory())
     monkeypatch.setenv("AGY_RECONCILE", "1")
