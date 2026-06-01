@@ -154,17 +154,20 @@ function badge(text, cls = '') {
     return `<span class="plan-badge-item ${cls}">${esc(text)}</span>`;
 }
 
-function progressBar(current, total) {
-    const p = formatProgress(current, total);
-    if (p.label === 'Progress unavailable') {
-        return '<div class="plan-progress plan-progress-empty"><span>Progress unavailable</span></div>';
+function progressBar(pctRaw, label, options = {}) {
+    const pct = Math.max(0, Math.min(100, Number(pctRaw) || 0));
+    const cls = String(options.cls || '').trim();
+    const fillCls = String(options.fillCls || '').trim();
+    const empty = options.empty === true;
+    if (empty) {
+        return `<div class="plan-progress plan-progress-empty ${esc(cls)}"><span>${esc(label || 'Progress unavailable')}</span></div>`;
     }
     return `
-        <div class="plan-progress" role="img" aria-label="progress ${esc(p.label)}">
+        <div class="plan-progress ${esc(cls)}" role="img" aria-label="progress ${esc(label || '')}">
             <div class="plan-progress-track">
-                <div class="plan-progress-fill" style="width:${p.pct}%"></div>
+                <div class="plan-progress-fill ${esc(fillCls)}" style="width:${pct}%"></div>
             </div>
-            <span class="plan-progress-label">${esc(p.label)}</span>
+            <span class="plan-progress-label">${esc(label || '')}</span>
         </div>
     `;
 }
@@ -318,6 +321,90 @@ function stepProgressText(stepNodes, planNode, snapshot) {
     return `${completed}/${total} steps`;
 }
 
+function stepTotals(stepNodes, planNode, snapshot) {
+    const totalRaw = Number(
+        planNode?.meta?.step_total
+        ?? snapshot?.step_total
+        ?? stepNodes.length
+        ?? 0,
+    );
+    const total = Number.isFinite(totalRaw) && totalRaw > 0 ? totalRaw : 0;
+    const done = stepNodes.filter((node) => node.status === 'done').length;
+    const active = stepNodes.filter((node) => node.status === 'active').length;
+    return { total, done, active };
+}
+
+function planProgress(stepNodes, planNode, snapshot) {
+    const totals = stepTotals(stepNodes, planNode, snapshot);
+    if (totals.total <= 0) {
+        return progressBar(0, 'Progress unavailable', { empty: true });
+    }
+    const ratio = (totals.done + (totals.active > 0 ? 0.5 : 0)) / totals.total;
+    const pct = Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+    const label = `${totals.done}/${totals.total} complete`;
+    return progressBar(pct, label, { cls: 'plan-progress-plan' });
+}
+
+function stepProgress(node) {
+    if (node.status === 'active') {
+        return progressBar(100, 'running', {
+            cls: 'plan-progress-running',
+            fillCls: 'plan-progress-fill-running',
+        });
+    }
+    if (node.status === 'done') {
+        return progressBar(100, 'done');
+    }
+    if (node.status === 'failed') {
+        return progressBar(100, 'failed', { cls: 'plan-progress-failed' });
+    }
+    return progressBar(0, 'pending');
+}
+
+function normalizeStreamItems(lines) {
+    if (!Array.isArray(lines)) {
+        return [];
+    }
+    const out = [];
+    for (const raw of lines) {
+        if (!raw || typeof raw !== 'object') {
+            continue;
+        }
+        const worker = String(raw.worker || '').trim();
+        const model = String(raw.model || '').trim();
+        const text = String(raw.text || '').trim();
+        if (!text) {
+            continue;
+        }
+        const prefix = [worker, model].filter(Boolean).join('/');
+        out.push(prefix ? `[${prefix}] ${text}` : text);
+    }
+    return out;
+}
+
+function streamBoxHtml(nodeId) {
+    return `
+        <div class="plan-stream" data-stream-node="${esc(nodeId)}">
+            <div class="plan-stream-lines"></div>
+        </div>
+    `;
+}
+
+function objectiveHtml(runMeta) {
+    const objective = String(runMeta?.objective || '').trim();
+    if (!objective) {
+        return '';
+    }
+    const lineCount = objective.split('\n').length;
+    const longText = objective.length > 700 || lineCount > 10;
+    return `
+        <details class="friendly-objective" ${longText ? '' : 'open'}>
+            <summary>Objective</summary>
+            <pre>${esc(objective)}</pre>
+        </details>
+    `;
+}
+
 function buildFriendlyHero(snapshot, meta, stepNodes, planNode) {
     const status = deriveRunSummaryStatus(snapshot, meta);
     const parts = [`${status.icon} ${status.text}`];
@@ -400,15 +487,22 @@ function nodeHtml(node, context) {
     const modelEffort = modelEffortChips(meta);
     const usage = usageChip(meta);
     const duration = durationChip(node);
+    const streamLines = normalizeStreamItems(meta.stream);
+    const showStream = streamLines.length > 0 || node.status === 'active';
+    const activeCaret = node.status === 'active'
+        ? '<span class="plan-running-caret" aria-hidden="true">▌</span>'
+        : '';
 
     if (node.type === 'plan') {
         const roadmap = stepRoadmapHtml(node, context.stepNodes);
         return `
-            <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
+            <div class="plan-node ${node.status === 'active' ? 'plan-node-running' : ''}" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">${esc(node.label)}</div>
+                    <div class="plan-node-label">${esc(node.label)}${activeCaret}</div>
+                    ${planProgress(context.stepNodes || [], node, context.snapshot || {})}
                     ${roadmap}
+                    ${showStream ? streamBoxHtml(node.id) : ''}
                 </div>
             </div>
         `;
@@ -427,13 +521,14 @@ function nodeHtml(node, context) {
             duration,
         ].filter(Boolean).join('');
         return `
-            <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
+            <div class="plan-node ${node.status === 'active' ? 'plan-node-running' : ''}" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">${esc(title)}</div>
-                    ${progressBar(idx, total)}
+                    <div class="plan-node-label">${esc(title)}${activeCaret}</div>
+                    ${stepProgress(node, idx, total)}
                     ${chips ? `<div class="plan-chip-row">${chips}</div>` : ''}
                     ${activity}
+                    ${showStream ? streamBoxHtml(node.id) : ''}
                 </div>
             </div>
         `;
@@ -441,10 +536,11 @@ function nodeHtml(node, context) {
 
     if (node.type === 'tot') {
         return `
-            <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
+            <div class="plan-node ${node.status === 'active' ? 'plan-node-running' : ''}" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">${esc(totSummaryLabel(meta))}</div>
+                    <div class="plan-node-label">${esc(totSummaryLabel(meta))}${activeCaret}</div>
+                    ${showStream ? streamBoxHtml(node.id) : ''}
                 </div>
             </div>
         `;
@@ -453,20 +549,22 @@ function nodeHtml(node, context) {
     if (node.type === 'iteration') {
         const iter = Number(meta.iteration || 0) || '?';
         const iterTotal = Number(meta.iteration_total || 0) || '?';
-        const iterProgress = Number(iter) > 0 && Number(iterTotal) > 0
-            ? progressBar(iter, iterTotal)
-            : '<div class="plan-progress plan-progress-empty"><span>Review progress unavailable</span></div>';
+        const iterStats = formatProgress(iter, iterTotal);
+        const iterProgress = iterStats.label === 'Progress unavailable'
+            ? progressBar(0, 'Review progress unavailable', { empty: true })
+            : progressBar(iterStats.pct, iterStats.label);
         const chips = [
             outcomeBadge(meta),
             modelEffort,
         ].filter(Boolean).join('');
         return `
-            <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
+            <div class="plan-node ${node.status === 'active' ? 'plan-node-running' : ''}" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">Review pass ${esc(iter)} of ${esc(iterTotal)}</div>
+                    <div class="plan-node-label">Review pass ${esc(iter)} of ${esc(iterTotal)}${activeCaret}</div>
                     ${iterProgress}
                     ${chips ? `<div class="plan-chip-row">${chips}</div>` : ''}
+                    ${showStream ? streamBoxHtml(node.id) : ''}
                 </div>
             </div>
         `;
@@ -482,22 +580,24 @@ function nodeHtml(node, context) {
             attemptText ? chip(attemptText, 'plan-chip-usage') : '',
         ].filter(Boolean).join('');
         return `
-            <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
+            <div class="plan-node ${node.status === 'active' ? 'plan-node-running' : ''}" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
                 <span class="plan-node-icon">${iconForStatus(node.status)}</span>
                 <div class="plan-node-body">
-                    <div class="plan-node-label">${esc(node.label)}</div>
+                    <div class="plan-node-label">${esc(node.label)}${activeCaret}</div>
                     ${chips ? `<div class="plan-chip-row">${chips}</div>` : ''}
                     ${reason}
+                    ${showStream ? streamBoxHtml(node.id) : ''}
                 </div>
             </div>
         `;
     }
 
     return `
-        <div class="plan-node" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
+        <div class="plan-node ${node.status === 'active' ? 'plan-node-running' : ''}" data-status="${esc(node.status)}" data-type="${esc(node.type)}">
             <span class="plan-node-icon">${iconForStatus(node.status)}</span>
             <div class="plan-node-body">
-                <div class="plan-node-label">${esc(node.label)}</div>
+                <div class="plan-node-label">${esc(node.label)}${activeCaret}</div>
+                ${showStream ? streamBoxHtml(node.id) : ''}
             </div>
         </div>
     `;
@@ -509,6 +609,9 @@ export class FriendlyPlanRenderer {
         this.runMeta = options.runMeta && typeof options.runMeta === 'object' ? options.runMeta : {};
         this.lastSignature = '';
         this._timerInterval = null;
+        this._streamState = new Map();
+        this._streamTickHandle = null;
+        this._typingQueue = [];
     }
 
     setRunMeta(meta) {
@@ -543,6 +646,158 @@ export class FriendlyPlanRenderer {
         }
     }
 
+    _ensureStreamTicker() {
+        if (this._streamTickHandle) {
+            return;
+        }
+        this._streamTickHandle = setInterval(() => {
+            if (this._typingQueue.length === 0) {
+                this._stopStreamTicker();
+                return;
+            }
+            const queue = this._typingQueue.slice();
+            this._typingQueue = [];
+            for (const job of queue) {
+                if (!job || !job.el || !this.container.contains(job.el)) {
+                    continue;
+                }
+                const remaining = job.text.length - job.pos;
+                if (remaining <= 0) {
+                    continue;
+                }
+                const burst = Math.min(6, Math.max(1, Math.ceil(remaining / 8)));
+                const nextPos = Math.min(job.text.length, job.pos + burst);
+                job.pos = nextPos;
+                job.el.textContent = job.text.slice(0, job.pos);
+                const scroller = job.scroller;
+                if (scroller) {
+                    scroller.scrollTop = scroller.scrollHeight;
+                }
+                if (job.pos < job.text.length) {
+                    this._typingQueue.push(job);
+                }
+            }
+            if (this._typingQueue.length === 0) {
+                this._stopStreamTicker();
+            }
+        }, 40);
+    }
+
+    _stopStreamTicker() {
+        if (!this._streamTickHandle) {
+            return;
+        }
+        clearInterval(this._streamTickHandle);
+        this._streamTickHandle = null;
+    }
+
+    _syncStreams(snapshot) {
+        if (!this.container || this.container.hidden) {
+            return;
+        }
+        const activeNodes = (snapshot?.nodes || []).filter((node) => node?.status === 'active');
+        const hasActiveStep = activeNodes.some((node) => node?.type === 'step');
+        const nextStreams = new Map();
+        for (const node of snapshot?.nodes || []) {
+            if (!node || !node.id) {
+                continue;
+            }
+            const lines = normalizeStreamItems(node.meta?.stream);
+            if (lines.length > 0 || node.status === 'active') {
+                nextStreams.set(String(node.id), lines);
+            }
+        }
+        const liveTail = normalizeStreamItems(snapshot?.liveTail);
+        if (!hasActiveStep && liveTail.length > 0) {
+            nextStreams.set('__live_tail__', liveTail);
+        }
+
+        for (const nodeId of Array.from(this._streamState.keys())) {
+            if (!nextStreams.has(nodeId)) {
+                this._streamState.delete(nodeId);
+            }
+        }
+
+        const boxes = this.container.querySelectorAll('[data-stream-node]');
+        for (const box of boxes) {
+            const nodeId = String(box.dataset.streamNode || '');
+            if (!nodeId) {
+                continue;
+            }
+            const linesWrap = box.querySelector('.plan-stream-lines');
+            if (!linesWrap) {
+                continue;
+            }
+            const targetLines = nextStreams.get(nodeId) || [];
+            let state = this._streamState.get(nodeId);
+            if (!state) {
+                state = { lines: [] };
+                this._streamState.set(nodeId, state);
+            }
+
+            let overlap = Math.min(state.lines.length, targetLines.length);
+            while (overlap > 0) {
+                const left = state.lines.slice(state.lines.length - overlap).join('\n');
+                const right = targetLines.slice(0, overlap).join('\n');
+                if (left === right) {
+                    break;
+                }
+                overlap -= 1;
+            }
+
+            if (overlap === 0 && state.lines.length > 0 && targetLines.length > 0) {
+                linesWrap.textContent = '';
+                state.lines = [];
+            } else if (overlap < state.lines.length) {
+                const keep = state.lines.length - overlap;
+                for (let i = 0; i < keep; i += 1) {
+                    if (linesWrap.firstChild) {
+                        linesWrap.removeChild(linesWrap.firstChild);
+                    }
+                }
+                state.lines = state.lines.slice(state.lines.length - overlap);
+            }
+
+            const delta = targetLines.slice(overlap);
+            if (delta.length === 0) {
+                continue;
+            }
+
+            for (let i = 0; i < delta.length; i += 1) {
+                const text = delta[i];
+                const lineEl = document.createElement('div');
+                lineEl.className = 'plan-stream-line';
+                const newestIncoming = i === delta.length - 1;
+                if (newestIncoming) {
+                    lineEl.textContent = '';
+                    linesWrap.appendChild(lineEl);
+                    this._typingQueue.push({
+                        el: lineEl,
+                        text,
+                        pos: 0,
+                        scroller: box,
+                    });
+                } else {
+                    lineEl.textContent = text;
+                    linesWrap.appendChild(lineEl);
+                }
+            }
+
+            const maxLines = 40;
+            while (linesWrap.children.length > maxLines) {
+                linesWrap.removeChild(linesWrap.firstChild);
+            }
+            state.lines = targetLines.slice(-maxLines);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        if (this._typingQueue.length > 0) {
+            this._ensureStreamTicker();
+        } else {
+            this._stopStreamTicker();
+        }
+    }
+
     render(snapshot) {
         if (!snapshot || typeof snapshot !== 'object') {
             this.container.innerHTML = '<div class="plan-empty">No run data yet.</div>';
@@ -559,20 +814,23 @@ export class FriendlyPlanRenderer {
         if (signature === this.lastSignature) {
             this._updateLiveTimers();
             this._syncTimerTicker();
+            this._syncStreams(snapshot);
             return;
         }
         this.lastSignature = signature;
 
         const { nodeMap, children, stepNodes } = collectStepGroups(snapshot);
         const planNode = nodeMap.get('plan');
-        const planHtml = planNode ? nodeHtml(planNode, { stepNodes, stepTotal: planNode?.meta?.step_total }) : '';
+        const planHtml = planNode ? nodeHtml(planNode, { stepNodes, stepTotal: planNode?.meta?.step_total, snapshot }) : '';
         const heroLine = buildFriendlyHero(snapshot, this.runMeta, stepNodes, planNode);
+        const objectiveBox = objectiveHtml(this.runMeta);
         const badges = snapshot.inferred
             ? '<span class="plan-badge">inferred timeline - limited detail</span>'
             : (snapshot.limited_detail
                 ? '<span class="plan-badge">older run - limited detail</span>'
                 : '');
         const renderedIds = new Set();
+        const activeStep = stepNodes.find((node) => node.status === 'active');
 
         let stepsHtml = '';
         for (const step of stepNodes) {
@@ -582,10 +840,12 @@ export class FriendlyPlanRenderer {
             for (const child of childNodes) {
                 renderedIds.add(child.id);
             }
-            const childHtml = childNodes.map((child) => nodeHtml(child, { stepNodes, stepTotal: step.meta?.step_total })).join('');
+            const childHtml = childNodes.map((child) => nodeHtml(child, { stepNodes, stepTotal: step.meta?.step_total, snapshot })).join('');
             stepsHtml += `
                 <section class="plan-step-group">
-                    ${nodeHtml(step, { stepNodes, stepTotal: step.meta?.step_total })}
+                    <div class="plan-step-main">
+                        ${nodeHtml(step, { stepNodes, stepTotal: step.meta?.step_total, snapshot })}
+                    </div>
                     ${childHtml ? `<div class="plan-step-children">${childHtml}</div>` : ''}
                 </section>
             `;
@@ -596,7 +856,7 @@ export class FriendlyPlanRenderer {
             .filter((node) => node && !renderedIds.has(node.id))
             .map((node) => {
                 renderedIds.add(node.id);
-                return nodeHtml(node, { stepNodes, stepTotal: planNode?.meta?.step_total });
+                return nodeHtml(node, { stepNodes, stepTotal: planNode?.meta?.step_total, snapshot });
             })
             .join('');
 
@@ -604,9 +864,18 @@ export class FriendlyPlanRenderer {
             .filter((node) => node.id !== 'plan' && !renderedIds.has(node.id))
             .map((node) => {
                 renderedIds.add(node.id);
-                return nodeHtml(node, { stepNodes, stepTotal: planNode?.meta?.step_total });
+                return nodeHtml(node, { stepNodes, stepTotal: planNode?.meta?.step_total, snapshot });
             })
             .join('');
+
+        const showLiveTail = !activeStep && Array.isArray(snapshot.liveTail) && snapshot.liveTail.length > 0;
+        const preservedStreams = new Map();
+        for (const el of this.container.querySelectorAll('[data-stream-node]')) {
+            const id = String(el.dataset.streamNode || '');
+            if (id) {
+                preservedStreams.set(id, el);
+            }
+        }
 
         this.container.innerHTML = `
             <div class="friendly-plan">
@@ -615,17 +884,30 @@ export class FriendlyPlanRenderer {
                     <div class="friendly-status">${esc(statusLine(snapshot))}</div>
                     <div class="friendly-counters">${esc(formatCounters(snapshot.counters || {}))}</div>
                     ${badges ? `<div class="friendly-badges">${badges}</div>` : ''}
+                    ${objectiveBox}
+                    ${showLiveTail ? `<div class="friendly-live-tail">${streamBoxHtml('__live_tail__')}</div>` : ''}
                 </div>
-                <div class="friendly-diagram">
-                    ${planHtml}
-                    ${rootChildren}
-                    ${stepsHtml}
-                    ${dangling}
+                <div class="friendly-diagram ${stepNodes.length > 0 ? 'friendly-diagram-has-steps' : ''}">
+                    ${planHtml ? `<div class="plan-flow-head">${planHtml}</div>` : ''}
+                    <div class="plan-flow-body">
+                        ${rootChildren}
+                        ${stepsHtml}
+                        ${dangling}
+                    </div>
                 </div>
             </div>
         `;
 
+        for (const placeholder of this.container.querySelectorAll('[data-stream-node]')) {
+            const id = String(placeholder.dataset.streamNode || '');
+            const reused = preservedStreams.get(id);
+            if (reused && reused !== placeholder) {
+                placeholder.replaceWith(reused);
+            }
+        }
+
         this._updateLiveTimers();
         this._syncTimerTicker();
+        this._syncStreams(snapshot);
     }
 }

@@ -473,6 +473,29 @@ input[type="text"], textarea, select {
     flex-wrap: wrap;
 }
 
+.friendly-plan .friendly-objective {
+    border: 1px solid var(--line);
+    border-radius: var(--r-2);
+    background: var(--bg-0);
+    padding: var(--s-2) var(--s-3);
+}
+
+.friendly-plan .friendly-objective summary {
+    cursor: pointer;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.friendly-plan .friendly-objective pre {
+    margin: var(--s-2) 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--font-mono);
+    font-size: 0.86rem;
+    color: var(--fg-1);
+}
+
 .friendly-plan .plan-badge {
     border: 1px solid var(--line);
     border-radius: 999px;
@@ -484,20 +507,100 @@ input[type="text"], textarea, select {
 .friendly-plan .friendly-diagram {
     display: grid;
     gap: var(--s-3);
+    position: relative;
+}
+
+.friendly-plan .plan-flow-head {
+    position: relative;
+}
+
+.friendly-plan .plan-flow-body {
+    display: grid;
+    gap: var(--s-3);
+    position: relative;
+}
+
+.friendly-plan .friendly-diagram-has-steps .plan-flow-head::after {
+    content: '';
+    position: absolute;
+    left: 1.15rem;
+    bottom: -0.95rem;
+    width: 1px;
+    height: 0.9rem;
+    background: var(--line);
 }
 
 .friendly-plan .plan-step-group {
-    margin-left: var(--s-4);
-    padding-left: var(--s-4);
-    border-left: 2px solid var(--line);
     display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr);
+    align-items: start;
     gap: var(--s-2);
+    position: relative;
+    padding-left: 1.75rem;
+}
+
+.friendly-plan .plan-step-group::before {
+    content: '';
+    position: absolute;
+    left: 1.1rem;
+    top: -0.95rem;
+    bottom: -0.95rem;
+    width: 1px;
+    background: var(--line);
+}
+
+.friendly-plan .plan-step-group::after {
+    content: '';
+    position: absolute;
+    left: 1.1rem;
+    top: calc(var(--s-2) + 1.05rem);
+    width: 0.66rem;
+    border-top: 1px solid var(--line);
+}
+
+.friendly-plan .plan-step-main {
+    position: relative;
 }
 
 .friendly-plan .plan-step-children {
     display: grid;
     gap: var(--s-2);
-    margin-left: var(--s-4);
+    margin-left: var(--s-2);
+    padding-left: 1rem;
+    position: relative;
+}
+
+.friendly-plan .plan-step-children::before {
+    content: '';
+    position: absolute;
+    left: 0.25rem;
+    top: 1rem;
+    bottom: 1rem;
+    width: 1px;
+    background: var(--line);
+}
+
+.friendly-plan .plan-step-children > .plan-node {
+    position: relative;
+}
+
+.friendly-plan .plan-step-children > .plan-node::before {
+    content: '';
+    position: absolute;
+    left: -0.74rem;
+    top: 1rem;
+    width: 0.74rem;
+    border-top: 1px solid var(--line);
+}
+
+@media (max-width: 900px) {
+    .friendly-plan .plan-step-group {
+        grid-template-columns: 1fr;
+    }
+
+    .friendly-plan .plan-step-children {
+        margin-left: 0;
+    }
 }
 
 .friendly-plan .plan-node {
@@ -526,7 +629,11 @@ input[type="text"], textarea, select {
 
 .friendly-plan .plan-node[data-status="active"] {
     border-color: var(--plan-active);
-    box-shadow: 0 0 0 1px var(--plan-active);
+}
+
+.friendly-plan .plan-node.plan-node-running {
+    border-color: var(--plan-active);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--plan-active) 70%, transparent), 0 0 10px color-mix(in srgb, var(--plan-active) 22%, transparent);
 }
 
 .friendly-plan .plan-node[data-status="done"] {
@@ -558,15 +665,6 @@ input[type="text"], textarea, select {
     color: var(--plan-active);
 }
 
-/* Pulse the active-step icon only when motion is welcomed. An infinite animation
-   pegs software-GL compositors (e.g. swiftshader) and never lets the frame settle,
-   which also breaks automated/computer-use perception of the view. */
-@media (prefers-reduced-motion: no-preference) {
-    .friendly-plan .plan-node[data-status="active"] .plan-node-icon {
-        animation: plan-pulse 1.2s ease-in-out infinite;
-    }
-}
-
 .friendly-plan .plan-node[data-status="done"] .plan-node-icon {
     color: var(--plan-done);
 }
@@ -584,6 +682,15 @@ input[type="text"], textarea, select {
 
 .friendly-plan .plan-node-label {
     font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.friendly-plan .plan-running-caret {
+    display: inline-block;
+    color: var(--plan-active);
+    opacity: 0.95;
 }
 
 .friendly-plan .plan-node-note {
@@ -648,6 +755,27 @@ input[type="text"], textarea, select {
 .friendly-plan .plan-progress-fill {
     height: 100%;
     background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 80%, var(--bg-0)), var(--accent));
+}
+
+.friendly-plan .plan-progress-running .plan-progress-track {
+    background:
+        repeating-linear-gradient(
+            -45deg,
+            color-mix(in srgb, var(--plan-active) 24%, transparent) 0,
+            color-mix(in srgb, var(--plan-active) 24%, transparent) 6px,
+            transparent 6px,
+            transparent 12px
+        ),
+        var(--bg-0);
+}
+
+.friendly-plan .plan-progress-fill-running {
+    width: 100%;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--plan-active) 55%, var(--bg-0)), var(--plan-active), color-mix(in srgb, var(--friendly-text, var(--accent)) 60%, var(--plan-active)));
+}
+
+.friendly-plan .plan-progress-failed .plan-progress-fill {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--bad) 78%, var(--bg-0)), var(--bad));
 }
 
 .friendly-plan .plan-progress-label {
@@ -735,6 +863,62 @@ input[type="text"], textarea, select {
 
 .friendly-plan .plan-badge-neutral {
     color: var(--fg-1);
+}
+
+.friendly-plan .plan-stream {
+    margin-top: 2px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-1);
+    background: color-mix(in srgb, var(--bg-0) 88%, #000 12%);
+    min-height: calc(1.25em * 2);
+    max-height: calc(1.25em * 6);
+    overflow-y: auto;
+    padding: 6px 8px;
+    font-size: 0.76rem;
+    line-height: 1.25;
+    font-family: var(--font-mono);
+}
+
+.friendly-plan .plan-stream-lines {
+    display: grid;
+    gap: 2px;
+}
+
+.friendly-plan .plan-stream-line {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.friendly-plan .friendly-live-tail {
+    margin-top: var(--s-1);
+}
+
+.friendly-plan .friendly-live-tail .plan-stream {
+    max-height: calc(1.25em * 6);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .friendly-plan .plan-running-caret {
+        animation: plan-caret-blink 0.9s steps(1, end) 12;
+    }
+
+    .friendly-plan .plan-progress-running .plan-progress-track {
+        animation: plan-indeterminate-stripes 1s linear 64;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .friendly-plan .plan-progress-running .plan-progress-track {
+        background:
+            repeating-linear-gradient(
+                -45deg,
+                color-mix(in srgb, var(--plan-active) 24%, transparent) 0,
+                color-mix(in srgb, var(--plan-active) 24%, transparent) 6px,
+                transparent 6px,
+                transparent 12px
+            ),
+            var(--bg-0);
+    }
 }
 
 :root:not(.light) .friendly-plan {
@@ -879,73 +1063,51 @@ input[type="text"], textarea, select {
 }
 
 :root:not(.light) .friendly-plan .plan-step-group {
-    border-left: 0;
-    position: relative;
-    margin-left: calc(var(--s-4) + 4px);
-    padding-left: var(--s-4);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0.92fr);
 }
 
-:root:not(.light) .friendly-plan .plan-step-group::before {
-    content: '';
-    position: absolute;
-    left: 8px;
-    top: -10px;
-    bottom: 14px;
-    border-left: 1px solid var(--friendly-line);
+:root:not(.light) .friendly-plan .friendly-objective {
+    border-color: var(--friendly-line);
+    background: linear-gradient(180deg, rgba(51, 255, 156, 0.06), rgba(7, 10, 7, 0.65));
 }
 
-:root:not(.light) .friendly-plan .plan-step-group > .plan-node {
-    position: relative;
+:root:not(.light) .friendly-plan .friendly-objective pre {
+    color: var(--friendly-text-dim);
 }
 
-:root:not(.light) .friendly-plan .plan-step-group > .plan-node::before {
-    content: '';
-    position: absolute;
-    left: -16px;
-    top: 1rem;
-    width: 12px;
-    border-top: 1px solid var(--friendly-line);
+:root:not(.light) .friendly-plan .friendly-diagram-has-steps .plan-flow-head::after,
+:root:not(.light) .friendly-plan .plan-step-group::before,
+:root:not(.light) .friendly-plan .plan-step-group::after,
+:root:not(.light) .friendly-plan .plan-step-children::before,
+:root:not(.light) .friendly-plan .plan-step-children > .plan-node::before {
+    background: var(--friendly-line);
+    border-color: var(--friendly-line);
 }
 
 :root:not(.light) .friendly-plan .plan-step-children {
-    margin-left: 10px;
-    padding-left: 18px;
-    position: relative;
+    gap: var(--s-2);
 }
 
-:root:not(.light) .friendly-plan .plan-step-children::before {
-    content: '';
-    position: absolute;
-    left: 4px;
-    top: 0.25rem;
-    bottom: 1rem;
-    border-left: 1px solid var(--friendly-line);
+:root:not(.light) .friendly-plan .plan-stream {
+    border-color: var(--friendly-line);
+    background: linear-gradient(180deg, rgba(11, 19, 13, 0.96), rgba(7, 10, 7, 0.9));
+    color: var(--friendly-text);
 }
 
-:root:not(.light) .friendly-plan .plan-step-children > .plan-node {
-    position: relative;
+:root:not(.light) .friendly-plan .plan-progress-running .plan-progress-track {
+    background:
+        repeating-linear-gradient(
+            -45deg,
+            rgba(255, 176, 0, 0.18) 0,
+            rgba(255, 176, 0, 0.18) 6px,
+            transparent 6px,
+            transparent 12px
+        ),
+        #091009;
 }
 
-:root:not(.light) .friendly-plan .plan-step-children > .plan-node::before {
-    content: '';
-    position: absolute;
-    left: -14px;
-    top: 1rem;
-    width: 10px;
-    border-top: 1px solid var(--friendly-line);
-}
-
-:root:not(.light) .friendly-plan .plan-step-children > .plan-node::after {
-    content: '';
-    position: absolute;
-    left: -14px;
-    top: 1rem;
-    bottom: -0.9rem;
-    border-left: 1px solid var(--friendly-line);
-}
-
-:root:not(.light) .friendly-plan .plan-step-children > .plan-node:last-child::after {
-    display: none;
+:root:not(.light) .friendly-plan .plan-progress-fill-running {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--friendly-active) 75%, #0d1a0f), var(--friendly-text));
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -965,10 +1127,14 @@ input[type="text"], textarea, select {
     }
 }
 
-@keyframes plan-pulse {
-    0% { opacity: 0.6; transform: scale(0.9); }
-    50% { opacity: 1; transform: scale(1.05); }
-    100% { opacity: 0.6; transform: scale(0.9); }
+@keyframes plan-caret-blink {
+    0%, 49% { opacity: 0.25; }
+    50%, 100% { opacity: 1; }
+}
+
+@keyframes plan-indeterminate-stripes {
+    0% { background-position: 0 0, 0 0; }
+    100% { background-position: 24px 0, 0 0; }
 }
 
 .runs-preview td {
