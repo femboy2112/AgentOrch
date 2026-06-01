@@ -15,6 +15,7 @@ _WORKER_EVENT_KINDS = {
     "usage",
     "stderr",
     "watchdog",
+    "heartbeat",
 }
 
 

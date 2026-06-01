@@ -52,6 +52,8 @@ def _print_result(result) -> None:
         if delta:
             dcol = C_GREEN if delta == "fixed" else (C_YELLOW if delta in ("preserved", "unchanged") else C_RED)
             print(f"  verifier  : {dcol}{delta}{C_RESET}")
+    if getattr(result, "run_outcome", None):
+        print(f"  {C_RED}outcome   : {result.run_outcome} (run watchdog){C_RESET}")
     if result.error:
         print(f"  {C_RED}error     : {result.error}{C_RESET}")
     if getattr(result, "protect_violations", None):
@@ -141,6 +143,10 @@ def _cmd_do(args) -> int:
         protect_paths=[g for g in (args.protect_paths or "").split(",") if g.strip()] or None,
         allow_paths=[g for g in (args.allow_paths or "").split(",") if g.strip()] or None,
         plan_only=getattr(args, "plan_only", False),
+        run_stall_abort=args.run_stall_abort,
+        notify=args.notify or os.environ.get("AGY_NOTIFY") or None,
+        notify_cmd=args.notify_cmd,
+        heartbeat_interval=args.heartbeat_interval,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -307,6 +313,30 @@ def main(argv=None) -> int:
                     help="Allowlist inverse of --protect-paths: fail the run if a worker "
                          "writes any path OUTSIDE these globs (e.g. additive-only into a "
                          "single subtree).")
+    do.add_argument("--run-stall-abort", type=float, default=None, metavar="SEC",
+                    help="Whole-run watchdog: abort the run if NO run-level forward "
+                         "progress (a step/branch/plan milestone, a worker-call "
+                         "boundary, a usage tick — i.e. anything but raw token "
+                         "chatter) happens within SEC seconds, then classify it "
+                         "'stalled' in meta.json and fire --notify. Complements the "
+                         "per-agent stall watchdog, which only catches a SILENT "
+                         "worker — this catches a stuck-but-chatty run (#40).")
+    do.add_argument("--notify", type=str, default=None, metavar="URL|CMD",
+                    help="Best-effort, non-fatal notification on lifecycle/anomaly "
+                         "events (start/step/stall/oom/verifier-fail/finish). An "
+                         "http(s):// value is POSTed a small JSON payload; anything "
+                         "else is run as a shell command (payload on stdin + "
+                         "AGY_NOTIFY_* env). See also --notify-cmd. Env: AGY_NOTIFY.")
+    do.add_argument("--notify-cmd", type=str, default=None, metavar="CMD",
+                    help="Shell command form of --notify (e.g. "
+                         "'notify-send \"agentorch $AGY_NOTIFY_EVENT\"'). Runs on the "
+                         "same events; payload arrives on stdin + AGY_NOTIFY_* env.")
+    do.add_argument("--heartbeat-interval", type=float, default=None, metavar="SEC",
+                    help="Seconds between run-level 'heartbeat' events written to "
+                         "events.jsonl (step, free-mem, elapsed, since-progress) so "
+                         "a watcher/dashboard reads one explicit liveness signal "
+                         "instead of inferring it from file mtimes. Default 30 "
+                         "(env AGY_HEARTBEAT_SECONDS); 0 disables.")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",

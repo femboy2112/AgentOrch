@@ -36,6 +36,33 @@ def _read_meta(runs_dir: Path, run_id: str) -> dict:
         return {"run_id": run_id}
 
 
+def _read_last_heartbeat(events_path: Path) -> Optional[dict]:
+    """Return the data payload of the last run-level 'heartbeat' event, if any.
+
+    The heartbeat (#40) is an *explicit* liveness signal (step, free-mem,
+    elapsed, seconds-since-progress) so a watcher reads one structured row
+    instead of inferring liveness from file mtimes. Returns None for runs that
+    predate the heartbeat (the mtime heuristic still bounds the scan).
+    """
+    try:
+        last: Optional[dict] = None
+        with events_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or '"heartbeat"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(ev, dict) and ev.get("kind") == "heartbeat":
+                    data = ev.get("data")
+                    last = data if isinstance(data, dict) else {}
+        return last
+    except OSError:
+        return None
+
+
 def _scan_filesystem_runs(runs_dir: Path, already_tracked: set[str]) -> list[dict]:
     """Return running dispatches discovered from runs/ on disk."""
     if not runs_dir.exists():
@@ -80,15 +107,24 @@ def _scan_filesystem_runs(runs_dir: Path, already_tracked: set[str]) -> list[dic
         except OSError:
             pass
 
-        out.append(
-            {
-                "run_id": run_id,
-                "started_at": started_at,
-                "mode": "cli",
-                "instruction_preview": instruction_preview,
-                "source": "cli",
-            }
-        )
+        row = {
+            "run_id": run_id,
+            "started_at": started_at,
+            "mode": "cli",
+            "instruction_preview": instruction_preview,
+            "source": "cli",
+        }
+        # Explicit liveness from the heartbeat (#40), when present: surfaces the
+        # current step and seconds-since-progress so a stuck-but-still-emitting
+        # run is visibly stalled rather than just "mtime fresh".
+        hb = _read_last_heartbeat(events_path)
+        if hb is not None:
+            row["heartbeat"] = hb
+            if hb.get("step") is not None:
+                row["step"] = hb.get("step")
+            if hb.get("since_progress_s") is not None:
+                row["since_progress_s"] = hb.get("since_progress_s")
+        out.append(row)
     return out
 
 

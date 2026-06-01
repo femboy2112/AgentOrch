@@ -38,6 +38,7 @@ from agy_orchestrator.workflows.test_feedback import TestFeedbackWorkflow
 from agy_orchestrator.workflows.vote import VoteWorkflow
 from dashboard.event_bus import EventBus
 from harness import roles
+from harness.run_monitor import Notifier, RunMonitor, RunStalled
 from harness.snapshot import diff_snapshots, take_snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -178,6 +179,9 @@ class DispatchResult:
     # --allow-paths. Non-empty forces success=False so a downstream consumer can
     # gate on meta.json instead of a human reading the diff.
     protect_violations: List[Dict[str, str]] = field(default_factory=list)
+    # Run-watchdog outcome (#40): set to "stalled" when --run-stall-abort fired
+    # (no run-level forward progress within the window). None for a normal run.
+    run_outcome: Optional[str] = None
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -659,6 +663,11 @@ async def dispatch_async(
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
+    # Run-level watchdog / heartbeat / notify (#40)
+    run_stall_abort: Optional[float] = None,
+    notify: Optional[str] = None,
+    notify_cmd: Optional[str] = None,
+    heartbeat_interval: Optional[float] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -730,7 +739,17 @@ async def dispatch_async(
     events_path = run_dir / "events.jsonl"
     events_path.touch()
 
+    # The run monitor (#40) is constructed below but referenced from _sink so it
+    # can observe run-level forward progress on every event. Use a 1-slot holder
+    # to keep the closure simple without reordering the surrounding setup.
+    _monitor_holder: List[RunMonitor] = []
+
     def _sink(event: dict) -> None:
+        if _monitor_holder:
+            try:
+                _monitor_holder[0].observe(event)
+            except Exception:
+                pass
         with events_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
@@ -818,6 +837,34 @@ async def dispatch_async(
         },
     })
 
+    # Run-level watchdog + heartbeat + notify (#40). Heartbeats publish through
+    # the bus (so they persist to events.jsonl AND reach the dashboard) on a
+    # dedicated publisher; the monitor observes every event via _sink to track
+    # run-level forward progress (chatter doesn't count) and the current step.
+    if heartbeat_interval is None:
+        heartbeat_interval = float(os.environ.get("AGY_HEARTBEAT_SECONDS", "30") or 0)
+    notify_url: Optional[str] = None
+    notify_command: Optional[str] = notify_cmd
+    if notify:
+        if notify.startswith(("http://", "https://")):
+            notify_url = notify
+        else:
+            notify_command = notify_command or notify
+    notifier = Notifier(webhook=notify_url, command=notify_command, run_id=run_id)
+    heartbeat_pub = EVENT_BUS.publisher_for(
+        run_id, worker="run-monitor", model="n/a", effort="n/a",
+    )
+    monitor = RunMonitor(
+        run_id=run_id,
+        emit=heartbeat_pub,
+        notifier=notifier,
+        work_dir=str(work_dir),
+        heartbeat_interval=heartbeat_interval or 0.0,
+        run_stall_abort=run_stall_abort,
+    )
+    _monitor_holder.append(monitor)
+    monitor.notify("start", extra={"mode": mode})
+
     # Route all tracking logs into this run's stderr.log while still showing them.
     file_handler = logging.FileHandler(run_dir / "stderr.log", encoding="utf-8")
     file_handler.setFormatter(
@@ -865,6 +912,7 @@ async def dispatch_async(
     error: Optional[str] = None
     output = ""
     workflow = None
+    run_outcome: Optional[str] = None
     try:
         if _is_cu:
             # Step 12 minimal glue: exercise the real adapter (writes events.jsonl under runs/<id>/,
@@ -890,7 +938,10 @@ async def dispatch_async(
             output = f"computer-use:{h.status} run_id={h.run_id} events={h.events_path or ''}"
             # workflow stays None (no quality ledger from cu yet)
         else:
-            output, workflow = await _run_workflow(
+            # Supervise the workflow with the run-level watchdog + heartbeat
+            # (#40). When neither is active monitor.run awaits the coroutine
+            # directly, so the default path is byte-for-byte unchanged.
+            output, workflow = await monitor.run(_run_workflow(
                 mode, prompt,
                 run_id=run_id,
                 generator_chain=generator_chain, critic_chain=critic_chain,
@@ -904,7 +955,15 @@ async def dispatch_async(
                 candidate_setup=candidate_setup,
                 resume_policy=resume_policy,
                 plan_only=plan_only,
-            )
+            ))
+    except RunStalled as exc:  # run watchdog aborted: classify, never crash
+        success = False
+        run_outcome = exc.reason
+        error = (
+            f"run aborted by watchdog: no run-level forward progress within "
+            f"{run_stall_abort:g}s (stuck/stalled)"
+        )
+        logger.error("Dispatch %s %s", run_id, error)
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
         error = f"{type(exc).__name__}: {exc}"
@@ -987,6 +1046,20 @@ async def dispatch_async(
                 "; ".join(f"{v['path']} ({v['reason']})" for v in protect_violations),
             )
 
+    # Notify on anomalies + finish (#40). The stall ping already fired from the
+    # watchdog; here we cover OOM / verifier-fail / a clean finish, now that
+    # success is final (the path-policy gate above may have flipped it).
+    if run_outcome != "stalled" and not success and verifier is not None:
+        baseline_oom = bool(baseline_result is not None and getattr(baseline_result, "resource_exceeded", False))
+        notifier.fire(
+            "oom" if baseline_oom else "verifier_fail",
+            monitor.payload(extra={
+                "baseline_ok": baseline_result.ok if baseline_result is not None else None,
+                "phase": "baseline" if baseline_oom else "run",
+            }),
+        )
+    notifier.fire("finish", monitor.payload(extra={"success": success, "outcome": run_outcome}))
+
     (run_dir / "stdout.log").write_text(output, encoding="utf-8")
     (run_dir / "changed-files.diff").write_text(
         diff.unified or "(no file changes detected)\n", encoding="utf-8"
@@ -1064,6 +1137,7 @@ async def dispatch_async(
         quality=quality,
         tokens=tokens,
         protect_violations=protect_violations,
+        run_outcome=run_outcome,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
@@ -1095,6 +1169,10 @@ def dispatch(
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
+    run_stall_abort: Optional[float] = None,
+    notify: Optional[str] = None,
+    notify_cmd: Optional[str] = None,
+    heartbeat_interval: Optional[float] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -1130,6 +1208,10 @@ def dispatch(
             protect_paths=protect_paths,
             allow_paths=allow_paths,
             plan_only=plan_only,
+            run_stall_abort=run_stall_abort,
+            notify=notify,
+            notify_cmd=notify_cmd,
+            heartbeat_interval=heartbeat_interval,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,
