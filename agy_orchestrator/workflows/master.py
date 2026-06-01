@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from typing import Callable, List, Optional, Tuple
 
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
@@ -49,6 +50,7 @@ class MasterWorkflow:
         working_directory: str = ".",
         recent_steps_verbatim: int = DEFAULT_RECENT_STEPS_VERBATIM,
         event_callback: Optional[Callable[[dict], None]] = None,
+        resume_policy: str = "auto",
     ):
         self.model = model
         self.effort = effort
@@ -72,6 +74,21 @@ class MasterWorkflow:
         # diverse code outputs here) or "vote" (free, but rarely clusters for code).
         self.selector = selector
         self.checkpoint_path = checkpoint_path
+        # Checkpoint-resume safety (issue #37). The #31 checkpoint is keyed only by
+        # the prompt hash, so a re-dispatch resumes "from the last completed step"
+        # even when the out-dir was reset/reverted underneath it between runs —
+        # silently building later steps on a tree missing the earlier steps' edits.
+        # `resume_policy` controls how a matching checkpoint is treated:
+        #   "auto"  (default) — resume only if the out-dir still fingerprints to the
+        #                       tree the checkpoint was saved against; otherwise
+        #                       DISCARD the stale checkpoint and start fresh (safe).
+        #   "force" (--resume) — resume even when the base diverged (operator override).
+        #   "never" (--fresh)  — ignore any checkpoint; always start clean.
+        if resume_policy not in ("auto", "force", "never"):
+            raise ValueError(
+                f"resume_policy must be 'auto', 'force', or 'never' (got {resume_policy!r})"
+            )
+        self.resume_policy = resume_policy
         # Session compaction: over a long chained run the resumed workflow session
         # (full transcript re-sent every step) and the growing project_context are the
         # token-cost drivers. Every ``compaction_interval`` steps, OR whenever
@@ -210,11 +227,53 @@ class MasterWorkflow:
     def _checkpoint_key(self, initial_prompt: str) -> str:
         return hashlib.sha256(initial_prompt.encode("utf-8")).hexdigest()
 
+    def _base_fingerprint(self) -> Optional[str]:
+        """Fingerprint of the out-dir's working state, for resume safety (#37).
+
+        Combines ``git rev-parse HEAD`` with a hash of ``git status --porcelain``
+        so BOTH a commit move (reset to a different ref) AND a working-tree change
+        (a ``git reset --hard`` that reverts the completed steps' *uncommitted*
+        edits — workers don't commit in master mode) flip the fingerprint. Returns
+        None when the out-dir isn't a git work tree or git is unavailable, in which
+        case resume can't be verified and falls back to legacy (#31) behavior.
+        """
+        wd = self.working_directory or "."
+        try:
+            head = subprocess.run(
+                ["git", "-C", str(wd), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if head.returncode != 0:
+                return None
+            status = subprocess.run(
+                ["git", "-C", str(wd), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if status.returncode != 0:
+                return None
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        head_ref = head.stdout.strip()
+        status_hash = hashlib.sha256(status.stdout.encode("utf-8")).hexdigest()[:16]
+        return f"{head_ref}:{status_hash}"
+
     def _load_checkpoint(
         self, initial_prompt: str
     ) -> Optional[Tuple[List[str], int, str, Optional[str]]]:
-        """Return (tasks, completed, project_context, session_id) to resume, or None."""
+        """Return (tasks, completed, project_context, session_id) to resume, or None.
+
+        Resume is gated by ``resume_policy`` and a base-fingerprint check (#37): a
+        prompt-key match is no longer sufficient — the out-dir must still be the
+        tree the checkpoint was saved against, or the operator must force it.
+        """
         path = self.checkpoint_path
+        if self.resume_policy == "never":
+            if path and os.path.exists(path):
+                logger.info(
+                    "Master resume disabled (--fresh): ignoring checkpoint %s; starting clean.",
+                    path,
+                )
+            return None
         if not path or not os.path.exists(path):
             return None
         try:
@@ -231,6 +290,43 @@ class MasterWorkflow:
         if not tasks or completed >= len(tasks):
             logger.info("Checkpoint shows project already complete; nothing to resume.")
             return None
+        # #37: verify the resume base still matches the tree we checkpointed against.
+        stored_fp = data.get("base_fingerprint")
+        current_fp = self._base_fingerprint()
+        if stored_fp is None or current_fp is None:
+            # Can't verify — a pre-#37 checkpoint or a non-git out-dir. Preserve the
+            # #31 salvage behavior (resume) but SAY so, so a stale resume is at least
+            # visible in the log instead of silent.
+            logger.warning(
+                "Master resuming checkpoint at step %d/%d but the base could NOT be "
+                "fingerprint-verified (out-dir not a git tree, or a pre-#37 "
+                "checkpoint); resuming on trust. Pass --fresh to start clean if the "
+                "tree was reset since the checkpoint was written.",
+                completed + 1, len(tasks),
+            )
+        elif stored_fp != current_fp:
+            if self.resume_policy == "force":
+                logger.warning(
+                    "Master out-dir DIVERGED from the checkpoint base (expected %s, "
+                    "found %s); --resume forces resume at step %d/%d anyway — later "
+                    "steps may build on a tree missing earlier steps' edits.",
+                    stored_fp, current_fp, completed + 1, len(tasks),
+                )
+            else:
+                logger.warning(
+                    "Master checkpoint base no longer matches the out-dir (expected "
+                    "%s, found %s): the tree was reset / hand-edited / moved since "
+                    "step %d completed. DISCARDING the stale checkpoint and starting "
+                    "FRESH to avoid a silently inconsistent build (#37). Pass --resume "
+                    "to force resume onto the current tree.",
+                    stored_fp, current_fp, completed,
+                )
+                return None
+        else:
+            logger.info(
+                "Master checkpoint base verified (%s); resuming at step %d/%d.",
+                current_fp, completed + 1, len(tasks),
+            )
         return tasks, completed, data.get("project_context", ""), data.get("session_id")
 
     def _save_checkpoint(
@@ -253,6 +349,10 @@ class MasterWorkflow:
                         "completed": completed,
                         "project_context": project_context,
                         "session_id": session_id,
+                        # #37: snapshot the out-dir state THIS checkpoint was written
+                        # against, so a later resume can confirm the tree wasn't reset
+                        # underneath it. Reflects the post-step edits on disk.
+                        "base_fingerprint": self._base_fingerprint(),
                     },
                     fh,
                 )

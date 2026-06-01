@@ -79,6 +79,20 @@ def _cmd_do(args) -> int:
             return 1
         spec_text = spec_path.read_text(encoding="utf-8")
 
+    # #37: master/pat checkpoint resume policy. Default "auto" (resume only if the
+    # out-dir still matches the tree the checkpoint was saved against, else start
+    # fresh). --fresh forces a clean start; --resume forces resume even if the tree
+    # diverged. Mutually exclusive.
+    if getattr(args, "fresh", False) and getattr(args, "resume", False):
+        print(f"{C_RED}--fresh and --resume are mutually exclusive{C_RESET}", file=sys.stderr)
+        return 1
+    if getattr(args, "fresh", False):
+        resume_policy = "never"
+    elif getattr(args, "resume", False):
+        resume_policy = "force"
+    else:
+        resume_policy = "auto"
+
     # Step 12: parse computer-use config (only has effect when generator chain leads with computer-use)
     cu_mode = getattr(args, "computer_use_mode", None)
     cu_priority = getattr(args, "computer_use_task_priority", None)
@@ -109,6 +123,7 @@ def _cmd_do(args) -> int:
         branches=args.branches,
         test_cmd=args.test_cmd,
         candidate_setup=args.candidate_setup,
+        resume_policy=resume_policy,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -249,6 +264,13 @@ def main(argv=None) -> int:
                          "Makes vote isolation sound on editable-install repos so "
                          "each candidate's verifier imports that candidate's own "
                          "source. Bounded by the verifier-concurrency cap.")
+    do.add_argument("--fresh", "--no-resume", dest="fresh", action="store_true",
+                    help="master/pat: ignore any salvage checkpoint and start clean "
+                         "(don't resume from a prior killed run)")
+    do.add_argument("--resume", action="store_true",
+                    help="master/pat: force resume from the salvage checkpoint even if "
+                         "the out-dir diverged from the tree it was saved against "
+                         "(default is to start fresh on divergence; #37)")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",

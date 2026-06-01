@@ -342,6 +342,7 @@ async def _run_workflow(
     mission_critical: bool = False,
     baseline_result: Optional[VerifierResult] = None,
     candidate_setup: Optional[str] = None,
+    resume_policy: str = "auto",
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
@@ -445,6 +446,7 @@ async def _run_workflow(
             agent_class=agent_class,
             working_directory=working_directory,
             checkpoint_path=_master_checkpoint_path(prompt),
+            resume_policy=resume_policy,
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -521,6 +523,7 @@ async def _run_workflow(
             agent_class=agent_class,
             working_directory=working_directory,
             checkpoint_path=_master_checkpoint_path(prompt),
+            resume_policy=resume_policy,
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -559,6 +562,7 @@ async def dispatch_async(
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
+    resume_policy: str = "auto",
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -793,6 +797,7 @@ async def dispatch_async(
                 mission_critical=mission_critical,
                 baseline_result=baseline_result,
                 candidate_setup=candidate_setup,
+                resume_policy=resume_policy,
             )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
@@ -948,6 +953,7 @@ def dispatch(
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
+    resume_policy: str = "auto",
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -978,6 +984,7 @@ def dispatch(
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
             candidate_setup=candidate_setup,
+            resume_policy=resume_policy,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,
