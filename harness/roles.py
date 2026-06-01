@@ -16,6 +16,7 @@ Everything here is overridable per dispatch from the CLI; these are defaults.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -31,6 +32,8 @@ from agy_orchestrator.core.calibration import CalibrationTable
 from harness.computer_use_role import (
     ComputerUseShim,  # thin adapter delegate; no LLM impact (Step 10: forwards real_gui/ask via its config)
 )
+
+logger = logging.getLogger(__name__)
 
 AGENT_CLASSES: Dict[str, Type[AgentInstance]] = {
     "codex": CodexAgent,
@@ -104,12 +107,23 @@ def _reset_calibration() -> None:
     _CALIBRATION = None
 
 
-def _arm_watchdog(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
+def _arm_watchdog(
+    agent: AgentInstance, worker: str, cfg: Dict[str, object], *, scale: float = 1.0,
+) -> None:
     """Arm the streaming watchdog from the calibration table.
 
     Skipped entirely when ``AGY_WATCHDOG=off`` (so an operator who wants the
     legacy fail-fast-only path can disable the safety net). Also skipped when
-    the agent already has explicit budgets set (env-var override case)."""
+    the agent already has explicit budgets set (env-var override case).
+
+    ``scale`` (>= 1.0 in practice) multiplies BOTH the byte and stall budgets.
+    A higher-effort / stronger-model run (e.g. codex ``gpt-5.5`` / ``xhigh`` from
+    issue #42) is longer and more verbose than the calibrated ``high`` baseline,
+    so when no calibration row exists for the exact ``(worker, model, effort)``
+    we (a) already fall back to the CONSERVATIVE per-worker defaults — never the
+    tighter calibrated budget — and (b) let the operator widen them further via
+    ``--watchdog-scale`` so a known-heavy run can't be truncated mid-flight.
+    Scale resolves from the explicit arg or the ``AGY_WATCHDOG_SCALE`` env var."""
     if os.environ.get("AGY_WATCHDOG", "").lower() == "off":
         return
     if agent.max_output_bytes > 0 or agent.stall_seconds > 0:
@@ -119,34 +133,66 @@ def _arm_watchdog(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> 
     effort = str(effort_val) if effort_val not in (None, "n/a") else None
     cal = _get_calibration()
     max_bytes, stall = cal.budget_for(worker, model, effort)
+    if not cal.has_data_for(worker, model, effort):
+        logger.debug(
+            "watchdog: no calibration for (%s, %s, %s) — using conservative "
+            "budget (max_bytes=%d, stall=%.0fs)", worker, model, effort, max_bytes, stall,
+        )
+    try:
+        env_scale = float(os.environ.get("AGY_WATCHDOG_SCALE", "") or 0) or 0.0
+    except ValueError:
+        env_scale = 0.0
+    eff_scale = scale if scale and scale > 0 else 1.0
+    if env_scale > 0:
+        eff_scale = env_scale
+    if eff_scale != 1.0:
+        max_bytes = int(max_bytes * eff_scale)
+        stall = stall * eff_scale
+        logger.info(
+            "watchdog: scaled budgets x%.2f for (%s, %s, %s) -> max_bytes=%d, stall=%.0fs",
+            eff_scale, worker, model, effort, max_bytes, stall,
+        )
     agent.max_output_bytes = max_bytes
     agent.stall_seconds = stall
 
 
 def _cfg_for_token(
-    token: str, codex_config: Optional[List[str]] = None
+    token: str,
+    codex_config: Optional[List[str]] = None,
+    overrides: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[str, Dict[str, object]]:
     """Resolve a chain token to ``(agent_name, config)``.
 
     A token is a plain agent name (``codex``/``agy``/``claude``/``grok``) or
     the special ``computer-use`` worker (Step 12). The latter returns a stub
-    config; dispatch routes it to the adapter instead of LLM path."""
+    config; dispatch routes it to the adapter instead of LLM path.
+
+    ``overrides`` (issue #42) is a per-provider ``{provider: {model, effort}}``
+    map merged over ``AGENT_DEFAULTS`` for THIS token — applied uniformly to the
+    lead and every fallback sub so e.g. codex runs at the requested tier wherever
+    it appears in the chain."""
     name = token
     if name == COMPUTER_USE_TOKEN:
         cfg = {"model": "n/a", "effort": "n/a"}
     else:
         cfg = dict(AGENT_DEFAULTS[name])
+        if overrides and name in overrides:
+            for k, v in overrides[name].items():
+                if v is not None:
+                    cfg[k] = v
     if name == "codex" and codex_config:
         cfg["config_overrides"] = list(codex_config)
     return name, cfg
 
 
 def _configs_for(
-    chain: List[str], codex_config: Optional[List[str]] = None
+    chain: List[str],
+    codex_config: Optional[List[str]] = None,
+    overrides: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Dict[Type[AgentInstance], Dict[str, object]]:
     out: Dict[Type[AgentInstance], Dict[str, object]] = {}
     for token in chain:
-        name, cfg = _cfg_for_token(token, codex_config)
+        name, cfg = _cfg_for_token(token, codex_config, overrides)
         if name == COMPUTER_USE_TOKEN:
             continue  # Step 12: cu never participates in LLM fallback dicts
         out[AGENT_CLASSES[name]] = cfg
@@ -162,6 +208,8 @@ def build_role_agent(
     fallback: bool = True,
     cycles: int = 2,
     codex_config: Optional[List[str]] = None,
+    overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    watchdog_scale: float = 1.0,
     computer_use_config: Optional[Dict[str, Any]] = None,
     post_construct_hook: Optional[RolePostConstructHook] = None,
 ) -> AgentInstance:
@@ -173,11 +221,16 @@ def build_role_agent(
 
     ``codex_config`` is a list of ``key=value`` codex config overrides (e.g.
     ``["tools.web_search=true"]``) applied only to codex providers in the chain.
+
+    ``overrides`` (issue #42) is a per-provider ``{provider: {model, effort}}``
+    map merged over AGENT_DEFAULTS for every provider in the chain; the per-call
+    ``model=``/``effort=`` scalars still apply to the lead as a final layer.
+    ``watchdog_scale`` widens the armed stall/byte budgets for known-heavy tiers.
     """
     if not chain:
         raise ValueError("role chain must be non-empty")
 
-    lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config)
+    lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config, overrides)
     if model is not None:
         lead_cfg["model"] = model
     if effort is not None:
@@ -196,7 +249,7 @@ def build_role_agent(
     if not fallback or len(chain) == 1:
         cls = AGENT_CLASSES[lead_name]
         agent = cls(prompt=prompt, **lead_cfg)
-        _arm_watchdog(agent, lead_name, lead_cfg)
+        _arm_watchdog(agent, lead_name, lead_cfg, scale=watchdog_scale)
         if post_construct_hook is not None:
             try:
                 post_construct_hook(agent, lead_name, lead_cfg)
@@ -205,7 +258,7 @@ def build_role_agent(
         return agent
 
     classes = [AGENT_CLASSES[name] for name in chain]
-    configs_by_cls = _configs_for(chain, codex_config)
+    configs_by_cls = _configs_for(chain, codex_config, overrides)
     # name_by_cls maps each agent class back to its worker token so the hook can
     # look up the right (worker, model, effort) budget for whichever sub the
     # FallbackAgent instantiates this attempt.
@@ -218,7 +271,7 @@ def build_role_agent(
         if worker is None:
             return
         cfg = configs_by_cls.get(agent_cls, {})
-        _arm_watchdog(sub, worker, cfg)
+        _arm_watchdog(sub, worker, cfg, scale=watchdog_scale)
         if post_construct_hook is not None:
             try:
                 post_construct_hook(sub, worker, cfg)
@@ -236,6 +289,8 @@ def build_role_agent(
 def build_master_agent_class(
     chain: List[str], *, fallback: bool = True, cycles: int = 2,
     codex_config: Optional[List[str]] = None,
+    overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    watchdog_scale: float = 1.0,
     post_construct_hook: Optional[RolePostConstructHook] = None,
 ):
     """Return ``(agent_class, model, effort)`` for MasterWorkflow.
@@ -245,10 +300,14 @@ def build_master_agent_class(
     plus the lead provider's model/effort as the seed values. Single-class master
     runs get armed when the workflow itself instantiates the agent; FallbackAgent
     arms via post_construct_hook on each _make_sub.
+
+    ``overrides``/``watchdog_scale`` (issue #42) flow through identically to
+    ``build_role_agent`` so a master/pat build honours --gen-effort/--codex-model
+    /--effort-profile on the architect chain.
     """
     if not chain:
         raise ValueError("role chain must be non-empty")
-    lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config)
+    lead_name, lead_cfg = _cfg_for_token(chain[0], codex_config, overrides)
     if lead_name == COMPUTER_USE_TOKEN:
         # cu not supported in master workflows; return a stub class for graceful fail
         return ComputerUseShim, lead_cfg["model"], lead_cfg["effort"]
@@ -268,7 +327,7 @@ def build_master_agent_class(
         HookedLead.__name__ = f"Hooked{cls.__name__}"
         return HookedLead, lead_cfg["model"], lead_cfg["effort"]
     classes = [AGENT_CLASSES[name] for name in chain]
-    configs_by_cls = _configs_for(chain, codex_config)
+    configs_by_cls = _configs_for(chain, codex_config, overrides)
     name_by_cls: Dict[Type[AgentInstance], str] = {
         AGENT_CLASSES[name]: name for name in chain
     }
@@ -278,7 +337,7 @@ def build_master_agent_class(
         if worker is None:
             return
         cfg = configs_by_cls.get(agent_cls, {})
-        _arm_watchdog(sub, worker, cfg)
+        _arm_watchdog(sub, worker, cfg, scale=watchdog_scale)
         if post_construct_hook is not None:
             try:
                 post_construct_hook(sub, worker, cfg)

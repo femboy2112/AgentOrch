@@ -117,6 +117,7 @@ class VoteWorkflow:
         baseline_ok: Optional[bool] = None,
         candidate_setup: Optional[str] = None,
         setup_timeout: Optional[float] = None,
+        max_parallel: Optional[int] = None,
     ):
         if not generators:
             raise ValueError("VoteWorkflow needs at least one generator")
@@ -158,7 +159,17 @@ class VoteWorkflow:
         if setup_timeout is None:
             setup_timeout = float(os.environ.get("AGY_SETUP_TIMEOUT", "1200") or 0)
         self.setup_timeout = setup_timeout
+        # Host-safety cap (#42 item 7): bound how many candidates run end-to-end
+        # at once (generation + verification). None = all K concurrent (legacy).
+        # Complements verifier_concurrency (which caps only the verifier step):
+        # this caps the whole candidate so a --branches>1 swarm can't thrash a
+        # small-RAM box. Resolves from the arg or AGY_MAX_PARALLEL_WORKERS.
+        if max_parallel is None:
+            _env_mp = os.environ.get("AGY_MAX_PARALLEL_WORKERS", "")
+            max_parallel = int(_env_mp) if _env_mp.strip().isdigit() else None
+        self.max_parallel = max(1, int(max_parallel)) if max_parallel else None
         self._verify_sem: Optional[asyncio.Semaphore] = None
+        self._gen_sem: Optional[asyncio.Semaphore] = None
         # Ledger signals.
         self.verified = False
         self.n_candidates = len(self.generators)
@@ -172,6 +183,11 @@ class VoteWorkflow:
     async def execute(self, prompt: str) -> str:
         # Bind the verifier concurrency gate to the running loop.
         self._verify_sem = asyncio.Semaphore(self.verifier_concurrency)
+        # End-to-end candidate gate (#42 item 7): caps how many candidates are
+        # in flight at once when --max-parallel-workers is set.
+        self._gen_sem = (
+            asyncio.Semaphore(self.max_parallel) if self.max_parallel else None
+        )
 
         # Fail fast if the isolated-workspace environment can't honestly run
         # the verifier (e.g. git-ignored .venv + editable install) — refusing
@@ -205,7 +221,7 @@ class VoteWorkflow:
         try:
             results = await asyncio.gather(
                 *[
-                    self._run_one(i, gen, ws)
+                    self._run_one_gated(i, gen, ws)
                     for i, (gen, ws) in enumerate(zip(self.generators, workspaces))
                 ],
                 return_exceptions=False,
@@ -471,6 +487,19 @@ class VoteWorkflow:
             return ""
         combined = "\n".join(parts)
         return combined[-limit:]
+
+    async def _run_one_gated(
+        self, idx: int, gen: AgentInstance, ws: _ManagedWorkspace,
+    ) -> Tuple[Optional[str], bool, Optional[str]]:
+        """Run one candidate, bounded by the end-to-end parallelism gate (#42).
+
+        With ``--max-parallel-workers`` set, at most N candidates execute
+        concurrently; without it the gate is absent and all K run at once
+        (byte-identical to the legacy path)."""
+        if self._gen_sem is None:
+            return await self._run_one(idx, gen, ws)
+        async with self._gen_sem:
+            return await self._run_one(idx, gen, ws)
 
     async def _run_one(
         self, idx: int, gen: AgentInstance, ws: _ManagedWorkspace,

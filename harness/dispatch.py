@@ -182,6 +182,11 @@ class DispatchResult:
     # Run-watchdog outcome (#40): set to "stalled" when --run-stall-abort fired
     # (no run-level forward progress within the window). None for a normal run.
     run_outcome: Optional[str] = None
+    # Resolved per-agent (model, effort) after CLI override + profile resolution
+    # (#42): ``{"generator": {provider: {model, effort}}, "critic": {...},
+    # "watchdog_scale": float}``. Persisted so "what did this run actually use"
+    # is answerable from meta.json, not just the live event stream.
+    resolved_config: Optional[Dict[str, Any]] = None
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -362,12 +367,15 @@ def _build_role_agent_compat(
     codex_config: Optional[List[str]],
     computer_use_config: Optional[Dict[str, Any]],
     post_construct_hook: Optional[roles.RolePostConstructHook],
+    overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    watchdog_scale: float = 1.0,
 ) -> AgentInstance:
     """Call roles.build_role_agent while staying compatible with patched tests.
 
     Some unit tests monkeypatch ``roles.build_role_agent`` with a legacy
-    signature that predates ``computer_use_config``. Pass that kwarg only when
-    the callee can accept it.
+    signature that predates ``computer_use_config`` / ``overrides`` /
+    ``watchdog_scale``. Pass each of those kwargs only when the callee can
+    accept it (named param or ``**kwargs``).
     """
     kwargs: Dict[str, Any] = {
         "prompt": prompt,
@@ -376,20 +384,24 @@ def _build_role_agent_compat(
         "codex_config": codex_config,
         "post_construct_hook": post_construct_hook,
     }
-    accepts_computer_use_config = False
     try:
         sig = inspect.signature(roles.build_role_agent)
-        accepts_computer_use_config = (
-            "computer_use_config" in sig.parameters
-            or any(
-                p.kind is inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
-            )
+        params = sig.parameters
+        has_var_kw = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
     except (TypeError, ValueError):
-        accepts_computer_use_config = False
-    if accepts_computer_use_config:
+        params, has_var_kw = {}, False
+
+    def _accepts(name: str) -> bool:
+        return has_var_kw or name in params
+
+    if _accepts("computer_use_config"):
         kwargs["computer_use_config"] = computer_use_config
+    if overrides and _accepts("overrides"):
+        kwargs["overrides"] = overrides
+    if watchdog_scale != 1.0 and _accepts("watchdog_scale"):
+        kwargs["watchdog_scale"] = watchdog_scale
     return roles.build_role_agent(chain, **kwargs)
 
 
@@ -414,9 +426,18 @@ async def _run_workflow(
     candidate_setup: Optional[str] = None,
     resume_policy: str = "auto",
     plan_only: bool = False,
+    gen_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    critic_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    watchdog_scale: float = 1.0,
+    max_parallel_workers: Optional[int] = None,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
-    the workflow's quality signals for the run ledger."""
+    the workflow's quality signals for the run ledger.
+
+    ``gen_overrides``/``critic_overrides`` are per-provider model/effort maps
+    (issue #42) applied to the generator-role and critic-role chains
+    respectively; ``watchdog_scale`` widens the armed budgets for heavy tiers;
+    ``max_parallel_workers`` caps concurrent candidate generation in vote."""
     # Plan-only / dry-run (#41): for master/pat, run JUST the planner and stop
     # before any worker mutates the out-dir. pat's "plan" is the master planner,
     # so both modes route through a plan-only MasterWorkflow — no verifier needed
@@ -425,6 +446,8 @@ async def _run_workflow(
         agent_class, model, effort = roles.build_master_agent_class(
             generator_chain, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
             post_construct_hook=post_construct_hook,
         )
         wf = MasterWorkflow(
@@ -451,6 +474,8 @@ async def _run_workflow(
             codex_config=codex_config,
             computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
         )
         return await gen.run_async(), None
 
@@ -463,6 +488,8 @@ async def _run_workflow(
             codex_config=codex_config,
             computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
         )
         critic = _build_role_agent_compat(
             critic_chain,
@@ -472,6 +499,8 @@ async def _run_workflow(
             codex_config=codex_config,
             computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
+            overrides=critic_overrides,
+            watchdog_scale=watchdog_scale,
         )
         model = str(getattr(gen, "model", None) or "n/a")
         effort = str(getattr(gen, "effort", None) or "n/a")
@@ -500,6 +529,8 @@ async def _run_workflow(
             codex_config=codex_config,
             computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
         )
         wf = TestFeedbackWorkflow(gen, verifier, max_iterations=max_iterations,
                                   working_directory=working_directory)
@@ -520,6 +551,8 @@ async def _run_workflow(
                 codex_config=codex_config,
                 computer_use_config=computer_use_config,
                 post_construct_hook=post_construct_hook,
+                overrides=gen_overrides,
+                watchdog_scale=watchdog_scale,
             )
             for token in generator_chain
         ]
@@ -531,6 +564,8 @@ async def _run_workflow(
         agent_class, model, effort = roles.build_master_agent_class(
             generator_chain, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
             post_construct_hook=post_construct_hook,
         )
         wf = MasterWorkflow(
@@ -576,6 +611,8 @@ async def _run_workflow(
                 codex_config=codex_config,
                 computer_use_config=computer_use_config,
                 post_construct_hook=post_construct_hook,
+                overrides=gen_overrides,
+                watchdog_scale=watchdog_scale,
             )
             vote_generators.append(slot_agent)
         wf = VoteWorkflow(
@@ -588,6 +625,10 @@ async def _run_workflow(
             # Per-candidate env bootstrap (#34): makes vote isolation sound on
             # editable-install repos (each candidate gets its own venv).
             candidate_setup=candidate_setup,
+            # Host-safety concurrency cap (#42 item 7): bound how many candidates
+            # are in flight end-to-end so --branches>1 can't thrash/freeze a
+            # small-RAM box. None = all K concurrent (legacy behaviour).
+            max_parallel=max_parallel_workers,
         )
         return await wf.execute(prompt), wf
 
@@ -604,10 +645,14 @@ async def _run_workflow(
             codex_config=codex_config,
             computer_use_config=computer_use_config,
             post_construct_hook=post_construct_hook,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
         )
         agent_class, model, effort = roles.build_master_agent_class(
             generator_chain, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
+            overrides=gen_overrides,
+            watchdog_scale=watchdog_scale,
             post_construct_hook=post_construct_hook,
         )
         master_wf = MasterWorkflow(
@@ -668,6 +713,20 @@ async def dispatch_async(
     notify: Optional[str] = None,
     notify_cmd: Optional[str] = None,
     heartbeat_interval: Optional[float] = None,
+    # Per-role / per-provider effort+model overrides (#42)
+    gen_effort: Optional[str] = None,
+    gen_model: Optional[str] = None,
+    critic_effort: Optional[str] = None,
+    critic_model: Optional[str] = None,
+    architect_effort: Optional[str] = None,
+    architect_model: Optional[str] = None,
+    codex_model: Optional[str] = None,
+    effort_map: Optional[str] = None,
+    model_map: Optional[str] = None,
+    effort_profile: Optional[str] = None,
+    watchdog_scale: Optional[float] = None,
+    max_parallel_workers: Optional[int] = None,
+    worker_mem_max: Optional[str] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -727,6 +786,35 @@ async def dispatch_async(
             branches = decision.branches
         if decision.max_iterations is not None:
             max_iterations = decision.max_iterations
+
+    # Per-role / per-provider effort+model overrides (#42). Resolve the CLI
+    # surface into per-role {provider: {model, effort}} maps now that `mode` is
+    # final (auto-routing may have changed it, which affects the --architect-*
+    # alias). resolve_overrides raises OverrideError (a ValueError) on a bad
+    # tier/model; the CLI pre-validates so a typo never reaches here as a crash.
+    from harness.effort_overrides import effective_config, resolve_overrides
+    resolved = resolve_overrides(
+        generator_chain=generator_chain,
+        critic_chain=critic_chain,
+        mode=mode,
+        profile=effort_profile,
+        gen_effort=gen_effort, gen_model=gen_model,
+        critic_effort=critic_effort, critic_model=critic_model,
+        architect_effort=architect_effort, architect_model=architect_model,
+        codex_model=codex_model,
+        effort_map=effort_map, model_map=model_map,
+        watchdog_scale=watchdog_scale,
+    )
+    gen_overrides = resolved.generator
+    critic_overrides = resolved.critic
+    eff_watchdog_scale = resolved.watchdog_scale
+    resolved_config: Dict[str, Any] = {
+        "generator": effective_config(generator_chain, gen_overrides, roles.AGENT_DEFAULTS),
+        "critic": effective_config(critic_chain, critic_overrides, roles.AGENT_DEFAULTS),
+        "watchdog_scale": eff_watchdog_scale,
+    }
+    for _note in resolved.notes:
+        logger.warning("override: %s", _note)
 
     # Where the worker actually writes files. Default = AgentOrch repo root,
     # which preserves the prior behaviour exactly.
@@ -879,10 +967,15 @@ async def dispatch_async(
     if test_cmd:
         # Pass mem_max only when a cap is actually requested, so the common path
         # (and test doubles that swap in a narrower QualityVerifier) keep their
-        # original constructor signature.
+        # original constructor signature. ``--verifier-mem-max`` (#39) caps the
+        # gate directly; ``--worker-mem-max`` (#42 item 7) caps each PARALLEL
+        # candidate's verifier in vote/tot — the per-candidate local spike that
+        # can OOM/freeze a small-RAM box when --branches>1. The explicit
+        # verifier cap wins if both are given.
+        _mem_cap = verifier_mem_max or (worker_mem_max if mode in ("vote", "tot") else None)
         _vkwargs = {"test_commands": [test_cmd]}
-        if verifier_mem_max:
-            _vkwargs["mem_max"] = verifier_mem_max
+        if _mem_cap:
+            _vkwargs["mem_max"] = _mem_cap
         verifier = QualityVerifier(**_vkwargs)
     else:
         verifier = None
@@ -955,6 +1048,10 @@ async def dispatch_async(
                 candidate_setup=candidate_setup,
                 resume_policy=resume_policy,
                 plan_only=plan_only,
+                gen_overrides=gen_overrides,
+                critic_overrides=critic_overrides,
+                watchdog_scale=eff_watchdog_scale,
+                max_parallel_workers=max_parallel_workers,
             ))
     except RunStalled as exc:  # run watchdog aborted: classify, never crash
         success = False
@@ -1138,6 +1235,7 @@ async def dispatch_async(
         tokens=tokens,
         protect_violations=protect_violations,
         run_outcome=run_outcome,
+        resolved_config=resolved_config,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
@@ -1173,6 +1271,20 @@ def dispatch(
     notify: Optional[str] = None,
     notify_cmd: Optional[str] = None,
     heartbeat_interval: Optional[float] = None,
+    # Per-role / per-provider effort+model overrides (#42)
+    gen_effort: Optional[str] = None,
+    gen_model: Optional[str] = None,
+    critic_effort: Optional[str] = None,
+    critic_model: Optional[str] = None,
+    architect_effort: Optional[str] = None,
+    architect_model: Optional[str] = None,
+    codex_model: Optional[str] = None,
+    effort_map: Optional[str] = None,
+    model_map: Optional[str] = None,
+    effort_profile: Optional[str] = None,
+    watchdog_scale: Optional[float] = None,
+    max_parallel_workers: Optional[int] = None,
+    worker_mem_max: Optional[str] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -1212,6 +1324,19 @@ def dispatch(
             notify=notify,
             notify_cmd=notify_cmd,
             heartbeat_interval=heartbeat_interval,
+            gen_effort=gen_effort,
+            gen_model=gen_model,
+            critic_effort=critic_effort,
+            critic_model=critic_model,
+            architect_effort=architect_effort,
+            architect_model=architect_model,
+            codex_model=codex_model,
+            effort_map=effort_map,
+            model_map=model_map,
+            effort_profile=effort_profile,
+            watchdog_scale=watchdog_scale,
+            max_parallel_workers=max_parallel_workers,
+            worker_mem_max=worker_mem_max,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,

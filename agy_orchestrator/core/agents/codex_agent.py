@@ -5,9 +5,16 @@ from agy_orchestrator.core.agent import AgentInstance
 
 
 class CodexAgent(AgentInstance):
+    # Single source of truth for codex model names (used by the async API below
+    # and synchronously by harness/effort_overrides.py for --codex-model
+    # validation without spinning an event loop).
+    AVAILABLE_MODELS: List[str] = [
+        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2",
+    ]
+
     @classmethod
     async def get_available_models(cls) -> List[str]:
-        return ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"]
+        return list(cls.AVAILABLE_MODELS)
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:

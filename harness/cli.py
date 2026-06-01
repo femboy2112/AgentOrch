@@ -52,6 +52,28 @@ def _print_result(result) -> None:
         if delta:
             dcol = C_GREEN if delta == "fixed" else (C_YELLOW if delta in ("preserved", "unchanged") else C_RED)
             print(f"  verifier  : {dcol}{delta}{C_RESET}")
+    # #42: surface the resolved per-agent (model, effort) only when something was
+    # actually overridden vs the baked defaults (keeps routine runs uncluttered).
+    rc = getattr(result, "resolved_config", None)
+    if rc:
+        from harness.roles import AGENT_DEFAULTS as _AD
+
+        def _nondefault(cfgmap) -> bool:
+            for prov, c in (cfgmap or {}).items():
+                d = _AD.get(prov, {})
+                if (str(c.get("model")) != str(d.get("model"))
+                        or str(c.get("effort")) != str(d.get("effort"))):
+                    return True
+            return False
+
+        scale = rc.get("watchdog_scale", 1.0)
+        if _nondefault(rc.get("generator")) or _nondefault(rc.get("critic")) or (
+            scale not in (1.0, None)
+        ):
+            gen_cfg = rc.get("generator", {})
+            parts = [f"{p}={c.get('model')}/{c.get('effort')}" for p, c in gen_cfg.items()]
+            tail = f"  (watchdog x{scale})" if scale and scale != 1.0 else ""
+            print(f"  {C_CYAN}effort    : {' '.join(parts)}{C_RESET}{tail}")
     if getattr(result, "run_outcome", None):
         print(f"  {C_RED}outcome   : {result.run_outcome} (run watchdog){C_RESET}")
     if result.error:
@@ -108,6 +130,32 @@ def _cmd_do(args) -> int:
             file=sys.stderr,
         )
 
+    # #42: validate effort/model overrides up front so a typo'd tier/model fails
+    # fast with an enumerated message instead of surfacing deep in a dispatch.
+    # Re-resolved (deterministically) inside dispatch; this is the early gate.
+    from harness import roles as _roles
+    from harness.effort_overrides import OverrideError, resolve_overrides
+    _gen_chain = gen_chain or list(_roles.GENERATOR_CHAIN)
+    _crit_chain = crit_chain or list(_roles.CRITIC_CHAIN)
+    try:
+        _resolved = resolve_overrides(
+            generator_chain=_gen_chain,
+            critic_chain=_crit_chain,
+            mode=args.mode,
+            profile=args.effort_profile,
+            gen_effort=args.gen_effort, gen_model=args.gen_model,
+            critic_effort=args.critic_effort, critic_model=args.critic_model,
+            architect_effort=args.architect_effort, architect_model=args.architect_model,
+            codex_model=args.codex_model,
+            effort_map=args.effort_map, model_map=args.model_map,
+            watchdog_scale=args.watchdog_scale,
+        )
+    except OverrideError as exc:
+        print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+        return 1
+    for _note in _resolved.notes:
+        print(f"{C_YELLOW}note: {_note}{C_RESET}", file=sys.stderr)
+
     # Step 12: parse computer-use config (only has effect when generator chain leads with computer-use)
     cu_mode = getattr(args, "computer_use_mode", None)
     cu_priority = getattr(args, "computer_use_task_priority", None)
@@ -147,6 +195,19 @@ def _cmd_do(args) -> int:
         notify=args.notify or os.environ.get("AGY_NOTIFY") or None,
         notify_cmd=args.notify_cmd,
         heartbeat_interval=args.heartbeat_interval,
+        gen_effort=args.gen_effort,
+        gen_model=args.gen_model,
+        critic_effort=args.critic_effort,
+        critic_model=args.critic_model,
+        architect_effort=args.architect_effort,
+        architect_model=args.architect_model,
+        codex_model=args.codex_model,
+        effort_map=args.effort_map,
+        model_map=args.model_map,
+        effort_profile=args.effort_profile,
+        watchdog_scale=args.watchdog_scale,
+        max_parallel_workers=args.max_parallel_workers,
+        worker_mem_max=args.worker_mem_max,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -337,6 +398,51 @@ def main(argv=None) -> int:
                          "a watcher/dashboard reads one explicit liveness signal "
                          "instead of inferring it from file mtimes. Default 30 "
                          "(env AGY_HEARTBEAT_SECONDS); 0 disables.")
+    # Per-role / per-provider effort + model overrides (#42). The default tier
+    # (codex gpt-5.3-codex / high) is right for routine work; crank these for a
+    # mission-critical, invariant-touching build that wants every provider at
+    # its ceiling. 'max' effort maps to codex reasoning_effort=xhigh.
+    eff = do.add_argument_group("effort/model overrides (#42)")
+    eff.add_argument("--gen-effort", type=str, default=None, metavar="TIER",
+                     help="Generator effort tier (low|medium|high|max); applies to "
+                          "every effort-capable provider in the generator chain "
+                          "(grok no-ops). 'max' -> codex reasoning_effort=xhigh.")
+    eff.add_argument("--critic-effort", type=str, default=None, metavar="TIER",
+                     help="Critic effort tier (low|medium|high|max); applies to every "
+                          "effort-capable provider in the critic chain.")
+    eff.add_argument("--architect-effort", type=str, default=None, metavar="TIER",
+                     help="Effort tier for the master/pat architect chain (alias of "
+                          "--gen-effort for those modes).")
+    eff.add_argument("--gen-model", type=str, default=None, metavar="NAME",
+                     help="Model for the generator chain lead (provider-specific).")
+    eff.add_argument("--critic-model", type=str, default=None, metavar="NAME",
+                     help="Model for the critic chain lead (provider-specific).")
+    eff.add_argument("--architect-model", type=str, default=None, metavar="NAME",
+                     help="Model for the master/pat architect chain lead.")
+    eff.add_argument("--codex-model", type=str, default=None, metavar="NAME",
+                     help="Convenience: set the codex model anywhere it appears in any "
+                          "chain (e.g. gpt-5.5). Validated against codex's model list.")
+    eff.add_argument("--effort", dest="effort_map", type=str, default=None, metavar="MAP",
+                     help="Per-provider effort map, e.g. 'codex=max,agy=high' (or a bare "
+                          "tier applied to all effort-capable providers). grok=… is dropped.")
+    eff.add_argument("--model", dest="model_map", type=str, default=None, metavar="MAP",
+                     help="Per-provider model map, e.g. 'codex=gpt-5.5'.")
+    eff.add_argument("--effort-profile", choices=["low", "balanced", "max"], default=None,
+                     help="One-switch preset: 'max' cranks every effort-capable provider "
+                          "to its strongest model + ceiling effort (codex gpt-5.5/xhigh); "
+                          "'balanced' == defaults; 'low' = cheap tier. Explicit flags "
+                          "override the profile.")
+    eff.add_argument("--watchdog-scale", type=float, default=None, metavar="FLOAT",
+                     help="Multiply the streaming-watchdog stall/byte budgets (>1.0) for "
+                          "known-heavy tiers so a long xhigh run isn't truncated mid-flight "
+                          "(env AGY_WATCHDOG_SCALE).")
+    eff.add_argument("--max-parallel-workers", type=int, default=None, metavar="N",
+                     help="Cap how many candidates run end-to-end at once in vote mode "
+                          "(host-safety for --branches>1; env AGY_MAX_PARALLEL_WORKERS).")
+    eff.add_argument("--worker-mem-max", type=str, default=None, metavar="SIZE",
+                     help="Per-candidate verifier memory cap for vote/tot (e.g. 4G), run "
+                          "in its own systemd scope like --verifier-mem-max (#39). Guards "
+                          "against an OOM/freeze when --branches>1 verify in parallel.")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",
