@@ -72,6 +72,35 @@ def is_git_repo(path: Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def has_uncommitted_changes(path: Path) -> bool:
+    """True iff the git work tree has uncommitted tracked changes OR untracked,
+    non-ignored files (i.e. ``git status --porcelain`` is non-empty).
+
+    This is the dirty-tree signal that makes a ``git worktree`` workspace
+    UNSAFE for vote (issue #36): ``git worktree add --detach`` checks out
+    HEAD only, so a candidate worktree silently OMITS the operator's
+    uncommitted edits and untracked files — candidates then build on stale
+    committed state, and mirroring the (HEAD-based) winner back over the
+    operator's tree DESTROYS those uncommitted/untracked changes. Copy-mode
+    has neither problem (it snapshots the actual working tree, ignored dirs
+    excluded), so the caller routes dirty git repos to copy-mode.
+
+    Ignored files (``.venv``, ``runs`` …) do NOT count as dirty — porcelain
+    respects ``.gitignore`` — so a clean repo with a git-ignored venv still
+    gets the fast worktree path. Falls open to False (treat as clean) on any
+    error so a git hiccup can't wedge vote."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    return bool(result.stdout.strip())
+
+
 async def _create_git_worktree(base: Path, target: Path) -> None:
     """``git worktree add --detach`` from base's HEAD into target.
 
@@ -138,7 +167,22 @@ async def candidate_workspace(
     worktree_active = False
 
     try:
-        if prefer_worktree and is_git_repo(base):
+        use_worktree = prefer_worktree and is_git_repo(base)
+        if use_worktree and has_uncommitted_changes(base):
+            # Dirty tree: a worktree would check out HEAD only, dropping the
+            # operator's uncommitted/untracked work and (on winner-apply)
+            # destroying it (issue #36). Copy-mode snapshots the real working
+            # tree instead, so candidates build on what the operator actually
+            # has and the winner can be applied without clobbering their
+            # changes. The fast worktree path is reserved for clean repos.
+            logger.info(
+                "candidate_workspace: %s has uncommitted/untracked changes; "
+                "using copy-mode (not worktree) so candidates reflect the real "
+                "working tree and vote can't discard uncommitted work (#36)",
+                base,
+            )
+            use_worktree = False
+        if use_worktree:
             try:
                 await _create_git_worktree(base, workspace)
                 backend = "worktree"
