@@ -108,6 +108,7 @@ def _cmd_do(args) -> int:
         max_iterations=args.max_iterations,
         branches=args.branches,
         test_cmd=args.test_cmd,
+        candidate_setup=args.candidate_setup,
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -241,6 +242,13 @@ def main(argv=None) -> int:
     do.add_argument("--branches", type=int, default=3, help="ToT branches (master mode)")
     do.add_argument("--test-cmd", type=str, default=None,
                     help="Optional verification command run as a quality gate")
+    do.add_argument("--candidate-setup", type=str, default=None, metavar="CMD",
+                    help="vote mode: shell command run inside each candidate's "
+                         "isolated workspace BEFORE its verifier (e.g. "
+                         "'python -m venv .venv && .venv/bin/pip install -e .'). "
+                         "Makes vote isolation sound on editable-install repos so "
+                         "each candidate's verifier imports that candidate's own "
+                         "source. Bounded by the verifier-concurrency cap.")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",

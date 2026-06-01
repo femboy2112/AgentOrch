@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,6 +115,8 @@ class VoteWorkflow:
         verifier_concurrency: int = 1,
         preflight: bool = True,
         baseline_ok: Optional[bool] = None,
+        candidate_setup: Optional[str] = None,
+        setup_timeout: Optional[float] = None,
     ):
         if not generators:
             raise ValueError("VoteWorkflow needs at least one generator")
@@ -142,6 +145,19 @@ class VoteWorkflow:
         # the base (#33). None = unknown; the preflight probes the base if it
         # needs to disambiguate a non-127 failure.
         self.baseline_ok = baseline_ok
+        # Per-candidate environment bootstrap (issue #34): an opt-in shell
+        # command run inside each candidate's workspace BEFORE its verifier.
+        # On an editable-install repo this is what makes vote isolation sound —
+        # e.g. `python -m venv .venv && .venv/bin/pip install -e .` gives each
+        # candidate its OWN venv whose editable install resolves `import <pkg>`
+        # to THAT candidate's source, not the base tree's (the false-green trap
+        # #32 documented). None = no bootstrap (legacy behaviour: refuse on the
+        # venv trap). Bounded by the same verifier semaphore (it's a heavy local
+        # spike — a venv + pip install per candidate).
+        self.candidate_setup = candidate_setup
+        if setup_timeout is None:
+            setup_timeout = float(os.environ.get("AGY_SETUP_TIMEOUT", "1200") or 0)
+        self.setup_timeout = setup_timeout
         self._verify_sem: Optional[asyncio.Semaphore] = None
         # Ledger signals.
         self.verified = False
@@ -249,6 +265,43 @@ class VoteWorkflow:
                 *[ws.close() for ws in workspaces], return_exceptions=True,
             )
 
+    async def _run_candidate_setup(self, ws_path: str) -> Optional[str]:
+        """Run the per-candidate environment bootstrap (#34) inside ws_path.
+
+        Returns None on success (or when no setup is configured), else a
+        human-readable error string so the candidate is failed cleanly. This is
+        what makes vote isolation sound on editable-install repos: bootstrapping
+        a per-candidate venv + editable install means the verifier imports THAT
+        candidate's source, not the shared base tree's."""
+        cmd = self.candidate_setup
+        if not cmd:
+            return None
+        logger.info("Vote candidate setup: %s in %s", cmd, ws_path)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=ws_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            comm = proc.communicate()
+            if self.setup_timeout and self.setup_timeout > 0:
+                _out, err = await asyncio.wait_for(comm, self.setup_timeout)
+            else:
+                _out, err = await comm
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), 5)
+            except Exception:
+                pass
+            return f"candidate setup timed out after {self.setup_timeout:.0f}s: {cmd}"
+        except Exception as exc:
+            return f"candidate setup raised: {type(exc).__name__}: {exc}"
+        if proc.returncode != 0:
+            tail = err.decode(errors="replace")[-500:] if err else ""
+            return f"candidate setup failed (rc={proc.returncode}): {cmd}\n{tail}".strip()
+        return None
+
     async def _preflight_environment_check(self) -> Optional[str]:
         """Return a human-readable refusal reason if an isolated candidate
         workspace cannot honestly run the verifier, else None.
@@ -291,6 +344,18 @@ class VoteWorkflow:
                 candidate_id="vote-preflight",
                 prefer_worktree=self.prefer_worktree,
             ) as (ws_path, _backend):
+                # Mirror the real per-candidate flow: bootstrap the env (#34)
+                # before verifying, so a configured setup that fixes the venv
+                # trap lets vote PROCEED instead of refusing.
+                setup_err = await self._run_candidate_setup(str(ws_path))
+                if setup_err is not None:
+                    return (
+                        "vote preflight refused: the per-candidate setup hook "
+                        f"(`{self.candidate_setup}`) failed in an isolated "
+                        "workspace, so candidates can't be bootstrapped or graded "
+                        "soundly. Fix the candidate-setup command, or use "
+                        f"`--mode master`. Setup said: {setup_err[:300]}"
+                    )
                 pristine = await self.verifier.verify(working_directory=str(ws_path))
         except Exception as exc:
             # Couldn't even build/probe the workspace — let the real run
@@ -358,17 +423,26 @@ class VoteWorkflow:
                 idx, type(gen).__name__, exc,
             )
             return None, False, f"{type(exc).__name__}: {exc}"
-        try:
-            # Throttle concurrent verifier runs — the local resource spike.
-            assert self._verify_sem is not None  # set in execute()
-            async with self._verify_sem:
+        # Setup + verify are the per-candidate LOCAL spike (a venv+pip install
+        # then a full suite) — gate both under one semaphore so K candidates
+        # don't fire K of them at once on a small host.
+        assert self._verify_sem is not None  # set in execute()
+        async with self._verify_sem:
+            setup_err = await self._run_candidate_setup(str(ws.path))
+            if setup_err is not None:
+                logger.info(
+                    "Vote candidate %d (%s) setup failed: %s",
+                    idx, type(gen).__name__, setup_err[:160],
+                )
+                return output, False, setup_err
+            try:
                 result = await self.verifier.verify(working_directory=str(ws.path))
-        except Exception as exc:
-            logger.warning(
-                "Vote candidate %d (%s) verifier raised: %s",
-                idx, type(gen).__name__, exc,
-            )
-            return output, False, f"verifier-raised: {exc}"
+            except Exception as exc:
+                logger.warning(
+                    "Vote candidate %d (%s) verifier raised: %s",
+                    idx, type(gen).__name__, exc,
+                )
+                return output, False, f"verifier-raised: {exc}"
         if not result.ok:
             logger.info(
                 "Vote candidate %d (%s) failed verifier: %s",

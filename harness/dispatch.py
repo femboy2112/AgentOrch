@@ -341,6 +341,7 @@ async def _run_workflow(
     working_directory: str = ".",
     mission_critical: bool = False,
     baseline_result: Optional[VerifierResult] = None,
+    candidate_setup: Optional[str] = None,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger."""
@@ -486,6 +487,9 @@ async def _run_workflow(
             # Reuse the baseline gate the harness just ran on the unchanged base
             # tree (#33) — lets the preflight skip a redundant full-suite re-run.
             baseline_ok=(baseline_result.ok if baseline_result is not None else None),
+            # Per-candidate env bootstrap (#34): makes vote isolation sound on
+            # editable-install repos (each candidate gets its own venv).
+            candidate_setup=candidate_setup,
         )
         return await wf.execute(prompt), wf
 
@@ -554,6 +558,7 @@ async def dispatch_async(
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    candidate_setup: Optional[str] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -787,6 +792,7 @@ async def dispatch_async(
                 working_directory=str(work_dir),
                 mission_critical=mission_critical,
                 baseline_result=baseline_result,
+                candidate_setup=candidate_setup,
             )
     except Exception as exc:  # graceful: record, never crash the operator's shell
         success = False
@@ -941,6 +947,7 @@ def dispatch(
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    candidate_setup: Optional[str] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -970,6 +977,7 @@ def dispatch(
             spec=spec,
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
+            candidate_setup=candidate_setup,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,
