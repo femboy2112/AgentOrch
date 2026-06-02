@@ -29,6 +29,8 @@ python -m harness do "INSTRUCTION"            # default: adversarial (gen+critic
 python -m harness do "INSTRUCTION" --mode direct     # one-shot, fast/cheap
 python -m harness do "INSTRUCTION" --mode feedback --test-cmd "pytest -q"  # repair loop
 python -m harness do "INSTRUCTION" --mode master     # whole-feature build
+python -m harness do "INSTRUCTION" --mode master --plan-only   # emit runs/<id>/plan.json, write nothing
+python -m harness do "INSTRUCTION" --mode master --plan plan.json   # execute an edited plan verbatim (skip planner)
 python -m harness do "INSTRUCTION" --mode pat --test-cmd "pytest -q"        # try direct, plan on fail
 python -m harness do "INSTRUCTION" --web-search      # enable codex web search
 python -m harness do "INSTRUCTION" --test-cmd "pytest -q"   # quality gate

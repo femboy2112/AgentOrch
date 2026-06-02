@@ -225,6 +225,49 @@ def _decide_reconcile_status(
     return "run"
 
 
+def load_plan_steps(path: Union[str, Path]) -> List[str]:
+    """Load + validate an operator-supplied plan file for master/pat execution.
+
+    Closes the plan round-trip: ``--plan-only`` emits ``runs/<id>/plan.json``,
+    the operator reviews/edits it, then feeds it back via ``--plan <file>`` and
+    master executes those steps verbatim (no re-planning).
+
+    Accepts BOTH shapes so the emitted artifact round-trips unedited:
+      * the plan.json object — ``{"instruction": ..., "steps": ["...", ...]}``
+      * a bare JSON list of step strings — ``["...", "..."]``
+
+    Returns the list of step strings. Raises ``ValueError`` with an
+    operator-facing message on any malformed input (missing file, bad JSON,
+    wrong shape, empty plan, or a non-string/empty step).
+    """
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ValueError(f"no such plan file: {path}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"plan file is not valid JSON ({path}): {exc}")
+    if isinstance(data, dict):
+        steps = data.get("steps")
+    elif isinstance(data, list):
+        steps = data
+    else:
+        raise ValueError(
+            f"plan file must be a JSON list of step strings, or an object with a "
+            f"'steps' list ({path})"
+        )
+    if not isinstance(steps, list) or not steps:
+        raise ValueError(f"plan file has no steps to execute ({path})")
+    cleaned: List[str] = []
+    for idx, step in enumerate(steps, 1):
+        if not isinstance(step, str) or not step.strip():
+            raise ValueError(
+                f"plan step {idx} must be a non-empty string ({path})"
+            )
+        cleaned.append(step)
+    return cleaned
+
+
 def _as_int(value: Any) -> Optional[int]:
     if value is None or isinstance(value, bool):
         return None
@@ -494,6 +537,7 @@ async def _run_workflow(
     candidate_setup: Optional[str] = None,
     resume_policy: str = "auto",
     plan_only: bool = False,
+    plan_steps: Optional[List[str]] = None,
     gen_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     critic_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
@@ -648,6 +692,7 @@ async def _run_workflow(
             working_directory=working_directory,
             checkpoint_path=_master_checkpoint_path(prompt),
             resume_policy=resume_policy,
+            plan_steps=plan_steps,
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -735,6 +780,7 @@ async def _run_workflow(
             working_directory=working_directory,
             checkpoint_path=_master_checkpoint_path(prompt),
             resume_policy=resume_policy,
+            plan_steps=plan_steps,
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -824,6 +870,7 @@ async def dispatch_async(
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
+    plan_steps: Optional[List[str]] = None,
     # Run-level watchdog / heartbeat / notify (#40)
     run_stall_abort: Optional[float] = None,
     notify: Optional[str] = None,
@@ -1198,6 +1245,7 @@ async def dispatch_async(
                 candidate_setup=candidate_setup,
                 resume_policy=resume_policy,
                 plan_only=plan_only,
+                plan_steps=plan_steps,
                 gen_overrides=gen_overrides,
                 critic_overrides=critic_overrides,
                 watchdog_scale=eff_watchdog_scale,
@@ -1501,6 +1549,7 @@ def dispatch(
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
+    plan_steps: Optional[List[str]] = None,
     run_stall_abort: Optional[float] = None,
     notify: Optional[str] = None,
     notify_cmd: Optional[str] = None,
@@ -1557,6 +1606,7 @@ def dispatch(
             protect_paths=protect_paths,
             allow_paths=allow_paths,
             plan_only=plan_only,
+            plan_steps=plan_steps,
             run_stall_abort=run_stall_abort,
             notify=notify,
             notify_cmd=notify_cmd,

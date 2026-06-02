@@ -52,6 +52,7 @@ class MasterWorkflow:
         event_callback: Optional[Callable[[dict], None]] = None,
         resume_policy: str = "auto",
         plan_only: bool = False,
+        plan_steps: Optional[List[str]] = None,
     ):
         self.model = model
         self.effort = effort
@@ -93,10 +94,15 @@ class MasterWorkflow:
         # Plan-only / dry-run (#41): run just the planner, emit the decomposed
         # step plan, and exit BEFORE any worker mutates the out-dir. Lets the
         # operator audit/approve the decomposition for the price of one planner
-        # call instead of an execute-then-reset cycle. `plan_steps` holds the
-        # emitted plan so the harness can serialize it to plan.json.
+        # call instead of an execute-then-reset cycle.
         self.plan_only = plan_only
-        self.plan_steps: Optional[List[str]] = None
+        # Operator-supplied plan (plan injection): when provided, master executes
+        # THESE steps verbatim and skips the planner — closing the round-trip with
+        # the plan.json that --plan-only emits (generate -> review/edit -> --plan
+        # <file> -> execute). The attribute is dual-purpose: plan-only mode also
+        # (re)writes it with the freshly emitted plan so the harness can serialize
+        # it to plan.json.
+        self.plan_steps: Optional[List[str]] = list(plan_steps) if plan_steps else None
         # Session compaction: over a long chained run the resumed workflow session
         # (full transcript re-sent every step) and the growing project_context are the
         # token-cost drivers. Every ``compaction_interval`` steps, OR whenever
@@ -428,7 +434,12 @@ class MasterWorkflow:
         # worker touches the out-dir. Ignores checkpoints (always re-plans) and
         # writes no checkpoint, so it is fully side-effect-free on disk.
         if self.plan_only:
-            tasks, _session_id = await self._run_planner(initial_prompt)
+            if self.plan_steps:
+                # An injected plan is emitted as-is (no point re-planning what the
+                # operator just handed us); useful to echo/validate a plan file.
+                tasks = list(self.plan_steps)
+            else:
+                tasks, _session_id = await self._run_planner(initial_prompt)
             self._emit_plan(tasks)
             self.plan_steps = list(tasks)
             logger.info(
@@ -445,6 +456,17 @@ class MasterWorkflow:
             return "\n".join(lines)
 
         resumed = self._load_checkpoint(initial_prompt)
+        if (resumed is not None and self.plan_steps
+                and list(resumed[0]) != list(self.plan_steps)):
+            # An injected plan that differs from the saved checkpoint means the
+            # operator edited the plan since the last run — the stale checkpoint
+            # must not win. Drop it and run the supplied plan fresh. (A matching
+            # checkpoint is still honored, so a crashed injected-plan run resumes.)
+            logger.info(
+                "Injected plan differs from the saved checkpoint; discarding the "
+                "stale checkpoint and running the supplied plan."
+            )
+            resumed = None
         if resumed is not None:
             tasks, start_index, project_context, workflow_session_id = resumed
             logger.info(
@@ -452,6 +474,19 @@ class MasterWorkflow:
                 start_index + 1,
                 len(tasks),
             )
+        elif self.plan_steps:
+            # Plan injection: execute the operator-supplied steps verbatim, skip
+            # the planner entirely.
+            tasks = list(self.plan_steps)
+            workflow_session_id = None
+            logger.info(
+                "Using operator-supplied plan (%d step(s)); skipping the planner.",
+                len(tasks),
+            )
+            self._emit_plan(tasks)
+            project_context = f"Original Goal: {initial_prompt}\n\n=== Accumulated Implementation ===\n"
+            start_index = 0
+            self._save_checkpoint(initial_prompt, tasks, start_index, project_context, workflow_session_id)
         else:
             tasks, workflow_session_id = await self._run_planner(initial_prompt)
             self._emit_plan(tasks)

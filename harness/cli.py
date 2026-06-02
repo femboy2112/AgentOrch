@@ -140,6 +140,37 @@ def _cmd_do(args) -> int:
             file=sys.stderr,
         )
 
+    # Plan injection: --plan feeds an edited plan.json back for verbatim execution
+    # (the review->revise->execute round-trip). Fail fast on misuse and on a
+    # malformed plan file so the error is at the CLI, not deep in a dispatch.
+    plan_steps = None
+    if getattr(args, "plan", None):
+        if getattr(args, "plan_only", False):
+            print(
+                f"{C_RED}--plan and --plan-only are mutually exclusive "
+                f"(--plan-only generates a plan; --plan executes one){C_RESET}",
+                file=sys.stderr,
+            )
+            return 1
+        if args.mode not in ("master", "pat"):
+            print(
+                f"{C_RED}--plan only applies to --mode master/pat (got "
+                f"--mode {args.mode}){C_RESET}",
+                file=sys.stderr,
+            )
+            return 1
+        from harness.dispatch import load_plan_steps
+        try:
+            plan_steps = load_plan_steps(args.plan)
+        except ValueError as exc:
+            print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+            return 1
+        print(
+            f"{C_YELLOW}note: executing supplied plan ({len(plan_steps)} step(s)) "
+            f"from {args.plan}; the planner is skipped{C_RESET}",
+            file=sys.stderr,
+        )
+
     # #42: validate effort/model overrides up front so a typo'd tier/model fails
     # fast with an enumerated message instead of surfacing deep in a dispatch.
     # Re-resolved (deterministically) inside dispatch; this is the early gate.
@@ -201,6 +232,7 @@ def _cmd_do(args) -> int:
         protect_paths=[g for g in (args.protect_paths or "").split(",") if g.strip()] or None,
         allow_paths=[g for g in (args.allow_paths or "").split(",") if g.strip()] or None,
         plan_only=getattr(args, "plan_only", False),
+        plan_steps=plan_steps,
         run_stall_abort=args.run_stall_abort,
         notify=args.notify or os.environ.get("AGY_NOTIFY") or None,
         notify_cmd=args.notify_cmd,
@@ -234,6 +266,12 @@ def _cmd_do(args) -> int:
         browser_display=browser_display,
     )
     _print_result(result)
+    if getattr(args, "plan_only", False) and result.success:
+        print(
+            f"  {C_BOLD}round-trip{C_RESET}: review/edit {result.run_dir}/plan.json, then\n"
+            f"    python -m harness do \"{args.instruction}\" --mode {args.mode} "
+            f"--plan {result.run_dir}/plan.json"
+        )
     return 0 if result.success else 1
 
 
@@ -378,6 +416,12 @@ def main(argv=None) -> int:
                     help="master/pat: run only the planner, emit the decomposed step "
                          "plan (stdout + events + runs/<id>/plan.json), and exit BEFORE "
                          "any worker writes to the out-dir.")
+    do.add_argument("--plan", type=str, default=None, metavar="FILE",
+                    help="master/pat: execute the steps in this plan file VERBATIM, "
+                         "skipping the planner. Accepts a --plan-only plan.json (or a "
+                         "bare JSON list of step strings), closing the round-trip: "
+                         "--plan-only -> review/edit plan.json -> --plan <file>. "
+                         "Mutually exclusive with --plan-only.")
     do.add_argument("--protect-paths", type=str, default=None, metavar="GLOB[,GLOB...]",
                     help="Fail the run if any worker modifies a path matching these "
                          "denylist globs (e.g. 'docs/core/**,**/*.lock,migrations/**'). "
