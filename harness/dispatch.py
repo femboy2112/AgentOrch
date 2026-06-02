@@ -1756,8 +1756,17 @@ async def dispatch_async(
         reconcile_status=reconcile_status,
         graph=graph_meta,
     )
+    meta_dict = asdict(result)
+    # The graph-execution summary is present ONLY for a graph DAG run; honor the
+    # graph_meta writer's contract (a flat / non-graph run's meta.json is
+    # byte-identical to the pre-graph-feature shape) by dropping the key when null
+    # rather than emitting a spurious "graph": null. (reconciliation / reconcile_status
+    # intentionally always appear — see their #44 "always set" contract — so they
+    # are NOT dropped here.)
+    if meta_dict.get("graph") is None:
+        meta_dict.pop("graph", None)
     (run_dir / "meta.json").write_text(
-        json.dumps(asdict(result), indent=2), encoding="utf-8"
+        json.dumps(meta_dict, indent=2), encoding="utf-8"
     )
     return result
 

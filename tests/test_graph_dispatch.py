@@ -840,21 +840,21 @@ def test_cli_plan_graph_strict_alias_rejects_flat(monkeypatch, tmp_path, capsys)
     assert "graph" in err.lower()
 
 
-def test_tdag_stays_orphaned():
-    # docs §8 Q5: tdag.py is SUPERSEDED by the master graph mode. Keep the file
-    # but ensure NO production module imports it — a stray import would resurrect
-    # dead code + the dead-code ambiguity this test exists to prevent. Scans the
-    # orchestrator + harness source for `tdag` references (skipping this test file
-    # and any __pycache__).
+def test_tdag_removed_and_unreferenced():
+    # docs §8 Q5: tdag.py was SUPERSEDED by the master graph mode and has now been
+    # DELETED. Guard against resurrection: the file must stay gone AND no production
+    # module may reference `tdag` (a stray import would reintroduce dead code + the
+    # dead-code ambiguity). Scans the orchestrator + harness source.
     import pathlib
 
     root = pathlib.Path(master_mod.__file__).resolve().parent.parent.parent
+    assert not (root / "agy_orchestrator" / "execution" / "tdag.py").exists(), (
+        "tdag.py was resurrected; it is superseded by the master graph mode"
+    )
     offenders = []
     for src in list((root / "agy_orchestrator").rglob("*.py")) + \
             list((root / "harness").rglob("*.py")):
-        if src.name == "tdag.py":
-            continue
         text = src.read_text(encoding="utf-8")
         if "tdag" in text:
             offenders.append(str(src))
-    assert offenders == [], f"tdag.py is imported by production code: {offenders}"
+    assert offenders == [], f"`tdag` referenced by production code: {offenders}"

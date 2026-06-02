@@ -220,11 +220,12 @@ class MasterWorkflow:
             self.plan_steps = list(plan_graph.as_steps())
         # Concurrency caps for the DAG walker (docs §5 M3). ``max_parallel_workers``
         # bounds how many whole DAG nodes (gen + ToT + verify) run at once via
-        # ``self._node_sem``; ``verifier_concurrency`` (default 1) serializes the
-        # local ``make check`` spike so K parallel nodes never run K full verifiers
-        # at once and OOM the box — the exact layering vote uses. Both default to
-        # the env (AGY_MAX_PARALLEL_NODES / AGY_VERIFIER_CONCURRENCY) when unset, so
-        # the harness can pass through without re-resolving. Linear runs ignore both.
+        # ``self._node_sem`` and defaults to the AGY_MAX_PARALLEL_NODES env when the
+        # caller passes None, so the harness can pass through without re-resolving.
+        # ``verifier_concurrency`` (default 1) serializes the local ``make check``
+        # spike so K parallel nodes never run K full verifiers at once and OOM the
+        # box — the exact layering vote uses; it is a constructor arg (no env knob).
+        # Linear runs ignore both.
         if max_parallel_workers is None:
             _env_mpn = os.environ.get("AGY_MAX_PARALLEL_NODES", "")
             max_parallel_workers = int(_env_mpn) if _env_mpn.strip().isdigit() else None
