@@ -4,8 +4,13 @@ import re
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.model_discovery import discover_models
 
 logger = logging.getLogger(__name__)
+
+# Static fallback model list (claude has no documented models subcommand; bare
+# names resolve to the CLI's current dated default).
+_CLAUDE_FALLBACK_MODELS = ["haiku", "sonnet", "opus"]
 
 # Map orchestrator-internal names to claude --model values. "opus"/"sonnet"/
 # "haiku" pass through unchanged — the CLI resolves them to its CURRENT default
@@ -44,7 +49,15 @@ class ClaudeAgent(AgentInstance):
 
     @classmethod
     async def get_available_models(cls) -> List[str]:
-        return ["haiku", "sonnet", "opus"]
+        # claude has no documented model-list subcommand, so we don't shell out
+        # (``list_argv=None``) and the static list is the fallback. Routed through
+        # discover_models to keep the path uniform + memoized across adapters.
+        return await discover_models(
+            "claude",
+            list_argv=None,
+            parse=lambda _stdout: [],
+            fallback=_CLAUDE_FALLBACK_MODELS,
+        )
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:

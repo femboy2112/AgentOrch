@@ -22,8 +22,18 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.model_discovery import discover_models
 
 logger = logging.getLogger(__name__)
+
+# Static fallback roster (agy selects its model via settings.json, not a flag or
+# a models subcommand, so this display-name list IS the source of truth).
+_AGY_FALLBACK_MODELS = [
+    "Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (Low)",
+    "Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Low)",
+    "Claude Opus 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
+]
 
 _SETTINGS_PATH = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
 _LOCK_PATH = Path(tempfile.gettempdir()) / "agentorch-agy-model.lock"
@@ -82,13 +92,16 @@ class AgyAgent(AgentInstance):
 
     @classmethod
     async def get_available_models(cls) -> List[str]:
-        # The agy /model picker roster (display names).
-        return [
-            "Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (Low)",
-            "Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Low)",
-            "Claude Opus 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)",
-            "GPT-OSS 120B (Medium)",
-        ]
+        # agy has no model-list subcommand (model is chosen in its interactive
+        # /model picker), so we don't shell out (``list_argv=None``); the picker
+        # roster is the static fallback. Routed through discover_models to keep the
+        # discovery/union path uniform + memoized across adapters.
+        return await discover_models(
+            "agy",
+            list_argv=None,
+            parse=lambda _stdout: [],
+            fallback=_AGY_FALLBACK_MODELS,
+        )
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:

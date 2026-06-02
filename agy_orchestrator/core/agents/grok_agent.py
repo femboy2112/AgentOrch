@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -7,6 +6,7 @@ import tempfile
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.model_discovery import discover_models
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,26 @@ logger = logging.getLogger(__name__)
 # parameter reasoningEffort"). So we never pass --effort/--reasoning-effort for
 # it. If a future model supports effort, add it to this set to re-enable.
 _EFFORT_CAPABLE_MODELS: set = set()
+
+# Static fallback when `grok models` can't be queried (CLI missing/updated).
+_GROK_FALLBACK_MODELS: List[str] = ["grok-build"]
+
+
+def _parse_grok_models(stdout: str) -> List[str]:
+    """Parse the indented bullet list under "Available models:" from `grok models`."""
+    models: List[str] = []
+    for line in stdout.splitlines():
+        # Skip the "Available models:" header and "Logged in as ..." footer by
+        # anchoring on the line start, NOT substring-matching "model" anywhere —
+        # a future model name containing that substring (e.g. "grok-model-x")
+        # must still be collected.
+        if re.match(r"\s*(Available models|Logged in)\b", line, re.IGNORECASE):
+            continue
+        m = re.match(r"\s*\*?\s*([A-Za-z0-9._-]+)", line)
+        # Only the indented bullet list under "Available models:".
+        if m and ("*" in line or line.startswith("  ")):
+            models.append(m.group(1))
+    return models
 
 
 class GrokAgent(AgentInstance):
@@ -44,26 +64,13 @@ class GrokAgent(AgentInstance):
 
     @classmethod
     async def get_available_models(cls) -> List[str]:
-        """Query `grok models`; fall back to the known default on any error."""
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "grok", "models",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await process.communicate()
-            if process.returncode == 0:
-                models = []
-                for line in stdout.decode().splitlines():
-                    m = re.match(r"\s*\*?\s*([A-Za-z0-9._-]+)", line)
-                    # Only the indented bullet list under "Available models:".
-                    if m and ("*" in line or line.startswith("  ")) and \
-                            "model" not in line.lower() and "logged" not in line.lower():
-                        models.append(m.group(1))
-                if models:
-                    return models
-        except Exception:
-            pass
-        return ["grok-build"]
+        """Query `grok models` (memoized); fall back to the known default on any error."""
+        return await discover_models(
+            "grok",
+            list_argv=["grok", "models"],
+            parse=_parse_grok_models,
+            fallback=_GROK_FALLBACK_MODELS,
+        )
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:

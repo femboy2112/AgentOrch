@@ -126,10 +126,16 @@ def test_invalid_effort_tier_raises():
                           gen_effort="turbo")
 
 
-def test_unknown_codex_model_raises():
-    with pytest.raises(OverrideError):
-        resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
+def test_unknown_codex_model_passthrough_with_note():
+    # Issue #46: an unknown/renamed codex model no longer hard-fails — it warns
+    # (advisory note) and passes through to the CLI unchanged. A CLI update or
+    # account change can rename a model at any time; rejecting it here used to
+    # break dispatch and masquerade as a usage wall.
+    r = resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
                           codex_model="gpt-9-imaginary")
+    assert r.generator["codex"]["model"] == "gpt-9-imaginary"
+    assert r.critic["codex"]["model"] == "gpt-9-imaginary"
+    assert any("gpt-9-imaginary" in n for n in r.notes)
 
 
 def test_grok_effort_in_map_is_dropped_with_note():

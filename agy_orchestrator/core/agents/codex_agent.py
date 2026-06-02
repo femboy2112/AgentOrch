@@ -4,6 +4,7 @@ import tempfile
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.model_discovery import discover_models
 
 
 class CodexAgent(AgentInstance):
@@ -16,7 +17,17 @@ class CodexAgent(AgentInstance):
 
     @classmethod
     async def get_available_models(cls) -> List[str]:
-        return list(cls.AVAILABLE_MODELS)
+        # The codex CLI exposes no machine-readable model-list subcommand, so we
+        # don't shell out (``list_argv=None``); AVAILABLE_MODELS is the static
+        # fallback. Routing through discover_models anyway keeps the discovery/
+        # union path uniform across adapters and memoizes the result. If a future
+        # codex build adds e.g. `codex models`, swap in its argv + a parser here.
+        return await discover_models(
+            "codex",
+            list_argv=None,
+            parse=lambda _stdout: [],
+            fallback=list(cls.AVAILABLE_MODELS),
+        )
 
     @classmethod
     async def get_model_usage(cls, model: str) -> float:

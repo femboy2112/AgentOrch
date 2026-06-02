@@ -33,15 +33,24 @@ Design rules (the "get it right" bits):
     ``gpt-5.5`` on agy), while ``--codex-model`` targets codex anywhere.
   * **explicit flags beat the profile.** The profile is the base; any explicit
     flag layered on top wins, with a note.
-  * **validation up front.** Unknown effort tier or unknown codex model fails
-    fast with a clear, enumerated error (raise :class:`OverrideError`).
+  * **validation up front, but model names are advisory (issue #46).** An
+    unknown *effort tier* still fails fast (a finite, code-defined enum). An
+    unknown/renamed *model* no longer hard-fails: a CLI update or account change
+    can rename or retire a model literal at any time, and rejecting it here used
+    to break dispatch and masquerade as a usage wall. We now WARN (log + note)
+    and pass the model through to the CLI unchanged — the model list (discovered
+    when available, else the static fallback) is advisory, not a gate. The CLI
+    itself is the real authority.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
+
+logger = logging.getLogger(__name__)
 
 # CLI effort tiers. ``max`` is codex's ``xhigh`` (a tier ABOVE the default
 # ``high``); the codex agent performs that aliasing at command-build time.
@@ -95,15 +104,24 @@ def validate_effort(value: str, *, where: str) -> str:
     return value
 
 
-def validate_model(provider: str, value: str, *, where: str) -> str:
-    # Only codex exposes a machine-checkable model list; validate it strictly so
-    # a typo'd --codex-model fails fast. Other providers pass through (we don't
-    # hold an authoritative list for them) — the provider CLI rejects a bad name.
+def validate_model(provider: str, value: str, *, where: str,
+                   notes: Optional[List[str]] = None) -> str:
+    # Model names are ADVISORY, not a gate (issue #46): a CLI update or account
+    # change can rename/retire a model literal at any time, and hard-rejecting an
+    # unknown name here used to break dispatch and look like a usage wall. So even
+    # for codex — the one provider with a static list — an unrecognized model is
+    # WARNED about (log + advisory note) and passed through unchanged; the codex
+    # CLI is the real authority on what it accepts. Other providers pass through
+    # silently here (their callers already emit an "unvalidated model" note).
     if provider == "codex" and value not in _codex_models():
-        raise OverrideError(
-            f"unknown codex model {value!r} for {where}; available: "
-            f"{', '.join(_codex_models())}"
+        msg = (
+            f"unrecognized codex model {value!r} for {where} — not in the known "
+            f"list ({', '.join(_codex_models())}); passing it through to the codex "
+            f"CLI unchanged (the list is advisory, not a gate)"
         )
+        logger.warning(msg)
+        if notes is not None:
+            notes.append(msg)
     return value
 
 
@@ -184,7 +202,7 @@ def _apply_model_to_lead(ov: Dict[str, Dict[str, str]], chain: List[str],
     if not chain:
         return
     lead = chain[0]
-    validate_model(lead, value, where=where)
+    validate_model(lead, value, where=where, notes=notes)
     ov.setdefault(lead, {})["model"] = value
     if lead != "codex":
         notes.append(f"{where}: model {value!r} for {lead} is not validated "
@@ -219,7 +237,7 @@ def _apply_map(ov: Dict[str, Dict[str, str]], chain: List[str], kv: Dict[str, st
         if field_name == "effort":
             validate_effort(value, where=flag)
         else:
-            validate_model(provider, value, where=flag)
+            validate_model(provider, value, where=flag, notes=notes)
         if provider not in chain_set:
             notes.append(f"{flag}: {provider} is not in this chain — override recorded "
                          f"but only applies if {provider} is reached")
@@ -301,7 +319,7 @@ def resolve_overrides(
                                  where=f"--{role}-model")
         # 4. --codex-model (most specific convenience; both roles)
         if codex_model is not None and "codex" in chain:
-            validate_model("codex", codex_model, where="--codex-model")
+            validate_model("codex", codex_model, where="--codex-model", notes=notes)
             ov.setdefault("codex", {})["model"] = codex_model
         return ov
 
