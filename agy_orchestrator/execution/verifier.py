@@ -2,13 +2,49 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
+
+# Shared with the worker-child resource bounds (issue #48): ONE thread-pin var
+# list + ONE opt-out, so the verifier subprocess (#54) and the worker child env
+# stay symmetric. Imported (not re-declared) so a future change to either lands
+# in both. agent.py does not import verifier, so this import introduces no cycle.
+from agy_orchestrator.core.agent import (
+    _THREAD_PIN_VARS,
+    _resource_bound_disabled,
+    looks_like_infra,
+)
 
 logger = logging.getLogger(__name__)
+
+# Matches the failing-test identity lines pytest -q writes to STDOUT, both in the
+# live "FAILED test::name - ..." stream and the "=== short test summary ===" block
+# ("FAILED test::name" / "ERROR test::name"). Used to surface a thrashing step's
+# failing tests in the event stream (issue #60). Anchored at line start; the
+# nodeid is the first whitespace-delimited token after the keyword.
+_PYTEST_FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+
+
+def _parse_failed_tests(stdout_tail: str, limit: int = 25) -> List[str]:
+    """Extract failing-test nodeids from a pytest -q stdout tail (issue #60).
+
+    pytest writes "FAILED test::name" to STDOUT (not stderr), so the failing-test
+    identity is otherwise persisted nowhere. De-duplicated, order-preserving, and
+    bounded so a suite that fails hundreds of tests can't unbound the event."""
+    if not stdout_tail:
+        return []
+    seen: List[str] = []
+    for nodeid in _PYTEST_FAILED_RE.findall(stdout_tail):
+        if nodeid not in seen:
+            seen.append(nodeid)
+        if len(seen) >= limit:
+            break
+    return seen
 
 @dataclass
 class VerifierResult:
@@ -25,6 +61,14 @@ class VerifierResult:
     # scope), NOT a genuine test failure. Lets callers report "verifier exceeded
     # resource budget" distinctly and avoid misreading it as a code failure.
     resource_exceeded: bool = False
+    # #58: a NON-timeout, normal-returncode failure whose stderr matches an
+    # infra-class marker (build tool missing, half-installed venv, disk full,
+    # permission flip, conftest import error) — a broken HOST env, not a code
+    # defect. Heuristic, so the adversarial loop treats it as a SOFT signal (one
+    # regenerate then bail) rather than ground truth. Only ever set on a genuine
+    # failure (ok=False, not timeout/resource_exceeded); False otherwise so a
+    # consumer that never inspects it sees byte-identical behaviour.
+    infra_suspected: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -70,6 +114,22 @@ class QualityVerifier:
                 "`harness do` in an external scope if you need a hard cap here.",
                 self.mem_max,
             )
+        # The most recent VerifierResult, exposed so the harness can surface the
+        # FINAL converged verifier's wall-clock + timeout margin (issue #55)
+        # without re-running the suite. None until verify() has run once.
+        self.last_result: Optional[VerifierResult] = None
+        # Optional observability sinks (issue #60), all opt-in (set by the harness
+        # after construction). When unset the verifier behaves byte-identically:
+        #   * run_dir         — directory to persist a per-iteration verify log to.
+        #   * event_callback  — bus publisher; failing-test nodeids are emitted so a
+        #                       thrashing step is visible in events.jsonl.
+        #   * step_index      — the build step this verifier gates (artifact naming).
+        # The per-step iteration counter advances on every FAILED verify so repeated
+        # failures within one step land in distinct artifacts.
+        self.run_dir: Optional[str] = None
+        self.event_callback: Optional[Callable[[dict], None]] = None
+        self.step_index: int = 0
+        self._iter_index: int = 0
 
     @staticmethod
     def _systemd_scope_available() -> bool:
@@ -96,6 +156,52 @@ class QualityVerifier:
             "/bin/sh", "-c", cmd,
         ]
 
+    def _verifier_env(self) -> Optional[dict]:
+        """Child env for the verifier subprocess with BLAS/xdist thread pins (#54).
+
+        Symmetric gap from #48: ``apply_worker_resource_bounds`` pins the thread
+        pools ONLY in the WORKER child env, but the orchestrator's OWN verifier ran
+        the raw ``--test-cmd`` with no env injection — inheriting the parent env, so
+        a ``--test-cmd`` running its own ``pytest -n auto`` plus default BLAS pools
+        nested-oversubscribed the host. Pin the SAME set here, guarded by the SAME
+        ``AGY_WORKER_RESOURCE_BOUND=0`` opt-out. Each var is only set when ABSENT, so
+        an operator/parent value is respected. Returns None (inherit parent env)
+        when bounding is disabled, keeping the historical behaviour byte-identical."""
+        if _resource_bound_disabled():
+            return None
+        env = dict(os.environ)
+        for var in _THREAD_PIN_VARS:
+            env.setdefault(var, "1")
+        return env
+
+    def _clamp_xdist(self, cmd: str) -> str:
+        """Clamp any verifier ``-n K`` xdist worker count to the host core count (#55b).
+
+        A ``--test-cmd ... -n 8`` on a 4-core box requests more xdist workers than
+        cores, oversubscribing every numeric library underneath. Rewrite ``-n K`` to
+        ``-n min(K, cpu_count())`` and log the clamp. ``-n auto``/``-n logical`` (and a
+        bound disabled via the resource opt-out) are left untouched: ``auto`` already
+        tracks the core count, and the opt-out means the operator wants raw control."""
+        if _resource_bound_disabled():
+            return cmd
+        cpu = os.cpu_count() or 1
+
+        def _sub(m: "re.Match") -> str:
+            k = int(m.group("k"))
+            if k <= cpu:
+                return m.group(0)
+            logger.warning(
+                "Verifier -n %d exceeds host core count %d; clamping to -n %d "
+                "to avoid oversubscription.", k, cpu, cpu,
+            )
+            return f"{m.group('flag')}{m.group('sep')}{cpu}"
+
+        # Match `-n 8` and `-n8` and `--numprocesses 8`, but NOT `-n auto`/`logical`.
+        pattern = re.compile(
+            r"(?P<flag>--numprocesses|-n)(?P<sep>=|\s+|)(?P<k>\d+)"
+        )
+        return pattern.sub(_sub, cmd)
+
     async def verify(self, working_directory: str) -> VerifierResult:
         """
         Runs the configured test commands in the specified directory.
@@ -104,15 +210,20 @@ class QualityVerifier:
             VerifierResult: structured verification outcome.
         """
         if not self.test_commands:
-            return VerifierResult(
+            return self._finalize(VerifierResult(
                 ok=True,
                 message="No verification commands configured",
                 returncode=0,
                 duration_ms=0,
-            )
+            ))
+
+        # Thread-pin child env (#54), shared with the worker-child bounds (#48).
+        env = self._verifier_env()
 
         total_duration_ms = 0
         for cmd in self.test_commands:
+            # Clamp any -n K xdist worker count to the host core count (#55b).
+            cmd = self._clamp_xdist(cmd)
             logger.info(
                 "Running verification: %s in %s%s",
                 cmd, working_directory,
@@ -124,6 +235,7 @@ class QualityVerifier:
                 process = await asyncio.create_subprocess_exec(
                     *argv,
                     cwd=working_directory,
+                    env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -131,6 +243,7 @@ class QualityVerifier:
                 process = await asyncio.create_subprocess_shell(
                     cmd,
                     cwd=working_directory,
+                    env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -173,7 +286,7 @@ class QualityVerifier:
                     result.error_hash = hashlib.sha256(
                         result.stderr_tail.encode()
                     ).hexdigest()[:16]
-                return result
+                return self._finalize(result)
 
             if process.returncode != 0:
                 # #39: under a memory cap, a SIGKILL (rc 137 / -9) almost always
@@ -190,6 +303,14 @@ class QualityVerifier:
                     )
                 else:
                     message = f"Command failed with exit code {process.returncode}: {cmd}"
+                # #58: a non-timeout, non-OOM failure whose stderr matches an
+                # infra-class marker looks like a broken HOST env (missing build
+                # tool, half-installed venv, full disk, permission flip, conftest
+                # import error), not a code defect. Flag it so the adversarial loop
+                # surfaces the real cause and bails after one regenerate instead of
+                # regenerating code against a problem the code can't fix. Heuristic,
+                # so only a SOFT signal — never override a resource_exceeded verdict.
+                infra_suspected = not resource_exceeded and looks_like_infra(stderr_tail)
                 result = VerifierResult(
                     ok=False,
                     message=message,
@@ -200,20 +321,106 @@ class QualityVerifier:
                     timeout=False,
                     cmd=cmd,
                     resource_exceeded=resource_exceeded,
+                    infra_suspected=infra_suspected,
                 )
                 if result.stderr_tail:
                     result.error_hash = hashlib.sha256(
                         result.stderr_tail.encode()
                     ).hexdigest()[:16]
-                logger.warning("Verification failed: %s", result.message)
-                return result
+                # #60: a non-timeout failure used to log ONLY result.message ("Command
+                # failed with exit code N: cmd"). pytest -q writes the failing-test
+                # identity ("FAILED test::name", "=== short test summary ===") to
+                # STDOUT, so without surfacing stdout_tail the actual failure was
+                # persisted nowhere. Log a bounded stdout tail (+ stderr tail when
+                # non-empty), persist the full tails to a per-iteration artifact, and
+                # emit the parsed failing-test nodeids into the event stream.
+                self._report_failure(result)
+                return self._finalize(result)
 
         logger.info("All verifications passed successfully.")
         final_cmd = "<multi>" if len(self.test_commands) > 1 else self.test_commands[0]
-        return VerifierResult(
+        return self._finalize(VerifierResult(
             ok=True,
             message="All tests passed",
             returncode=0,
             duration_ms=total_duration_ms,
             cmd=final_cmd,
-        )
+        ))
+
+    def _finalize(self, result: VerifierResult) -> VerifierResult:
+        """Record the result for FINAL-verifier telemetry (#55) and return it."""
+        self.last_result = result
+        return result
+
+    @staticmethod
+    def _stdout_log_tail(stdout_tail: str, max_lines: int = 25,
+                         max_chars: int = 1500) -> str:
+        """Last ~25 lines / ~1500 chars of a pytest stdout tail — the region that
+        holds the "=== short test summary ===" / "FAILED ..." block (#60)."""
+        if not stdout_tail:
+            return ""
+        tail = "\n".join(stdout_tail.splitlines()[-max_lines:])
+        return tail[-max_chars:]
+
+    def _report_failure(self, result: VerifierResult) -> None:
+        """Surface a non-timeout verifier failure (#60): WARNING-log the stdout tail,
+        persist the full tails to a per-iteration artifact, and emit the parsed
+        failing-test nodeids into the event stream. All best-effort and bounded."""
+        # Advance the per-step iteration counter so repeated failures within one
+        # build step land in distinct artifacts (verify_step<N>_iter<M>.log).
+        self._iter_index += 1
+        out_tail = self._stdout_log_tail(result.stdout_tail)
+        if out_tail:
+            logger.warning(
+                "Verification failed: %s\n--- captured stdout (tail) ---\n%s",
+                result.message, out_tail,
+            )
+        else:
+            logger.warning("Verification failed: %s", result.message)
+        if result.stderr_tail.strip():
+            logger.warning(
+                "--- captured stderr (tail) ---\n%s",
+                result.stderr_tail[-1500:],
+            )
+
+        # (2) Persist the full captured tails to a per-iteration artifact so
+        # post-hoc diagnosis needs no re-run. Opt-in on run_dir being set.
+        if self.run_dir:
+            try:
+                from pathlib import Path
+                artifact = Path(self.run_dir) / (
+                    f"verify_step{self.step_index}_iter{self._iter_index}.log"
+                )
+                artifact.write_text(
+                    f"$ {result.cmd}\n"
+                    f"exit code: {result.returncode}\n"
+                    f"duration_ms: {result.duration_ms}\n"
+                    f"message: {result.message}\n"
+                    "=== STDOUT ===\n"
+                    f"{result.stdout_tail}\n"
+                    "=== STDERR ===\n"
+                    f"{result.stderr_tail}\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # never let observability fail a run
+                logger.debug("Could not persist verify artifact: %s", exc)
+
+        # (3) Parse "FAILED " lines from stdout and emit the failing-test names so
+        # a thrashing step is visible in events.jsonl.
+        failed = _parse_failed_tests(result.stdout_tail)
+        if failed and self.event_callback is not None:
+            try:
+                self.event_callback({
+                    "kind": "lifecycle",
+                    "data": {
+                        "event": "verifier_failed",
+                        "detail": {
+                            "step": self.step_index,
+                            "iteration": self._iter_index,
+                            "returncode": result.returncode,
+                            "failed_tests": failed,
+                        },
+                    },
+                })
+            except Exception:
+                pass

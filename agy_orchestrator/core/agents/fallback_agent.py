@@ -9,13 +9,17 @@ a long autonomous build resilient to one provider exhausting its usage mid-run.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import Callable, Dict, List, Optional, Type
 
 from agy_orchestrator.core.agent import (
     WATCHDOG_MARKER,
+    WATCHDOG_TRANSPORT_STALL,
     AgentInstance,
     is_context_overflow,
+    is_transport_error,
     is_usage_wall,
 )
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
@@ -43,7 +47,7 @@ def _watchdog_reason_in(stderr: str) -> Optional[str]:
 
 
 def _reason_category(*, looked_like_usage: bool, watchdog_reason: Optional[str],
-                     context_overflow: bool = False) -> str:
+                     context_overflow: bool = False, transport: bool = False) -> str:
     # Context overflow is checked FIRST and is distinct from a quota wall: the
     # same provider can serve the next (smaller) step, so telemetry must not fold
     # it into "usage" (issue #47).
@@ -51,11 +55,39 @@ def _reason_category(*, looked_like_usage: bool, watchdog_reason: Optional[str],
         return "context_overflow"
     if looked_like_usage:
         return "usage"
+    # A transport/network blip (websocket reset, ECONNRESET, transient 502/503)
+    # failed the CONNECTION, not the provider — keep it separable from a real quota
+    # wall so flakiness telemetry doesn't read as provider exhaustion (issue #57).
+    # The watchdog's transport-stall trip funnels here too.
+    if transport or watchdog_reason == WATCHDOG_TRANSPORT_STALL:
+        return "transport"
     if watchdog_reason == "verbose":
         return "verbose"
     if watchdog_reason == "stalled":
         return "stalled"
     return "error"
+
+
+# Bounded same-provider backoff-retries for a transport-classified failure before
+# advancing to the next provider (issue #57). The connection blipped, not the
+# provider, so a short retry on the SAME provider is the right first move. Kept
+# small (1-2) and overridable via env so a flapping link can't burn the cycle
+# budget. The backoff is brief because these are network resets, not quota waits.
+def _transport_retries() -> int:
+    try:
+        n = int(os.environ.get("AGY_TRANSPORT_RETRIES", "2") or "2")
+    except ValueError:
+        n = 2
+    return max(0, min(n, 2))
+
+
+def _transport_backoff_seconds(attempt: int) -> float:
+    # attempt is 1-based; 0.5s, 1.0s. Overridable base for tests/tuning.
+    try:
+        base = float(os.environ.get("AGY_TRANSPORT_BACKOFF", "0.5") or "0.5")
+    except ValueError:
+        base = 0.5
+    return base * attempt
 
 
 def make_fallback_agent(
@@ -193,6 +225,10 @@ def make_fallback_agent(
             pending: List[Type[AgentInstance]] = list(self._chain) * self._cycles
             total = len(pending)
             attempts = 0
+            # Per-provider count of bounded same-provider transport retries already
+            # spent, so a flapping link can't loop a single provider forever (#57).
+            transport_retries_used: Dict[Type[AgentInstance], int] = {}
+            max_transport_retries = _transport_retries()
             while pending:
                 agent_cls = pending.pop(0)
                 attempts += 1
@@ -214,6 +250,41 @@ def make_fallback_agent(
                     looked_like_overflow = is_context_overflow(stderr)
                     looked_like_usage = is_usage_wall(stderr)
                     reason = _watchdog_reason_in(stderr)
+                    # A transport blip (plain network reset, or the watchdog's
+                    # transport-stall trip) failed the CONNECTION, not the provider.
+                    # Prefer a BOUNDED same-provider backoff-retry before advancing
+                    # to the next provider (issue #57): re-splice this same provider
+                    # to the front of pending, sleep a short backoff, and retry.
+                    looked_like_transport = (
+                        reason == WATCHDOG_TRANSPORT_STALL or is_transport_error(stderr)
+                    )
+                    if (looked_like_transport
+                            and transport_retries_used.get(agent_cls, 0) < max_transport_retries):
+                        n = transport_retries_used.get(agent_cls, 0) + 1
+                        transport_retries_used[agent_cls] = n
+                        backoff = _transport_backoff_seconds(n)
+                        logger.warning(
+                            "[Fallback] %s transport blip (%s) — same-provider retry "
+                            "%d/%d after %.1fs backoff",
+                            label, reason or "network", n, max_transport_retries, backoff,
+                        )
+                        self._emit_orchestration(
+                            phase="fallback",
+                            action="transport_retry",
+                            from_worker=label,
+                            to_worker=label,
+                            reason=reason or "transport",
+                            reason_category="transport",
+                            attempt=attempts,
+                            attempt_total=len(self._chain),
+                        )
+                        # Retry the SAME provider next; it does not consume a chain
+                        # slot conceptually, but counts toward total attempts above.
+                        pending.insert(0, agent_cls)
+                        if backoff > 0:
+                            await asyncio.sleep(backoff)
+                        last_error = exc
+                        continue
                     if reason and reason in self._watchdog_rules:
                         targets = self._watchdog_rules[reason]
                         # Splice rule-based re-route targets to the FRONT of pending,
@@ -235,6 +306,7 @@ def make_fallback_agent(
                                 looked_like_usage=looked_like_usage,
                                 watchdog_reason=reason,
                                 context_overflow=looked_like_overflow,
+                                transport=looked_like_transport,
                             ),
                             attempt=attempts,
                             attempt_total=len(self._chain),
@@ -254,11 +326,12 @@ def make_fallback_agent(
                             action="reroute",
                             from_worker=label,
                             to_worker=to_worker,
-                            reason=reason or "error",
+                            reason=reason or ("transport" if looked_like_transport else "error"),
                             reason_category=_reason_category(
                                 looked_like_usage=looked_like_usage,
                                 watchdog_reason=reason,
                                 context_overflow=looked_like_overflow,
+                                transport=looked_like_transport,
                             ),
                             attempt=attempts,
                             attempt_total=len(self._chain),

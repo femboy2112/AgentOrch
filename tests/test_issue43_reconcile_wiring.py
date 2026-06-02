@@ -32,7 +32,13 @@ def _ok_workflow_factory(output="built the thing"):
 
 
 def _canned(disposition="warn", *, dead=False):
-    findings = []
+    # A SUBSTANTIVE trace examines >= 1 mechanism (#51): a clean build traces a
+    # mechanism and finds it load-bearing; a dead build also traces it but flags it.
+    findings = [MechanismFinding(
+        name="learner", classification="load_bearing", location="world.py:10",
+        witness=Witness(value=2.0, description="ablation dropped the live score"),
+        evidence="learner.step() called on the real loop",
+    )]
     if dead:
         findings.append(MechanismFinding(
             name="surprise", classification="exists_not_load_bearing",
@@ -91,9 +97,10 @@ def test_reconcile_warn_does_not_fail(tmp_path, monkeypatch):
     # warn default: dead wiring surfaced loudly but the run still SUCCEEDS.
     assert result.success is True
     assert result.reconciliation["reconciled"] is False
-    findings = result.reconciliation["findings"]
-    assert findings[0]["sub_kind"] == "stub_constant"
-    assert findings[0]["location"] == "world.py:42"
+    dead = [f for f in result.reconciliation["findings"]
+            if f["classification"] == "exists_not_load_bearing"]
+    assert dead[0]["sub_kind"] == "stub_constant"
+    assert dead[0]["location"] == "world.py:42"
 
 
 def test_reconcile_fail_disposition_flips_success(tmp_path, monkeypatch):

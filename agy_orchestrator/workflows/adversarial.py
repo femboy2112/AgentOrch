@@ -88,6 +88,15 @@ class AdversarialReview:
         # iteration budget against unbroken code. Surfaced for the run ledger.
         self.verifier_infra_failed = False
         self.infra_reason: Optional[str] = None
+        # #58: a NON-timeout verifier failure whose stderr matched an infra-class
+        # marker (missing build tool, half-installed venv, full disk, permission
+        # flip, conftest import error). These markers are heuristic, so — unlike
+        # the #50 timeout/OOM bail, which is precise — this is a SOFT signal: the
+        # loop allows exactly ONE regenerate (a real code bug that merely *looks*
+        # infra-ish still gets a fix attempt) and then bails rather than burning
+        # the whole iteration budget against an unfixable host problem. Counts the
+        # infra-suspected regenerate attempts already spent.
+        self._infra_suspected_retries = 0
         self.event_callback = event_callback
 
     def _emit_orchestration(self, **fields) -> None:
@@ -200,6 +209,49 @@ class AdversarialReview:
                         approved=self.approved,
                     )
                     return last_output
+                # #58: any OTHER infra-class failure (suite couldn't import because
+                # a sibling left the venv half-installed, "make: command not found",
+                # disk-full write) returns ok=False with a NORMAL returncode — #50's
+                # precise timeout/OOM branch above doesn't catch it, so it used to
+                # fall through to "regenerate" and burn the whole iteration budget
+                # regenerating code against a host problem the code can't fix. The
+                # verifier flags these heuristically (VerifierResult.infra_suspected).
+                # Treat it like #50 — surface the real cause, distinct log/event —
+                # but as a SOFT signal: the markers are heuristic, so allow exactly
+                # ONE regenerate (a real bug that merely *looks* infra-ish still gets
+                # a fix attempt), then bail rather than thrash to max_iterations.
+                if result.infra_suspected:
+                    if self._infra_suspected_retries >= 1:
+                        self.verifier_infra_failed = True
+                        self.infra_reason = "verifier_infra_suspected"
+                        logger.error(
+                            "Verifier failed with an INFRA-class error again after a "
+                            "regenerate (host env, not a code defect): %s. NOT "
+                            "regenerating further — fix the environment (missing build "
+                            "tool, half-installed venv, disk space, permissions, "
+                            "conftest import) and re-run.",
+                            result.message,
+                        )
+                        self._emit_orchestration(
+                            phase="adversarial",
+                            action="iteration_completed",
+                            iteration=iteration + 1,
+                            iteration_total=self.max_iterations,
+                            outcome=self.infra_reason,
+                            verified=self.verified,
+                            approved=self.approved,
+                        )
+                        return last_output
+                    self._infra_suspected_retries += 1
+                    logger.warning(
+                        "Verifier failed with what looks like an INFRA-class error "
+                        "(host env, not a code defect): %s. Markers are heuristic, so "
+                        "allowing ONE regenerate in case it's a genuine code bug; will "
+                        "bail if it recurs.",
+                        result.message,
+                    )
+                    # Fall through to the normal regenerate path (feed the failing
+                    # code + error back); the retry counter gates the next round.
                 logger.info("Programmatic verification failed. Sending back to generator.")
                 # Feed the failing CODE back with the error, not just the error —
                 # regenerating from scratch loses the working parts (matches the

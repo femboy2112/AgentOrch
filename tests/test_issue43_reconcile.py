@@ -243,8 +243,25 @@ def test_fail_disposition_flags_run():
     )
     result = _run(reply, disposition="fail")
     assert result.should_fail_run is True
-    # ...but a reconciled run under 'fail' still does not fail.
-    clean = _run(json.dumps({"findings": []}), disposition="fail")
+    # ...but a SUBSTANTIVE reconciled run under 'fail' still does not fail. A trace
+    # that actually examined a mechanism and found it load-bearing is clean (#51:
+    # an EMPTY trace no longer counts as clean — it is hollow, see substance tests).
+    clean = _run(
+        json.dumps(
+            {
+                "findings": [
+                    {
+                        "name": "live",
+                        "classification": "load_bearing",
+                        "location": "a.py:1",
+                        "witness": {"value": 2.0},
+                        "evidence": "on path",
+                    }
+                ]
+            }
+        ),
+        disposition="fail",
+    )
     assert clean.should_fail_run is False
 
 
@@ -359,7 +376,23 @@ def test_file_line_split_fields_are_joined():
 # (f) the verdict is a DISTINCT object, not a VerifierResult, not auto-folded
 # --------------------------------------------------------------------------- #
 def test_verdict_is_distinct_from_verifier_result():
-    result = _run(json.dumps({"findings": []}))
+    # A SUBSTANTIVE reconciled trace (>=1 mechanism, all load-bearing); an EMPTY
+    # trace is hollow and never reconciled (#51), so use a real finding here.
+    result = _run(
+        json.dumps(
+            {
+                "findings": [
+                    {
+                        "name": "live",
+                        "classification": "load_bearing",
+                        "location": "a.py:1",
+                        "witness": {"value": 2.0},
+                        "evidence": "on path",
+                    }
+                ]
+            }
+        )
+    )
     assert isinstance(result, ReconciliationResult)
     assert not isinstance(result, VerifierResult)
     # ReconciliationResult must NOT be auto-truthy-folded the way VerifierResult is
@@ -546,9 +579,20 @@ def test_event_callback_failure_is_swallowed():
     def boom(_e):
         raise RuntimeError("observability must never break execution")
 
-    station = ReconciliationReview(
-        _StubAgent(json.dumps({"findings": []})), goal="g", event_callback=boom
+    reply = json.dumps(
+        {
+            "findings": [
+                {
+                    "name": "live",
+                    "classification": "load_bearing",
+                    "location": "a.py:1",
+                    "witness": {"value": 2.0},
+                    "evidence": "on path",
+                }
+            ]
+        }
     )
+    station = ReconciliationReview(_StubAgent(reply), goal="g", event_callback=boom)
     # Must not propagate the callback's exception.
     result = asyncio.run(station.execute())
     assert result.reconciled is True

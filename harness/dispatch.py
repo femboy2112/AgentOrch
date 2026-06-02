@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from agy_orchestrator.core.agent import AgentInstance
+from agy_orchestrator.core.agent import WATCHDOG_MARKER, AgentInstance
 from agy_orchestrator.core.calibration import append_live_row
 from agy_orchestrator.execution.graph_plan import (
     ChainPlan,
@@ -217,6 +217,24 @@ class DispatchResult:
     # conflict, resolution}, ...]}``. getattr-guarded off the workflow so a flat
     # plan / non-master mode leaves this None and meta.json is byte-identical.
     graph: Optional[Dict[str, Any]] = None
+    # Final-verifier observability (#55), present only when a --test-cmd verifier
+    # ran AND reached a converged result: ``{"verifier_duration_ms",
+    # "verifier_timeout_margin", "verifier_timeout_margin_pct",
+    # "verifier_margin_low", "verifier_oversubscribed"}``. None (and dropped from
+    # meta.json) when no verifier ran, so a non-gated run stays byte-identical.
+    verifier: Optional[Dict[str, Any]] = None
+    # Plan provenance (#56): the sha256 of the plan that this run actually used,
+    # so "what plan did run X execute?" is answerable after the fact and a
+    # hand-edit between a ``--plan-only`` emit and a ``--plan`` feed-back is
+    # detectable. Two shapes, both getattr/drop-guarded so a planner-driven run
+    # (no injected/emitted plan) leaves meta.json byte-identical:
+    #   * ``--plan-only`` emit  -> ``{"source": "emitted", "sha256": <hex>}``
+    #     (the hash of the freshly written runs/<id>/plan.json)
+    #   * ``--plan <file>`` feed -> ``{"source": <path>, "sha256": <hex>,
+    #     "matches_emitted": True|False|None}`` where matches_emitted compares the
+    #     loaded file's hash against an operator-supplied ``--plan-expect-sha``
+    #     pin (None = no pin given, so no comparison was made).
+    plan_provenance: Optional[Dict[str, Any]] = None
 
 
 def _decide_reconcile_status(
@@ -242,6 +260,21 @@ def _decide_reconcile_status(
     if disposition == "fail" and not verifier_green:
         return "skipped:verifier_not_green"
     return "run"
+
+
+def plan_file_sha256(path: Union[str, Path]) -> str:
+    """Return the sha256 (hex) of a plan file's raw bytes (#56).
+
+    Hashes the exact on-disk bytes the operator reviewed/edited — NOT a
+    re-serialized parse — so any byte-level hand-edit between a ``--plan-only``
+    emit and a ``--plan`` feed-back changes the digest. Raises ``ValueError``
+    with an operator-facing message if the file is missing (matching load_plan's
+    failure surface).
+    """
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ValueError(f"no such plan file: {path}")
+    return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
 def load_plan(path: Union[str, Path]) -> Plan:
@@ -523,6 +556,76 @@ def _derive_verifier_delta(
     if not baseline_ok and final_verified:
         return "fixed"
     return "unchanged"
+
+
+# A final verifier whose wall-clock left less than this fraction of its timeout
+# budget unused is flagged verifier_margin_low (#55a): the suite is close to the
+# wall-clock kill, so a slightly slower host / heavier change would TIME OUT (an
+# infra failure, not a code defect). 20% per the issue.
+_VERIFIER_MARGIN_FLOOR_PCT = 0.20
+
+# A final verifier that ran this many times SLOWER than the same suite's pre-run
+# baseline on the unchanged tree is flagged verifier_oversubscribed (#55c): the
+# code didn't get ~2x slower, the host did — almost always nested thread-pool /
+# xdist oversubscription. Conservative (a real 2x regression is rare) so the flag
+# stays meaningful.
+_VERIFIER_OVERSUBSCRIBE_FACTOR = 2.0
+
+
+def _verifier_telemetry(
+    final_result: Optional[VerifierResult],
+    *,
+    timeout_s: Optional[float],
+    baseline_result: Optional[VerifierResult],
+    run_id: str,
+) -> Dict[str, Any]:
+    """Final-verifier observability for meta.json + the friendly view (#55).
+
+    Returns {} when no verifier reached a converged result (so a non-gated run's
+    telemetry/meta.json is byte-identical). Otherwise records the FINAL verify's
+    wall-clock, the remaining timeout margin (and a low-margin warning), and a
+    suspected-oversubscription flag derived from the same-suite baseline."""
+    if final_result is None:
+        return {}
+    out: Dict[str, Any] = {
+        "verifier_duration_ms": final_result.duration_ms,
+        "verifier_timeout_margin": None,
+        "verifier_timeout_margin_pct": None,
+        "verifier_margin_low": None,
+        "verifier_oversubscribed": None,
+    }
+    # (a) timeout margin = timeout_budget - duration; warn when < 20% of budget.
+    if timeout_s and timeout_s > 0:
+        timeout_ms = timeout_s * 1000.0
+        margin_ms = round(timeout_ms - final_result.duration_ms)
+        margin_pct = margin_ms / timeout_ms
+        out["verifier_timeout_margin"] = margin_ms
+        out["verifier_timeout_margin_pct"] = round(margin_pct, 3)
+        out["verifier_margin_low"] = margin_pct < _VERIFIER_MARGIN_FLOOR_PCT
+        if out["verifier_margin_low"]:
+            logger.warning(
+                "Dispatch %s: verifier left only %.0f%% of its %.0fs timeout budget "
+                "unused (%dms of %dms) — a slightly slower host would TIME OUT. "
+                "Raise AGY_TEST_TIMEOUT or lighten the suite.",
+                run_id, margin_pct * 100, timeout_s,
+                final_result.duration_ms, round(timeout_ms),
+            )
+    # (c) oversubscription heuristic: FINAL duration >> baseline on the same suite.
+    if (baseline_result is not None
+            and not baseline_result.timeout
+            and baseline_result.duration_ms > 0
+            and not final_result.timeout):
+        ratio = final_result.duration_ms / baseline_result.duration_ms
+        oversub = ratio >= _VERIFIER_OVERSUBSCRIBE_FACTOR
+        out["verifier_oversubscribed"] = oversub
+        if oversub:
+            logger.warning(
+                "Dispatch %s: final verifier ran %.1fx slower than the same-suite "
+                "baseline (%dms vs %dms) — suspected oversubscription (nested "
+                "thread-pool / xdist). Check -n and BLAS thread pins.",
+                run_id, ratio, final_result.duration_ms, baseline_result.duration_ms,
+            )
+    return out
 
 
 def _build_role_agent_compat(
@@ -974,6 +1077,41 @@ async def _run_workflow(
     raise ValueError(f"unknown mode: {mode}")
 
 
+# Substring in a recon agent's stderr that the FallbackAgent writes when its whole
+# provider chain is spent (see fallback_agent.py's "All N fallback attempts
+# exhausted" RuntimeError text — which, when caught + folded into stderr rather than
+# re-raised, leaves this marker). A trace that ends here returned a degenerate reply,
+# not a real verdict.
+_FALLBACK_EXHAUSTED_MARKER = "fallback attempts exhausted"
+
+
+def _detect_recon_starvation(recon_agent: AgentInstance) -> Optional[str]:
+    """Return a starvation slug iff the trace agent was killed/exhausted (#59).
+
+    A recon agent can return WITHOUT raising yet have produced only a degenerate
+    reply because its watchdog tripped (``_watchdog_reason``) or its own fallback
+    chain was exhausted (a ``[watchdog:...]`` marker / "fallback attempts exhausted"
+    in stderr). Such a trace is HOLLOW regardless of how the parse landed: it must
+    set ``reconcile_status=ran:critic_starved`` and never contribute reconciled=true.
+
+    Returns the slug (a watchdog reason like "stalled"/"verbose", or
+    "fallback_exhausted"), or None when the agent ran to a real completion.
+    """
+    reason = getattr(recon_agent, "_watchdog_reason", None)
+    if reason:
+        return str(reason)
+    stderr = str(getattr(recon_agent, "stderr", "") or "")
+    if WATCHDOG_MARKER in stderr:
+        # A FallbackAgent copies the sub's stderr (carrying its watchdog marker) up
+        # on a success-shaped return; pull the slug the same way fallback_agent does.
+        head = stderr.split(WATCHDOG_MARKER, 1)[1]
+        slug = head.split("]", 1)[0].strip()
+        return slug or "watchdog"
+    if _FALLBACK_EXHAUSTED_MARKER in stderr:
+        return "fallback_exhausted"
+    return None
+
+
 async def _run_reconciliation(
     *,
     run_id: str,
@@ -986,6 +1124,8 @@ async def _run_reconciliation(
     post_construct_hook: Optional[roles.RolePostConstructHook],
     working_directory: str,
     disposition: str,
+    ablation_cmd: Optional[str] = None,
+    ablation_cmd_map: Optional[Dict[str, str]] = None,
 ) -> "ReconciliationResult":  # type: ignore[name-defined]
     """Build an independent reviewer and run the reconciliation station (#43).
 
@@ -1010,6 +1150,8 @@ async def _run_reconciliation(
         goal=goal,
         working_directory=working_directory,
         disposition=disposition,
+        ablation_cmd=ablation_cmd,
+        ablation_cmd_map=ablation_cmd_map,
         event_callback=EVENT_BUS.publisher_for(
             run_id,
             worker="reconcile",
@@ -1017,7 +1159,20 @@ async def _run_reconciliation(
             effort=str(getattr(recon_agent, "effort", "n/a") or "n/a"),
         ),
     )
-    return await station.execute()
+    result = await station.execute()
+    # #59: a recon agent that DIDN'T raise can still have been killed/exhausted
+    # (watchdog trip or fallback-chain exhaustion) and so returned a degenerate
+    # reply. Inspect its post-run telemetry; a starved trace is HOLLOW — mark it so
+    # it sets reconcile_status=ran:critic_starved and can't bless dead wiring.
+    starved = _detect_recon_starvation(recon_agent)
+    if starved is not None:
+        logger.warning(
+            "Reconciliation %s: trace agent starved (%s) — verdict is hollow, "
+            "not reconciled.",
+            run_id, starved,
+        )
+        result.mark_starved(starved)
+    return result
 
 
 def _build_telegram_notifier(
@@ -1094,6 +1249,12 @@ async def dispatch_async(
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
     plan_steps: Optional[List[str]] = None,
+    # Plan provenance (#56): when --plan injected a file, ``plan_source`` is its
+    # path (recorded + hashed into meta.json) and ``plan_expect_sha`` is an
+    # optional hard pin — a mismatch is refused BEFORE any worker runs. Both None
+    # on a planner-driven (non-injected) run, leaving meta.json byte-identical.
+    plan_source: Optional[Union[str, Path]] = None,
+    plan_expect_sha: Optional[str] = None,
     # Graph execution (docs §5 M3): an operator-supplied dependency DAG +
     # concurrency caps for the master graph walker. plan_graph routes to the
     # frontier scheduler when it has non-linear deps; max_parallel_nodes bounds
@@ -1137,6 +1298,12 @@ async def dispatch_async(
     # Reconciliation / Integration-Skeptic station (#43)
     reconcile: bool = False,
     reconcile_disposition: Optional[str] = None,
+    # Programmatic ablation-witness hook (#52). OPT-IN: a witness command template
+    # (``<cmd> {MECH}``) the reconcile station runs READ-ONLY in a throwaway worktree
+    # to MEASURE each mechanism's load-bearing delta instead of trusting the model's
+    # self-report. None => byte-identical to the self-report path.
+    ablation_cmd: Optional[str] = None,
+    ablation_cmd_map: Optional[Dict[str, str]] = None,
     # Step 12: computer-use worker params (forwarded to adapter when generator=computer-use)
     # Step 10: real-gui harness wiring (flags only; absent keeps cu_req construction byte-identical)
     computer_use_mode: Optional[str] = None,
@@ -1249,6 +1416,30 @@ async def dispatch_async(
     run_dir.mkdir(parents=True, exist_ok=True)
     events_path = run_dir / "events.jsonl"
     events_path.touch()
+
+    # Plan provenance (#56): when --plan injected a file, hash its raw bytes and
+    # record where it came from so the executed plan is auditable after the fact.
+    # An optional --plan-expect-sha pin is a HARD gate for unattended dispatch:
+    # a mismatch is refused here, BEFORE any worker writes. ``matches_emitted``
+    # reflects that comparison (None when no pin was supplied).
+    plan_provenance: Optional[Dict[str, Any]] = None
+    if plan_source is not None:
+        loaded_sha = plan_file_sha256(plan_source)
+        matches_emitted: Optional[bool] = None
+        if plan_expect_sha is not None:
+            matches_emitted = loaded_sha == plan_expect_sha.strip().lower()
+            if not matches_emitted:
+                raise ValueError(
+                    f"plan sha256 mismatch: --plan {plan_source} hashes to "
+                    f"{loaded_sha} but --plan-expect-sha pinned "
+                    f"{plan_expect_sha.strip().lower()}; refusing to run "
+                    f"(the plan was edited since it was reviewed)"
+                )
+        plan_provenance = {
+            "source": str(plan_source),
+            "sha256": loaded_sha,
+            "matches_emitted": matches_emitted,
+        }
 
     # The run monitor (#40) is constructed below but referenced from _sink so it
     # can observe run-level forward progress on every event. Use a 1-slot holder
@@ -1415,6 +1606,14 @@ async def dispatch_async(
         if _mem_cap:
             _vkwargs["mem_max"] = _mem_cap
         verifier = QualityVerifier(**_vkwargs)
+        # #60: give the verifier a place to persist a per-iteration failure log
+        # and a bus to emit failing-test nodeids on, so a thrashing step is
+        # diagnosable post-hoc and visible in events.jsonl. Both opt-in attrs;
+        # unset they leave the verifier byte-identical.
+        verifier.run_dir = str(run_dir)
+        verifier.event_callback = EVENT_BUS.publisher_for(
+            run_id, worker="verifier", model="n/a", effort="n/a",
+        )
     else:
         verifier = None
     baseline_result: Optional[VerifierResult] = None
@@ -1538,8 +1737,15 @@ async def dispatch_async(
                         post_construct_hook=_post_construct_hook,
                         working_directory=str(work_dir),
                         disposition=recon_disposition,
+                        ablation_cmd=ablation_cmd,
+                        ablation_cmd_map=ablation_cmd_map,
                     )
-                    reconcile_status = "ran"
+                    # #51/#59: reconcile_status reflects the RESULT, not merely a
+                    # non-exception return. A hollow trace (no JSON parsed, zero
+                    # mechanisms traced, or a starved/exhausted critic chain) records
+                    # a ran:* variant that callers + the friendly view surface as a
+                    # distinct AMBER state rather than a green "ran".
+                    reconcile_status = reconciliation_result.substance_status()
                 except Exception as rexc:  # best-effort: never fail a good build
                     reconcile_status = "error:" + type(rexc).__name__
                     logger.warning("Reconciliation station errored (continuing): %s: %s",
@@ -1614,6 +1820,19 @@ async def dispatch_async(
                 wall_ms_value = float(agent_wall)
             watchdog_reason_value = getattr(agent_for_telemetry, "_watchdog_reason", None)
 
+    # #55: surface the FINAL converged verifier's wall-clock + timeout margin (and
+    # a suspected-oversubscription flag) for the run ledger / friendly view. The
+    # verifier records its last result; absent a verifier (or a run that never
+    # reached the gate) every field is None and meta.json's shape is unchanged
+    # except for these always-present keys (the issue asks them to be recorded).
+    final_vr = getattr(verifier, "last_result", None) if verifier is not None else None
+    verifier_telemetry = _verifier_telemetry(
+        final_vr,
+        timeout_s=getattr(verifier, "timeout", None) if verifier is not None else None,
+        baseline_result=baseline_result,
+        run_id=run_id,
+    )
+
     telemetry = {
         "wall_ms": wall_ms_value,
         "out_bytes": out_bytes_value,
@@ -1625,6 +1844,7 @@ async def dispatch_async(
         "baseline_error_hash": baseline_result.error_hash if baseline_result is not None else None,
         "baseline_duration_ms": baseline_result.duration_ms if baseline_result is not None else None,
         "verifier_delta": verifier_delta,
+        **verifier_telemetry,
     }
 
     # Quality-cost ledger (task #9): how much to trust this run.
@@ -1670,10 +1890,21 @@ async def dispatch_async(
         dead = reconciliation_result.findings()
         if reconciliation_result.should_fail_run:
             success = False
-            recon_err = (
-                f"reconciliation failed: {len(dead)} exists-but-not-load-bearing "
-                f"finding(s) (" + ", ".join(f"{f.name}:{f.sub_kind}" for f in dead) + ")"
-            )
+            if not reconciliation_result.is_substantive:
+                # #51/#59: a hollow trace (starved critic, unparseable reply, or an
+                # empty trace) is not reconciled, so a fail disposition flips the run
+                # — but it failed because the gate never RAN, not on a dead-wiring
+                # finding. Name the hollow reason instead of "0 findings".
+                recon_err = (
+                    f"reconciliation did not verify "
+                    f"({reconciliation_result.substance_status()}): the trace was "
+                    f"hollow, so the run cannot pass the fail-disposition gate"
+                )
+            else:
+                recon_err = (
+                    f"reconciliation failed: {len(dead)} exists-but-not-load-bearing "
+                    f"finding(s) (" + ", ".join(f"{f.name}:{f.sub_kind}" for f in dead) + ")"
+                )
             error = f"{error}; {recon_err}" if error else recon_err
         elif dead:
             logger.warning(
@@ -1735,6 +1966,13 @@ async def dispatch_async(
                 ),
                 encoding="utf-8",
             )
+        # Plan provenance (#56): hash the freshly emitted plan.json so the
+        # operator can pin it with --plan-expect-sha when feeding it back, and so
+        # "which plan did this --plan-only run emit?" is answerable from meta.json.
+        plan_provenance = {
+            "source": "emitted",
+            "sha256": plan_file_sha256(run_dir / "plan.json"),
+        }
 
     # Graph-execution summary for meta.json (docs §5 M5). Read the graph
     # observability off the master workflow (pat wraps one in .master_workflow).
@@ -1829,6 +2067,8 @@ async def dispatch_async(
         reconciliation=reconciliation,
         reconcile_status=reconcile_status,
         graph=graph_meta,
+        verifier=(verifier_telemetry or None),
+        plan_provenance=plan_provenance,
     )
     meta_dict = asdict(result)
     # The graph-execution summary is present ONLY for a graph DAG run; honor the
@@ -1839,6 +2079,16 @@ async def dispatch_async(
     # are NOT dropped here.)
     if meta_dict.get("graph") is None:
         meta_dict.pop("graph", None)
+    # Final-verifier observability (#55) follows the same drop-when-absent contract
+    # as graph: a run without a verifier (or one that never converged a result)
+    # leaves meta.json byte-identical to the pre-#55 shape.
+    if meta_dict.get("verifier") is None:
+        meta_dict.pop("verifier", None)
+    # Plan provenance (#56) follows the same drop-when-absent contract: a
+    # planner-driven run (no --plan-only emit, no --plan injection) leaves
+    # meta.json byte-identical to the pre-#56 shape.
+    if meta_dict.get("plan_provenance") is None:
+        meta_dict.pop("plan_provenance", None)
     (run_dir / "meta.json").write_text(
         json.dumps(meta_dict, indent=2), encoding="utf-8"
     )
@@ -1878,6 +2128,8 @@ def dispatch(
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
     plan_steps: Optional[List[str]] = None,
+    plan_source: Optional[Union[str, Path]] = None,
+    plan_expect_sha: Optional[str] = None,
     plan_graph: Optional[GraphPlan] = None,
     max_parallel_nodes: Optional[int] = None,
     verifier_concurrency: int = 1,
@@ -1905,6 +2157,9 @@ def dispatch(
     baseline_gate: bool = False,
     reconcile: bool = False,
     reconcile_disposition: Optional[str] = None,
+    # Programmatic ablation-witness hook (#52); see dispatch_async.
+    ablation_cmd: Optional[str] = None,
+    ablation_cmd_map: Optional[Dict[str, str]] = None,
     # Step 12: forwarded for computer-use adapter (see dispatch_async)
     # Step 10: real-gui harness flags (passed through only when present; non-real paths identical)
     computer_use_mode: Optional[str] = None,
@@ -1941,6 +2196,8 @@ def dispatch(
             allow_paths=allow_paths,
             plan_only=plan_only,
             plan_steps=plan_steps,
+            plan_source=plan_source,
+            plan_expect_sha=plan_expect_sha,
             plan_graph=plan_graph,
             max_parallel_nodes=max_parallel_nodes,
             verifier_concurrency=verifier_concurrency,
@@ -1967,6 +2224,8 @@ def dispatch(
             baseline_gate=baseline_gate,
             reconcile=reconcile,
             reconcile_disposition=reconcile_disposition,
+            ablation_cmd=ablation_cmd,
+            ablation_cmd_map=ablation_cmd_map,
             computer_use_mode=computer_use_mode,
             computer_use_task_priority=computer_use_task_priority,
             computer_use_budgets=computer_use_budgets,

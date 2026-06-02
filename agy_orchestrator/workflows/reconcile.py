@@ -36,6 +36,7 @@ parsing; the only non-determinism is the single LLM call (which tests mock).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -123,10 +124,16 @@ class Witness:
     component was ablated. ``value == 0`` => dead wiring (surface loudly);
     ``value > 0`` with a low metric => legitimately incomplete (acceptable).
     ``description`` is the agent's prose for what it observed.
+
+    ``measured`` is False for the LLM's self-reported witness (the default) and
+    True once a programmatic ``--ablation-cmd`` run has REPLACED ``value`` with a
+    real with/without-component delta (#52). A measured witness is trusted over
+    the model's self-report; an unmeasured one is only a claim.
     """
 
     value: float = 0.0
     description: str = ""
+    measured: bool = False
 
     @property
     def is_dead(self) -> bool:
@@ -177,6 +184,65 @@ class ReconciliationResult:
     disposition: str = "warn"
     raw: str = ""
     parse_error: Optional[str] = None
+    # The recon agent's trace was killed/exhausted (watchdog trip or fallback-chain
+    # exhaustion) before it could produce a real trace (#59). A starved trace is
+    # HOLLOW — it carries no substance, so it must never bless dead wiring as
+    # reconciled. ``starved_reason`` is the slug (e.g. "stalled", "fallback_exhausted")
+    # for logs / the substance status; None when the trace ran to completion.
+    starved_reason: Optional[str] = None
+
+    def mark_starved(self, reason: str) -> "ReconciliationResult":
+        """Flag this verdict HOLLOW because the trace agent was starved (#59).
+
+        Records ``starved_reason`` AND forces ``reconciled=False`` regardless of how
+        the parse landed: a killed/exhausted critic chain that happened to emit a
+        well-formed (or empty) JSON blob must never read as "all clear". Returns
+        ``self`` for chaining. ``reason`` must be a non-empty slug.
+        """
+        self.starved_reason = reason or "critic_starved"
+        self.reconciled = False
+        return self
+
+    @property
+    def is_starved(self) -> bool:
+        """True iff the recon agent was killed/exhausted before it could trace (#59)."""
+        return self.starved_reason is not None
+
+    @property
+    def is_substantive(self) -> bool:
+        """True iff this trace actually examined mechanisms (#51).
+
+        A reconcile is substantive only when it parsed cleanly, was not starved,
+        and traced at least one mechanism. The hollow variants — a quota-walled /
+        watchdog-killed critic (``starved``), an unparseable reply (``parse_error``),
+        or a clean-but-empty trace (zero mechanisms) — are NOT substantive and must
+        not contribute ``reconciled=true``.
+        """
+        return (
+            not self.is_starved
+            and self.parse_error is None
+            and len(self.findings_list) >= 1
+        )
+
+    def substance_status(self) -> str:
+        """Classify the RESULT into a reconcile_status variant (#51 / #59).
+
+        Returns one of (most-degenerate first):
+          * ``ran:critic_starved`` — the trace agent was killed/exhausted (#59);
+          * ``ran:parse_error``    — the reply carried no parseable verdict;
+          * ``ran:empty``          — parsed cleanly but zero mechanisms traced;
+          * ``ran:<N>_findings``   — parsed cleanly and traced N>=1 mechanisms.
+
+        The non-``ran:<N>_findings`` variants are HOLLOW (not substantive): CI on
+        such a run is green on a reconcile that never traced a mechanism.
+        """
+        if self.is_starved:
+            return "ran:critic_starved"
+        if self.parse_error is not None:
+            return "ran:parse_error"
+        if not self.findings_list:
+            return "ran:empty"
+        return f"ran:{len(self.findings_list)}_findings"
 
     def findings(self) -> List[MechanismFinding]:
         """The DEAD-wired findings (``exists_not_load_bearing``) — the actionable set.
@@ -215,6 +281,12 @@ class ReconciliationResult:
             "verdict": self.verdict,
             "disposition": self.disposition,
             "parse_error": self.parse_error,
+            # #51/#59: whether this trace actually examined mechanisms, and the
+            # substance variant (ran:<N>_findings / ran:empty / ran:parse_error /
+            # ran:critic_starved). A reader can gate on these without re-deriving.
+            "substantive": self.is_substantive,
+            "substance_status": self.substance_status(),
+            "starved_reason": self.starved_reason,
             "findings": [
                 {
                     "name": f.name,
@@ -224,6 +296,7 @@ class ReconciliationResult:
                     "witness": {
                         "value": f.witness.value,
                         "description": f.witness.description,
+                        "measured": f.witness.measured,
                     },
                     "evidence": f.evidence,
                 }
@@ -295,6 +368,36 @@ def _coerce_float(value: Any) -> float:
             except ValueError:
                 return 0.0
     return 0.0
+
+
+# A witness command reports its signal as a number on stdout — by convention the
+# LAST numeric token (so a verbose harness can log freely and still emit the metric
+# last). ``WITNESS:<n>`` is honored first when present so a command can be explicit.
+_WITNESS_TAG_RE = re.compile(r"WITNESS:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _parse_witness_signal(stdout: str) -> Optional[float]:
+    """Extract the numeric witness signal a witness command emitted on stdout.
+
+    Prefers an explicit ``WITNESS:<n>`` tag (last occurrence wins so a re-run that
+    prints progress can still pin the metric); otherwise falls back to the LAST
+    bare number in the output. Returns None when no number is present at all (so
+    the caller can tell "ran but emitted no signal" apart from "signal == 0").
+    """
+    tags = _WITNESS_TAG_RE.findall(stdout or "")
+    if tags:
+        try:
+            return float(tags[-1])
+        except ValueError:
+            pass
+    nums = _NUMBER_RE.findall(stdout or "")
+    if nums:
+        try:
+            return float(nums[-1])
+        except ValueError:
+            return None
+    return None
 
 
 def _parse_witness(raw: Any) -> Witness:
@@ -384,6 +487,21 @@ class ReconciliationReview:
         event_callback: optional, no-op-safe lifecycle sink (mirrors adversarial.py).
         max_iterations: kept for signature symmetry; the trace is a single pass, so
             values > 1 do not loop (the station is deterministic given the reply).
+        ablation_cmd: optional programmatic ablation-witness template (#52). When
+            given, the station MEASURES each mechanism's load-bearing witness instead
+            of trusting the model's self-report: it runs the command twice in a
+            throwaway worktree (once clean, once with ``AGY_ABLATE=<mech>`` set so the
+            project disables that component) and records the real signal delta in
+            ``Witness.value``. The template may contain ``{MECH}`` (substituted with
+            the mechanism name); whatever the command emits as its last number (or a
+            ``WITNESS:<n>`` tag) is the signal. Read-only: it never mutates the build
+            tree. None (default) => byte-identical to the pre-#52 self-report path.
+        ablation_cmd_map: optional ``{mechanism_name: cmd}`` override map; a mechanism
+            listed here uses its own witness command instead of ``ablation_cmd``.
+        ablation_timeout: per-command wall-clock cap in seconds for a witness run
+            (each of the clean + ablated runs); None => AGY_ABLATION_TIMEOUT or 600.
+        prefer_worktree: forwarded to the throwaway-workspace isolation (clean repos
+            get a fast git worktree; dirty/non-git fall back to a copy).
     """
 
     def __init__(
@@ -396,6 +514,10 @@ class ReconciliationReview:
         diff: Optional[str] = None,
         event_callback: Optional[Callable[[dict], None]] = None,
         max_iterations: int = 1,
+        ablation_cmd: Optional[str] = None,
+        ablation_cmd_map: Optional[Dict[str, str]] = None,
+        ablation_timeout: Optional[float] = None,
+        prefer_worktree: bool = True,
     ):
         if disposition not in DISPOSITIONS:
             raise ValueError(
@@ -409,9 +531,23 @@ class ReconciliationReview:
         self.diff = diff
         self.event_callback = event_callback
         self.max_iterations = max_iterations
+        # Programmatic ablation-witness hook (#52). OPT-IN: None leaves the station
+        # byte-identical to the LLM-self-report path.
+        self.ablation_cmd = ablation_cmd or None
+        self.ablation_cmd_map = dict(ablation_cmd_map or {})
+        if ablation_timeout is None:
+            import os
+            ablation_timeout = float(os.environ.get("AGY_ABLATION_TIMEOUT", "600") or 0)
+        self.ablation_timeout = ablation_timeout
+        self.prefer_worktree = prefer_worktree
         # Populated by execute() for the run ledger / dashboard.
         self.result: Optional[ReconciliationResult] = None
         self.reconciled: Optional[bool] = None
+
+    @property
+    def ablation_enabled(self) -> bool:
+        """True iff a programmatic ablation witness is configured (#52)."""
+        return bool(self.ablation_cmd or self.ablation_cmd_map)
 
     # --- event plumbing (no-op-safe; mirrors adversarial.py) -------------------
     def _emit_orchestration(self, **fields) -> None:
@@ -481,9 +617,11 @@ class ReconciliationReview:
 
         # reconciled is DERIVED from the findings, not trusted from the model.
         reconciled = not any(f.is_dead for f in findings)
-        # A reply we couldn't parse is NOT reconciled-by-default: an unreadable
-        # verdict must not silently pass as "all clear".
-        if parse_error is not None and not findings:
+        # A HOLLOW reply must not silently pass as "all clear" (#51): neither an
+        # unparseable verdict NOR a clean-but-EMPTY trace (zero mechanisms examined)
+        # may contribute reconciled=true. Only a trace that actually examined >= 1
+        # mechanism and found no dead wiring earns reconciled=true.
+        if not findings:
             reconciled = False
 
         return ReconciliationResult(
@@ -493,6 +631,166 @@ class ReconciliationReview:
             raw=reply,
             parse_error=parse_error,
         )
+
+    def _ablation_cmd_for(self, mechanism: str) -> Optional[str]:
+        """The witness command to run for ``mechanism`` (#52), or None.
+
+        A per-mechanism entry in ``ablation_cmd_map`` wins over the shared
+        ``ablation_cmd`` template; ``{MECH}`` (and ``{mech}``) is substituted with
+        the mechanism name in either."""
+        template = self.ablation_cmd_map.get(mechanism) or self.ablation_cmd
+        if not template:
+            return None
+        return template.replace("{MECH}", mechanism).replace("{mech}", mechanism)
+
+    async def _run_witness(
+        self, cmd: str, cwd: str, ablate: Optional[str]
+    ) -> Optional[float]:
+        """Run ONE witness command in ``cwd`` and return its numeric signal (#52).
+
+        When ``ablate`` is set, ``AGY_ABLATE=<mechanism>`` is added to the child env
+        so a project that honors the flag disables that component for this run. The
+        signal is the last number (or a ``WITNESS:<n>`` tag) the command prints on
+        stdout; None when it fails, times out, or emits no number — the caller treats
+        a missing signal as "could not measure", NOT as 0."""
+        import os
+        env = dict(os.environ)
+        if ablate:
+            env["AGY_ABLATE"] = ablate
+        else:
+            # Never leak an outer AGY_ABLATE into the clean baseline run.
+            env.pop("AGY_ABLATE", None)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd, env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            comm = proc.communicate()
+            if self.ablation_timeout and self.ablation_timeout > 0:
+                out, _err = await asyncio.wait_for(comm, self.ablation_timeout)
+            else:
+                out, _err = await comm
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), 5)
+            except Exception:
+                pass
+            logger.warning(
+                "Ablation witness timed out after %ss (ablate=%s): %s",
+                self.ablation_timeout, ablate, cmd,
+            )
+            return None
+        except Exception as exc:
+            logger.warning("Ablation witness failed to launch (ablate=%s): %s — %s",
+                           ablate, cmd, exc)
+            return None
+        return _parse_witness_signal(out.decode(errors="replace"))
+
+    async def _measure_finding(self, finding: MechanismFinding, cwd: str) -> None:
+        """Measure ``finding``'s real ablation delta in ``cwd`` and reconcile it (#52).
+
+        Runs the mechanism's witness command twice — clean, then with
+        ``AGY_ABLATE=<name>`` — and writes the absolute signal delta into
+        ``finding.witness.value`` (marking it ``measured``). When the model CLAIMED
+        the mechanism load-bearing (or reported a positive witness) but the
+        measurement shows the signal did NOT move (delta == 0), the finding is
+        flipped to ``exists_not_load_bearing`` and logged loudly — the measurement
+        overrides the self-report. A run that can't produce a number on both passes
+        is left as the model reported it (we don't have a contradicting measurement)."""
+        cmd = self._ablation_cmd_for(finding.name)
+        if not cmd:
+            return
+        claimed_load_bearing = (
+            finding.classification == "load_bearing" or finding.witness.value > 0
+        )
+        baseline = await self._run_witness(cmd, cwd, ablate=None)
+        ablated = await self._run_witness(cmd, cwd, ablate=finding.name)
+        if baseline is None or ablated is None:
+            logger.warning(
+                "Ablation witness for %r produced no measurable signal "
+                "(baseline=%s, ablated=%s); keeping the self-reported witness.",
+                finding.name, baseline, ablated,
+            )
+            return
+
+        delta = abs(baseline - ablated)
+        finding.witness.value = delta
+        finding.witness.measured = True
+        finding.witness.description = (
+            f"measured ablation delta {delta:g} "
+            f"(baseline={baseline:g}, ablated[{finding.name}]={ablated:g})"
+        )
+        self._emit_orchestration(
+            phase="reconcile",
+            action="ablation_measured",
+            mechanism=finding.name,
+            measured_delta=delta,
+        )
+
+        if claimed_load_bearing and delta == 0:
+            # Model said it moves; measurement says it doesn't. Trust the
+            # measurement: this is dead wiring masquerading as load-bearing.
+            logger.warning(
+                "Ablation MISMATCH for %r: model reported load-bearing but the "
+                "measured signal did not move (delta=0, baseline=ablated=%g). "
+                "Flipping finding to exists_not_load_bearing.",
+                finding.name, baseline,
+            )
+            finding.classification = "exists_not_load_bearing"
+            if finding.sub_kind is None:
+                finding.sub_kind = "uncalled"
+            self._emit_orchestration(
+                phase="reconcile",
+                action="ablation_mismatch",
+                mechanism=finding.name,
+                measured_delta=delta,
+            )
+
+    async def _apply_ablation_witnesses(
+        self, result: ReconciliationResult
+    ) -> ReconciliationResult:
+        """Measure every finding's witness in a throwaway worktree, then re-derive.
+
+        Read-only w.r.t. the build tree: the witness commands run inside an isolated
+        ``candidate_workspace`` copy/worktree, never the live ``working_directory``.
+        After measuring, ``reconciled`` is recomputed because a mismatch may have
+        flipped a finding to dead. The whole step is best-effort: a workspace or
+        command failure logs and leaves the self-reported verdict untouched."""
+        if not self.ablation_enabled or not result.findings_list:
+            return result
+        # Lazy import: agy_orchestrator.execution is a peer; keep reconcile importable
+        # even where the isolation backend's deps (git) are unusual.
+        from agy_orchestrator.execution.workspace import candidate_workspace
+
+        try:
+            async with candidate_workspace(
+                self.working_directory,
+                candidate_id="ablate",
+                prefer_worktree=self.prefer_worktree,
+            ) as (ws_path, _backend):
+                for finding in result.findings_list:
+                    try:
+                        await self._measure_finding(finding, str(ws_path))
+                    except Exception as exc:  # one bad witness can't sink the rest
+                        logger.warning(
+                            "Ablation measurement raised for %r (continuing): %s",
+                            finding.name, exc,
+                        )
+        except Exception as exc:  # best-effort: never fail a build on the witness hook
+            logger.warning(
+                "Ablation-witness workspace failed (%s); keeping self-reported "
+                "witnesses.", exc,
+            )
+            return result
+
+        # A flip to dead may have changed the verdict; re-derive it the same way
+        # parse() does (a hollow/empty trace still cannot read as reconciled).
+        result.reconciled = bool(result.findings_list) and not any(
+            f.is_dead for f in result.findings_list
+        )
+        return result
 
     async def execute(self) -> ReconciliationResult:
         """Run the single trace pass and return the distinct verdict object."""
@@ -513,6 +811,13 @@ class ReconciliationReview:
         self.agent.prompt = self.build_prompt()
         reply = await self.agent.run_async()
         result = self.parse(reply)
+
+        # Programmatic ablation-witness hook (#52): when a witness command is
+        # configured, MEASURE each mechanism's load-bearing signal in a throwaway
+        # worktree and cross-check the model's self-report. Opt-in + best-effort; a
+        # no-op when no command is set, so the verdict is byte-identical otherwise.
+        if self.ablation_enabled:
+            result = await self._apply_ablation_witnesses(result)
 
         self.result = result
         self.reconciled = result.reconciled

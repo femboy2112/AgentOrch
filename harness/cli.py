@@ -78,9 +78,19 @@ def _print_result(result) -> None:
     if rec:
         dead = [f for f in rec.get("findings", [])
                 if f.get("classification") == "exists_not_load_bearing"]
-        col = C_GREEN if rec.get("reconciled") else C_RED
-        print(f"  {col}reconcile : {rec.get('verdict')} "
-              f"({len(dead)} exists-but-not-load-bearing){C_RESET}")
+        # #51/#59: a HOLLOW trace (starved critic, unparseable reply, or an empty
+        # trace that examined zero mechanisms) is neither green nor red — it's AMBER:
+        # the station ran but did not actually verify, so it must not read as a clean
+        # "reconciled". ``substantive`` is False for every ran:* hollow variant.
+        substantive = rec.get("substantive", True)
+        if not substantive:
+            status = rec.get("substance_status") or rec.get("verdict")
+            print(f"  {C_YELLOW}reconcile : hollow ({status}) — did not verify; "
+                  f"not reconciled{C_RESET}")
+        else:
+            col = C_GREEN if rec.get("reconciled") else C_RED
+            print(f"  {col}reconcile : {rec.get('verdict')} "
+                  f"({len(dead)} exists-but-not-load-bearing){C_RESET}")
         for f in dead[:10]:
             loc = f.get("location") or "?"
             print(f"    {C_RED}⚠ {f.get('name')} [{f.get('sub_kind')}] {loc}{C_RESET}")
@@ -159,6 +169,13 @@ def _cmd_do(args) -> int:
         return 1
     plan_file = plan_path or plan_graph_path
     strict_graph = plan_graph_path is not None
+    if getattr(args, "plan_expect_sha", None) and not plan_file:
+        print(
+            f"{C_RED}--plan-expect-sha requires --plan or --plan-graph (it pins "
+            f"the injected plan file's hash){C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
     if plan_file:
         if getattr(args, "plan_only", False):
             print(
@@ -210,6 +227,23 @@ def _cmd_do(args) -> int:
                 file=sys.stderr,
             )
             return 1
+        # Plan provenance pin (#56): when --plan-expect-sha is supplied, refuse
+        # fast at the CLI on a hash mismatch (a hand-edit since the reviewed emit)
+        # so the error surfaces here, not deep in the dispatch. dispatch_async
+        # re-checks as a backstop; matching here keeps the message operator-facing.
+        plan_expect_sha = getattr(args, "plan_expect_sha", None)
+        if plan_expect_sha:
+            from harness.dispatch import plan_file_sha256
+            actual_sha = plan_file_sha256(plan_file)
+            if actual_sha != plan_expect_sha.strip().lower():
+                print(
+                    f"{C_RED}plan sha256 mismatch: {plan_file} hashes to "
+                    f"{actual_sha} but --plan-expect-sha pinned "
+                    f"{plan_expect_sha.strip().lower()}; refusing to run "
+                    f"(the plan was edited since it was reviewed){C_RESET}",
+                    file=sys.stderr,
+                )
+                return 1
         print(
             f"{C_YELLOW}note: executing supplied {shape} ({len(plan_steps)} "
             f"step(s)) from {plan_file}; the planner is skipped{C_RESET}",
@@ -289,6 +323,8 @@ def _cmd_do(args) -> int:
         allow_paths=[g for g in (args.allow_paths or "").split(",") if g.strip()] or None,
         plan_only=getattr(args, "plan_only", False),
         plan_steps=plan_steps,
+        plan_source=plan_file,
+        plan_expect_sha=getattr(args, "plan_expect_sha", None),
         plan_graph=plan_graph,
         max_parallel_nodes=max_parallel_nodes,
         merge_policy=getattr(args, "merge_policy", "reconcile"),
@@ -314,6 +350,7 @@ def _cmd_do(args) -> int:
         baseline_gate=args.baseline_gate,
         reconcile=args.reconcile,
         reconcile_disposition=args.reconcile_disposition,
+        ablation_cmd=getattr(args, "ablation_cmd", None),
         web_search=args.web_search,
         mission_critical=args.mission_critical,
         spec=spec_text,
@@ -506,6 +543,13 @@ def main(argv=None) -> int:
                          "graph 'nodes' DAG (errors on a flat plan). Runs the "
                          "concurrent frontier scheduler. Graphs are master-only "
                          "for v1. Mutually exclusive with --plan / --plan-only.")
+    do.add_argument("--plan-expect-sha", type=str, default=None, metavar="SHA256",
+                    help="with --plan/--plan-graph: REFUSE to run unless the plan "
+                         "file's sha256 matches this hash (a hard pin for "
+                         "unattended dispatch — catches a hand-edit between the "
+                         "--plan-only emit and the --plan feed-back). The emitted "
+                         "plan's sha256 is recorded in meta.json (plan_provenance). "
+                         "Default (no flag): record provenance, do not gate.")
     do.add_argument("--max-parallel-nodes", type=int, default=None, metavar="N",
                     help="master: cap how many DAG nodes run concurrently when "
                          "executing a graph plan (env AGY_MAX_PARALLEL_NODES; "
@@ -633,6 +677,17 @@ def main(argv=None) -> int:
                      help="What a non-reconciled verdict does: 'warn' (default — report "
                           "loudly + artifact, don't fail), 'fail' (flip the run to failed), "
                           "'open-task' (warn + recommend a follow-up build task).")
+    rec.add_argument("--ablation-cmd", type=str, default=None, metavar="'CMD {MECH}'",
+                     help="OPT-IN programmatic ablation witness (#52): a shell command "
+                          "the reconcile station runs READ-ONLY in a throwaway worktree to "
+                          "MEASURE each mechanism's load-bearing signal instead of trusting "
+                          "the model's self-report. Run twice per mechanism (clean, then "
+                          "with AGY_ABLATE=<mech> set so the project disables it); the last "
+                          "number it prints (or a WITNESS:<n> tag) is the signal, and the "
+                          "with/without delta is recorded in the witness. A 'moved' claim "
+                          "with a measured delta of 0 flips the finding to "
+                          "exists-not-load-bearing. '{MECH}' is replaced with each "
+                          "mechanism name. Off by default (self-report path unchanged).")
     do.add_argument("--web-search", action="store_true",
                     help="Enable codex web search (-c tools.web_search=true) for accuracy")
     do.add_argument("--mission-critical", action="store_true",

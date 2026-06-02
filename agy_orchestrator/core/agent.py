@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # returns or raises. FallbackAgent reads these to choose rule-based re-route targets.
 WATCHDOG_VERBOSE = "verbose"   # output bytes > per-config budget (rambling/looping)
 WATCHDOG_STALLED = "stalled"   # no output for > stall_seconds and nothing produced
+WATCHDOG_TRANSPORT_STALL = "transport_stall"  # only transport-noise on stderr, no forward progress
 WATCHDOG_MARKER = "[watchdog:"  # carried in self.stderr for downstream pattern matching
 
 # Default absolute-timeout multiple of `timeout` when AGY_ABSOLUTE_TIMEOUT is
@@ -64,6 +65,77 @@ def is_usage_wall(stderr: str) -> bool:
     if is_context_overflow(s):
         return False
     return any(marker in s for marker in USAGE_MARKERS)
+
+
+# Substrings (lowercased) that indicate a TRANSPORT/network blip — a websocket
+# reset, a dropped connection, a transient 502/503 — rather than the provider
+# itself being out of quota or the prompt being malformed. Kept deliberately
+# conservative (a transport blip clears on a short retry; a quota wall does not),
+# so a misclassification can't silently swallow a real quota outage. Reused by
+# both the streaming watchdog's stderr-liveness gate (issue #53) and
+# FallbackAgent's reason classifier (issue #57) — ONE marker list, no duplicate.
+TRANSPORT_MARKERS = (
+    "connection reset", "econnreset", "websocket", "stream error",
+    "temporarily unavailable", "503", "502",
+)
+
+
+def is_transport_error(stderr: str) -> bool:
+    """True when stderr looks like a transient transport/network failure (issue #57).
+
+    Distinct from a quota wall: the PROVIDER is fine, the connection blipped, so
+    the right response is a bounded same-provider retry — not advancing to the
+    next provider. Conservative on purpose: a quota wall or a context overflow is
+    NEVER a transport error, even if a future marker overlaps."""
+    s = (stderr or "").lower()
+    if is_usage_wall(s) or is_context_overflow(s):
+        return False
+    return any(marker in s for marker in TRANSPORT_MARKERS)
+
+
+# Substrings (lowercased) that mark a stderr line as transport/network NOISE — the
+# chatter a worker emits while retrying a blipped connection. A line matching one
+# of these is NOT forward progress, so the stall watchdog must NOT treat it as
+# liveness (issue #53). Superset of TRANSPORT_MARKERS plus codex's own noise
+# patterns ("network"/"timeout", mirrored from CodexAgent.filter_stderr) and the
+# generic reset/retry chatter, so a websocket that resets every few seconds with
+# zero real progress can no longer hold the worker alive until the hard timeout.
+_TRANSPORT_NOISE_MARKERS = TRANSPORT_MARKERS + (
+    "network", "timeout", "reset", "retry", "retrying",
+)
+
+
+def _is_transport_noise_line(line: str) -> bool:
+    """True when a single stderr line is transport-retry noise (not real progress)."""
+    s = (line or "").lower()
+    return any(marker in s for marker in _TRANSPORT_NOISE_MARKERS)
+
+
+# Substrings (lowercased) that mark a verifier failure as INFRA-class — the host
+# environment is broken (a sibling left the venv half-installed, the build tool
+# isn't on PATH, the disk filled, a permission flipped, conftest couldn't import)
+# rather than the generated CODE being defective (issue #58). #50 already branches
+# the adversarial loop on a verifier TIMEOUT / OOM, but any OTHER infra failure
+# returns ok=False with a NORMAL returncode and falls through to "regenerate" —
+# regenerating code against a problem the code can't fix. Kept deliberately
+# conservative: these are heuristic, so the loop treats a hit as a SOFT signal
+# (one regenerate then bail), never as ground truth.
+_INFRA_MARKERS = (
+    "command not found", "no module named", "no space left",
+    "permission denied", "importerror while loading conftest",
+)
+
+
+def looks_like_infra(stderr_tail: str) -> bool:
+    """True when a verifier failure looks like a broken HOST env, not bad code (issue #58).
+
+    Conservative on purpose — the markers are heuristic ("No module named" can be
+    a genuine missing-import bug in the project as easily as a half-installed
+    harness venv) — so the adversarial loop uses this only as a SOFT signal:
+    surface the real cause, allow exactly ONE regenerate, then bail rather than
+    burn the whole iteration budget regenerating against an infra problem."""
+    s = (stderr_tail or "").lower()
+    return any(marker in s for marker in _INFRA_MARKERS)
 
 
 # BLAS/numeric thread pools that each oversubscribe cores if left at their
@@ -397,16 +469,39 @@ class AgentInstance(ABC):
         # network blips looks like a stall under stdout-only progress tracking.
         out_total = [0]
         any_output = [False]
+        # Whether any TRANSPORT-NOISE stderr line has been seen since the last real
+        # progress. A worker can stay alive emitting "connection reset / retrying"
+        # on stderr every few seconds while making zero forward progress; that is a
+        # transport STALL, not liveness. We label such a trip distinctly so
+        # FallbackAgent can re-route immediately rather than burn the hard timeout
+        # (issue #53). Reset whenever real progress (stdout, or non-noise stderr)
+        # advances the stall clock.
+        transport_noise_only = [False]
         # Reset the shared last-progress clock at the start of this attempt so a
         # stale value from a prior attempt can't make the liveness wait think the
         # child is already idle.
         self._last_progress = time.monotonic()
+
+        def _mark_progress() -> None:
+            self._last_progress = time.monotonic()
+            any_output[0] = True
+            transport_noise_only[0] = False
 
         def _emit_line(line: bytes, echo: bool, stream: str) -> None:
             if echo:
                 sys.stderr.buffer.write(line)
                 sys.stderr.buffer.flush()
             text = line.decode(errors="replace")
+            # stdout is always forward progress. A stderr line counts as progress
+            # only when it is NOT transport-retry noise: real worker chatter
+            # (codex exec lines, apply_patch traces, status) advances the stall
+            # clock, but "connection reset / retrying" spam does not (issue #53).
+            if stream == "stdout":
+                _mark_progress()
+            elif _is_transport_noise_line(text):
+                transport_noise_only[0] = True
+            else:
+                _mark_progress()
             try:
                 if stream == "stdout":
                     events = self._events_from_stdout_line(text)
@@ -437,10 +532,11 @@ class AgentInstance(ABC):
                 if not data:
                     break
                 chunks.append(data)
-                # Either stream resets the stall clock — the watchdog cares
-                # about "is the worker doing anything", not "is stdout flowing".
-                self._last_progress = time.monotonic()
-                any_output[0] = True
+                # NOTE: progress is no longer bumped per-chunk. It is bumped
+                # per-LINE in _emit_line, because a stderr line is only liveness
+                # when it is NOT transport-retry noise (issue #53) — a decision
+                # that can only be made after the line is decoded. stdout always
+                # counts (see _mark_progress in _emit_line).
                 if count:
                     # Byte budget tallies stdout only: runaway-verbose tax
                     # (e.g. claude:haiku spitting 4528 tokens on calc3) lands
@@ -493,10 +589,27 @@ class AgentInstance(ABC):
                     self._killpg_tree(process)
                     return
                 if stall_seconds > 0 and (time.monotonic() - self._last_progress) > stall_seconds:
-                    # Only trip stall if NOTHING has been produced on EITHER stream
-                    # yet. A worker that emitted, then went silent for one stall
-                    # window, may be reasoning between bursts — the hard wall-timeout
-                    # (AGY_TIMEOUT, default 2400s) still catches genuine hangs.
+                    # `_last_progress` advances on REAL progress only (stdout, or
+                    # non-noise stderr); transport-retry noise does not move it.
+                    # Two stall shapes trip here:
+                    #   (a) classic STALL — no real progress has EVER occurred (the
+                    #       worker froze before producing anything). A worker that
+                    #       emitted, then went briefly silent, may be reasoning
+                    #       between bursts, so we don't trip in that case — the hard
+                    #       wall-timeout (AGY_TIMEOUT) still catches genuine hangs.
+                    #   (b) TRANSPORT stall — the only thing on stderr since the last
+                    #       real progress is "connection reset / retrying" spam, which
+                    #       previously kept the worker alive until the hard timeout
+                    #       (~40 min wasted, issue #53). Trip distinctly so the
+                    #       fallback layer can re-route NOW.
+                    if transport_noise_only[0]:
+                        self._watchdog_reason = WATCHDOG_TRANSPORT_STALL
+                        logger.warning(
+                            "watchdog: TRANSPORT STALL trip — only transport-retry "
+                            "noise for %.0fs, no forward progress; killing",
+                            stall_seconds)
+                        self._killpg_tree(process)
+                        return
                     if not any_output[0]:
                         self._watchdog_reason = WATCHDOG_STALLED
                         logger.warning("watchdog: STALLED trip — no output for %.0fs; killing",
