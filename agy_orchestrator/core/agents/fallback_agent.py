@@ -13,9 +13,10 @@ import logging
 from typing import Callable, Dict, List, Optional, Type
 
 from agy_orchestrator.core.agent import (
-    USAGE_MARKERS,
     WATCHDOG_MARKER,
     AgentInstance,
+    is_context_overflow,
+    is_usage_wall,
 )
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
@@ -41,7 +42,13 @@ def _watchdog_reason_in(stderr: str) -> Optional[str]:
     return head.split("]", 1)[0].strip() or None
 
 
-def _reason_category(*, looked_like_usage: bool, watchdog_reason: Optional[str]) -> str:
+def _reason_category(*, looked_like_usage: bool, watchdog_reason: Optional[str],
+                     context_overflow: bool = False) -> str:
+    # Context overflow is checked FIRST and is distinct from a quota wall: the
+    # same provider can serve the next (smaller) step, so telemetry must not fold
+    # it into "usage" (issue #47).
+    if context_overflow:
+        return "context_overflow"
     if looked_like_usage:
         return "usage"
     if watchdog_reason == "verbose":
@@ -202,8 +209,10 @@ def make_fallback_agent(
                     result = await sub.run_async(piped_input)
                 except Exception as exc:
                     stderr = getattr(sub, "stderr", "") or ""
-                    stderr_lc = stderr.lower()
-                    looked_like_usage = any(marker in stderr_lc for marker in USAGE_MARKERS)
+                    # is_usage_wall already excludes context overflow, so the two
+                    # flags are mutually exclusive and overflow never reads as usage.
+                    looked_like_overflow = is_context_overflow(stderr)
+                    looked_like_usage = is_usage_wall(stderr)
                     reason = _watchdog_reason_in(stderr)
                     if reason and reason in self._watchdog_rules:
                         targets = self._watchdog_rules[reason]
@@ -225,14 +234,16 @@ def make_fallback_agent(
                             reason_category=_reason_category(
                                 looked_like_usage=looked_like_usage,
                                 watchdog_reason=reason,
+                                context_overflow=looked_like_overflow,
                             ),
                             attempt=attempts,
                             attempt_total=len(self._chain),
                         )
                     else:
                         logger.warning(
-                            "[Fallback] %s failed%s%s: %s",
+                            "[Fallback] %s failed%s%s%s: %s",
                             label,
+                            " (context overflow)" if looked_like_overflow else "",
                             " (usage/quota wall)" if looked_like_usage else "",
                             f" (watchdog:{reason})" if reason else "",
                             exc,
@@ -247,6 +258,7 @@ def make_fallback_agent(
                             reason_category=_reason_category(
                                 looked_like_usage=looked_like_usage,
                                 watchdog_reason=reason,
+                                context_overflow=looked_like_overflow,
                             ),
                             attempt=attempts,
                             attempt_total=len(self._chain),

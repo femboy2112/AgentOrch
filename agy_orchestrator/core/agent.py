@@ -27,15 +27,41 @@ ABSOLUTE_TIMEOUT_FACTOR = 4.0
 # a transient error. Such a failure will NOT clear within a few seconds, so the
 # base run loop fails fast (no retry/backoff) and lets the fallback layer roll to
 # the next provider immediately. Imported by core.agents.fallback_agent too.
+#
+# NOTE: markers must be SPECIFIC to quota — a bare "exceeded" used to live here
+# and silently swallowed codex's "context_length_exceeded" (a context-window
+# overflow, NOT a quota wall), making operators/telemetry believe codex was
+# quota-walled when the very next smaller step would serve fine (issue #47).
+# Keep quota markers qualified ("... exceeded") so they can't match an overflow.
 USAGE_MARKERS = (
     "usage limit", "rate limit", "rate_limit", "quota", "out of credits",
     "insufficient_quota", "too many requests", "429", "plan limit",
-    "exceeded", "balance",
+    "quota exceeded", "limit exceeded", "usage exceeded", "balance",
 )
+
+# Substrings (lowercased) that indicate the prompt OVERFLOWED the model's context
+# window (codex's own remote compaction failed), as distinct from a quota wall.
+# Correct response differs: a quota wall = "provider unavailable for a while"; a
+# context overflow = "this ONE prompt was too big" — the same provider can serve
+# the next, smaller step. Both fail fast (an immediate retry of the identical
+# oversized prompt won't help), but they are labelled and categorised separately
+# so telemetry stops mis-attributing overflows as quota outages (issue #47).
+CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded", "exceeds the context window", "context window",
+    "remote compaction failed", "compact_remote", "maximum context length",
+)
+
+
+def is_context_overflow(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    return any(marker in s for marker in CONTEXT_OVERFLOW_MARKERS)
 
 
 def is_usage_wall(stderr: str) -> bool:
     s = (stderr or "").lower()
+    # A context overflow is never a quota wall, even if a future marker overlaps.
+    if is_context_overflow(s):
+        return False
     return any(marker in s for marker in USAGE_MARKERS)
 
 class AgentInstance(ABC):
@@ -620,6 +646,12 @@ class AgentInstance(ABC):
 
                     logger.warning("Attempt %d/%d failed with code %s:\n%s",
                                    attempt, self.max_retries, self.returncode, self.stderr)
+                    if is_context_overflow(self.stderr):
+                        # The prompt overflowed the context window (NOT a quota wall).
+                        # Retrying the identical oversized prompt won't help, so fail
+                        # fast — but label it distinctly so the fallback layer and
+                        # telemetry don't mis-read it as a quota outage (issue #47).
+                        raise RuntimeError(f"context overflow: {self.stderr[:200]}")
                     if is_usage_wall(self.stderr):
                         # A quota wall won't clear in seconds — let the caller fail over now.
                         raise RuntimeError(f"usage wall: {self.stderr[:200]}")
@@ -628,7 +660,7 @@ class AgentInstance(ABC):
                     await self._kill_current()
                     raise
                 except RuntimeError:
-                    raise  # timeout / usage wall: fail fast
+                    raise  # timeout / usage wall / context overflow: fail fast
                 except Exception as e:
                     logger.warning("Attempt %d/%d encountered an exception: %s",
                                    attempt, self.max_retries, e)
