@@ -588,6 +588,18 @@ class ReconciliationReview:
             )
         return "".join(parts)
 
+    def _json_only_reprompt(self) -> str:
+        """The trace prompt + a strict JSON-only instruction, used to recover from a
+        first reply that carried no parseable JSON object (#68)."""
+        return (
+            self.build_prompt()
+            + "\n\n--- OUTPUT CONTRACT (STRICT) ---\n"
+            "Your previous reply contained NO JSON object and could not be parsed. "
+            "Reply with ONLY a single JSON object for the verdict — no prose, no "
+            "explanation, no markdown fences, no thinking. The first character of "
+            "your reply must be '{' and the last must be '}'.\n"
+        )
+
     def parse(self, reply: str) -> ReconciliationResult:
         """Parse a model reply into a ReconciliationResult.
 
@@ -811,6 +823,37 @@ class ReconciliationReview:
         self.agent.prompt = self.build_prompt()
         reply = await self.agent.run_async()
         result = self.parse(reply)
+
+        # #68: a reply with no parseable JSON object means the anti-hollow-win
+        # trace produced NO verdict — the station would otherwise silently no-op
+        # (disposition=warn) while the run still reports "verified" from the unit
+        # verifier alone, exactly the hollow-win this station exists to catch.
+        # Re-ask ONCE with a strict JSON-only reprompt before accepting a
+        # parse_error (most are the model wrapping the verdict in prose).
+        if result.parse_error is not None:
+            logger.warning(
+                "Reconciliation reply had no parseable verdict (%s); re-prompting "
+                "for JSON-only output before declaring parse_error (#68).",
+                result.parse_error,
+            )
+            self._emit_orchestration(
+                phase="reconcile", action="reprompt_json", reason=result.parse_error,
+            )
+            try:
+                self.agent.prompt = self._json_only_reprompt()
+                reply2 = await self.agent.run_async()
+                result2 = self.parse(reply2)
+                if result2.parse_error is None:
+                    result = result2
+                else:
+                    logger.error(
+                        "Reconciliation STILL unparseable after a JSON-only "
+                        "re-prompt (%s) — the anti-hollow-win check did NOT verify "
+                        "this run; treating as hollow (disposition=%s).",
+                        result2.parse_error, self.disposition,
+                    )
+            except Exception as exc:  # best-effort: keep the original parse_error
+                logger.warning("Reconciliation JSON-only re-prompt failed: %s", exc)
 
         # Programmatic ablation-witness hook (#52): when a witness command is
         # configured, MEASURE each mechanism's load-bearing signal in a throwaway
