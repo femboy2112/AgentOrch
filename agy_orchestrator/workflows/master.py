@@ -105,6 +105,15 @@ class MasterWorkflow:
         self.compaction_interval = int(compaction_interval)
         self.max_context_chars = int(max_context_chars)
         self.event_callback = event_callback
+        # Run-level confidence signals (#45). Master never set these before, so the
+        # harness/ledger read the class default (False) on every master run and
+        # mislabeled good builds as unverified. The step loop propagates the FINAL
+        # accepted step's AdversarialReview signals up onto these attrs. build_ledger
+        # (execution/ledger.py) reads exactly these names via getattr.
+        self.verified = False
+        self.approved = False
+        self.stalled = False
+        self.iterations_used = 0
 
     def _emit_orchestration(self, **fields) -> None:
         cb = self.event_callback
@@ -538,6 +547,18 @@ class MasterWorkflow:
             )
 
             final_step_output = await adv.execute(adv_prompt)
+
+            # Propagate this step's verifier/critic signals up to the master object
+            # (#45). Tracking the LAST step is correct: the run-level question is
+            # "did the final accepted output pass a verifier." These are plain Python
+            # attributes, so they SURVIVE the end-of-run context compaction (compaction
+            # only resets workflow_session_id, not object attributes). When
+            # self.verifier is None, adv.verified stays False — correct, no programmatic
+            # verifier means not "verified"; adv.approved may still carry a critic OK.
+            self.verified = bool(getattr(adv, "verified", False))
+            self.approved = bool(getattr(adv, "approved", False))
+            self.stalled = bool(getattr(adv, "stalled", False))
+            self.iterations_used = int(getattr(adv, "iterations_used", 0) or 0)
 
             logger.info(f"Step {i+1} Completed. Summarizing for project context.")
             self._emit_orchestration(

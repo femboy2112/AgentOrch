@@ -49,6 +49,14 @@ def build_ledger(workflow: Any, *, mode: str, had_verifier: bool,
     else:
         confidence = "failed"
 
+    # The "unverified" note is conditional on had_verifier (#45): the hardcoded
+    # "no verifier" wording is factually wrong when a verifier WAS configured but
+    # the final output simply wasn't confirmed green. Other branches are fixed.
+    if confidence == "unverified" and had_verifier:
+        note = _NOTE_UNVERIFIED_WITH_VERIFIER
+    else:
+        note = _NOTE[confidence]
+
     row: Dict[str, Optional[object]] = {
         "confidence": confidence,
         "verified": verified,
@@ -57,7 +65,7 @@ def build_ledger(workflow: Any, *, mode: str, had_verifier: bool,
         "iterations_used": iterations,
         "had_verifier": had_verifier,
         # A short, operator-facing note on how much to trust this run.
-        "note": _NOTE[confidence],
+        "note": note,
     }
     if telemetry:
         for k in ("wall_ms", "out_bytes", "watchdog_reason",
@@ -78,3 +86,11 @@ _NOTE = {
                   "hit its cap). Treat as suspect; review or re-run with --test-cmd.",
     "failed": "The run produced no output.",
 }
+
+# Honest "unverified" wording when a verifier WAS configured (#45): we can't
+# claim "no verifier" — one ran but never confirmed the final output green.
+_NOTE_UNVERIFIED_WITH_VERIFIER = (
+    "A verifier was configured but the final output was not confirmed green "
+    "(the loop hit its cap or the last attempt failed). Treat as suspect; "
+    "review the run."
+)

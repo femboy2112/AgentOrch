@@ -193,6 +193,36 @@ class DispatchResult:
     # findings). NEVER merged into ``success``/the verifier under the default
     # "warn" disposition; only an explicit "fail" disposition flips success.
     reconciliation: Optional[Dict[str, Any]] = None
+    # Why the reconcile station did or didn't run (#44). Always set (e.g.
+    # "skipped:not_enabled" when --reconcile wasn't passed), so a null
+    # ``reconciliation`` in meta.json is never ambiguous: "ran", "skipped:<why>",
+    # or "error:<ExcType>".
+    reconcile_status: Optional[str] = None
+
+
+def _decide_reconcile_status(
+    reconcile_enabled: bool,
+    plan_only: bool,
+    has_output: bool,
+    disposition: str,
+    verifier_green: bool,
+) -> str:
+    """Decide whether to run the reconcile station and, if not, why (#44).
+
+    Returns "run" to run the station, else a "skipped:<reason>" string. The hard
+    verifier gate is kept ONLY for the "fail" disposition: for warn/open-task the
+    station is read-only and we most want the dead-wiring trace exactly when the
+    build is shaky, so we run regardless of verifier_green.
+    """
+    if not reconcile_enabled:
+        return "skipped:not_enabled"
+    if plan_only:
+        return "skipped:plan_only"
+    if not has_output:
+        return "skipped:no_output"
+    if disposition == "fail" and not verifier_green:
+        return "skipped:verifier_not_green"
+    return "run"
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -1125,6 +1155,7 @@ async def dispatch_async(
     workflow = None
     run_outcome: Optional[str] = None
     reconciliation_result = None  # #43: set after a converged build if --reconcile
+    reconcile_status = None  # #44: why reconcile did/didn't run; persisted to meta.json
     try:
         if _is_cu:
             # Step 12 minimal glue: exercise the real adapter (writes events.jsonl under runs/<id>/,
@@ -1180,8 +1211,12 @@ async def dispatch_async(
             # is still open here so its trace events stream + persist normally.
             # Wrapped best-effort: a station failure must NEVER fail a good build.
             verifier_green = verifier is None or bool(getattr(workflow, "verified", False))
-            if (reconcile_enabled and not plan_only and verifier_green
-                    and output and output.strip()):
+            has_output = bool(output and output.strip())
+            reconcile_status = _decide_reconcile_status(
+                reconcile_enabled, plan_only, has_output,
+                recon_disposition, verifier_green,
+            )
+            if reconcile_status == "run":
                 try:
                     reconciliation_result = await _run_reconciliation(
                         run_id=run_id,
@@ -1195,9 +1230,20 @@ async def dispatch_async(
                         working_directory=str(work_dir),
                         disposition=recon_disposition,
                     )
+                    reconcile_status = "ran"
                 except Exception as rexc:  # best-effort: never fail a good build
+                    reconcile_status = "error:" + type(rexc).__name__
                     logger.warning("Reconciliation station errored (continuing): %s: %s",
                                    type(rexc).__name__, rexc)
+            else:
+                # Never silently un-reconcile (#44): name the run + the reason. A
+                # fail-disposition skip on a non-green verifier is a warning (the
+                # build is shaky and we're declining the hard gate); the rest are info.
+                if reconcile_status == "skipped:verifier_not_green":
+                    logger.warning("Dispatch %s reconcile %s (disposition=fail, verifier not green)",
+                                   run_id, reconcile_status)
+                else:
+                    logger.info("Dispatch %s reconcile %s", run_id, reconcile_status)
     except RunStalled as exc:  # run watchdog aborted: classify, never crash
         success = False
         run_outcome = exc.reason
@@ -1211,6 +1257,13 @@ async def dispatch_async(
         error = f"{type(exc).__name__}: {exc}"
         logger.error("Dispatch %s failed: %s", run_id, error)
     finally:
+        # Always populate reconcile_status for meta.json (#44), even on paths that
+        # never reached the gate (computer-use, watchdog stall, or an exception):
+        # if reconcile wasn't enabled say so, otherwise the build didn't reach a
+        # reconcilable converged state.
+        if reconcile_status is None:
+            reconcile_status = ("skipped:not_enabled" if not reconcile_enabled
+                                else "skipped:no_output")
         duration = time.monotonic() - started
         dispatch_pub({
             "kind": "lifecycle",
@@ -1416,6 +1469,7 @@ async def dispatch_async(
         run_outcome=run_outcome,
         resolved_config=resolved_config,
         reconciliation=reconciliation,
+        reconcile_status=reconcile_status,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
