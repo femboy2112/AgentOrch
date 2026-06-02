@@ -312,7 +312,13 @@ def test_notifier_inactive_without_chats(fake_key, capture_client):
 def test_handle_status_in_progress(monkeypatch, tmp_path):
     rd = tmp_path / "runs"
     rd.mkdir()
-    (rd / "20260602_000001").mkdir()  # no meta.json yet
+    run = rd / "20260602_000001"
+    run.mkdir()
+    # A real in-progress run streams events.jsonl (touched at dispatch start) and
+    # has no meta.json yet; liveness now requires a recent event stream so a stale
+    # leftover dir can't be reported as a perpetual "in progress" (issue: phantom
+    # /status). A freshly-written events file is live.
+    (run / "events.jsonl").write_text('{"event_type":"x","run_id":"20260602_000001"}\n')
     monkeypatch.setattr(bot, "RUNS_DIR", rd)
     msg = bot.handle_command("/status", state={})
     assert "in progress" in msg.lower()

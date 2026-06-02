@@ -143,10 +143,21 @@ def _run_dirs() -> List[Path]:
     runs_dir = _runs_dir()
     if not runs_dir.exists():
         return []
-    return sorted(
-        (d for d in runs_dir.iterdir() if d.is_dir() and not d.name.startswith(".")),
-        reverse=True,
-    )
+    dirs = [d for d in runs_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+    # Order by most-recent activity (mtime), NOT lexically by name. A non-timestamp
+    # run-id — a test/dev leftover like "r-red-1" or "cu-probe" — sorts lexically
+    # ABOVE every real "YYYYMMDD-HHMMSS-…" run and would hijack "latest", so
+    # /status reported a months-old meta-less dir as a perpetual "in progress".
+    # mtime tracks the last event/heartbeat write, so a genuinely active run sorts
+    # first and a stale dir sinks regardless of its name.
+    def _mtime(d: Path) -> float:
+        try:
+            return d.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    return sorted(dirs, key=_mtime, reverse=True)
 
 
 def _read_meta(run_dir: Path) -> Optional[dict]:
@@ -171,17 +182,40 @@ def _events_path(run_dir: Path) -> Path:
     return run_dir / "events.jsonl"
 
 
-def is_live_run(run_dir: Path) -> bool:
-    """True iff the run has started streaming events but has no terminal meta.
+def _live_stale_seconds() -> float:
+    """Max age (s) of the last event write for a run to still count as live.
 
-    A run is "live" when ``events.jsonl`` exists (the dispatch is streaming) and
-    ``meta.json`` (written only when the run FINISHES) is absent. This is how the
-    bot catches runs it never started — discovery is pure filesystem scan.
+    A real in-progress dispatch streams events and periodic heartbeats, so its
+    events.jsonl mtime stays fresh; an aborted/abandoned run goes silent. Generous
+    default (30 min) so a slow-but-alive step (e.g. a long pytest between
+    heartbeats) is never dropped; tunable via AGY_TELEGRAM_LIVE_STALE_S (0 = off)."""
+    try:
+        return float(os.environ.get("AGY_TELEGRAM_LIVE_STALE_S", "1800") or 0)
+    except Exception:
+        return 1800.0
+
+
+def is_live_run(run_dir: Path) -> bool:
+    """True iff the run is ACTIVELY streaming: events.jsonl exists, no terminal
+    meta.json, AND the event stream was written recently.
+
+    ``meta.json`` is written only when a run FINISHES, so events-without-meta is
+    how the bot discovers runs it never started. The recency gate is the fix for
+    a stale/aborted dir (events.jsonl but no meta, untouched for days) being
+    reported as perpetually "in progress" — a dead run is not a live one.
     """
     try:
         if not run_dir.is_dir():
             return False
-        return _events_path(run_dir).exists() and not (run_dir / "meta.json").exists()
+        ev = _events_path(run_dir)
+        if not ev.exists() or (run_dir / "meta.json").exists():
+            return False
+        stale = _live_stale_seconds()
+        if stale > 0:
+            import time as _t
+            if (_t.time() - ev.stat().st_mtime) > stale:
+                return False  # silent for too long -> aborted, not live
+        return True
     except Exception:
         return False
 
@@ -270,10 +304,21 @@ def summarize_latest() -> str:
     dirs = _run_dirs()
     if not dirs:
         return "📭 <b>No runs yet</b>"
-    latest = dirs[0]
-    meta = _read_meta(latest)
+    # Skip stale-incomplete leftovers (meta-less AND not live) so a dead dir can't
+    # be reported as a perpetual "in progress". Report the first run (most recent
+    # by mtime) that is either actively live or has finished (has meta.json).
+    latest = None
+    meta = None
+    for d in dirs:
+        m = _read_meta(d)
+        if m is None:
+            if is_live_run(d):
+                return f"⏳ <b>Run in progress</b> · <code>{_e(d.name)}</code>"
+            continue  # stale/aborted incomplete run — skip
+        latest, meta = d, m
+        break
     if meta is None:
-        return f"⏳ <b>Run in progress</b> · <code>{_e(latest.name)}</code>"
+        return "📭 <b>No completed runs yet</b>"
     success = bool(meta.get("success"))
     icon = "✅" if success else "❌"
     mode = _e(meta.get("mode") or "")
