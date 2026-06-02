@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -28,6 +29,47 @@ logger = logging.getLogger(__name__)
 # failing tests in the event stream (issue #60). Anchored at line start; the
 # nodeid is the first whitespace-delimited token after the keyword.
 _PYTEST_FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.MULTILINE)
+
+
+def _safe_getpgid(process) -> Optional[int]:
+    """Process-group id of a freshly-spawned child (== its pid when it was started
+    with ``start_new_session=True``), or None if it already exited / pgid is
+    unavailable. Captured right after spawn so the group can be signalled later
+    even once the direct child has been reaped."""
+    try:
+        return os.getpgid(process.pid)
+    except Exception:
+        return None
+
+
+def _kill_process_group(pgid: Optional[int], *, fallback_process=None) -> None:
+    """SIGKILL an entire process group, best-effort (#61).
+
+    On a plain (non-scoped) verifier spawn the test process is its own group
+    leader, so signalling the group reaps the WHOLE pool — the multiprocessing /
+    pytest-xdist workers that block on ``sys.stdin.readline()`` and which a bare
+    ``process.kill()`` (direct child only) would orphan to PID 1 forever. Safe to
+    call after normal completion too: the leader is already gone, so this just
+    sweeps any leaked daemon descendants (``ProcessLookupError`` => nothing left).
+
+    Under the #39 memory-cap path the command runs inside a transient systemd
+    ``--scope``; those descendants live in the scope's cgroup (child of the user
+    manager), not our group, so the scope's own ``--collect`` GC reaps them — here
+    we still kill the ``systemd-run`` client group, which is strictly better than
+    the previous leak-everything behaviour."""
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return  # group already gone — nothing to reap
+        except Exception:
+            pass
+    if fallback_process is not None:
+        try:
+            fallback_process.kill()
+        except Exception:
+            pass
 
 
 def _parse_failed_tests(stdout_tail: str, limit: int = 25) -> List[str]:
@@ -238,6 +280,10 @@ class QualityVerifier:
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    # #61: own session/process group so a timeout (or any teardown)
+                    # can SIGKILL the WHOLE group — reaping forked pool workers that
+                    # a direct-child kill would orphan to PID 1.
+                    start_new_session=True,
                 )
             else:
                 process = await asyncio.create_subprocess_shell(
@@ -246,7 +292,12 @@ class QualityVerifier:
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,  # #61: see above
                 )
+            # #61: capture the group id now, while the child is alive, so a timeout
+            # kill (or post-completion sweep) can signal the whole group even after
+            # the direct child has been reaped.
+            pgid = _safe_getpgid(process)
             stdout = b""
             stderr = b""
             timed_out = False
@@ -261,7 +312,9 @@ class QualityVerifier:
                 logger.warning("Verification command exceeded %.0fs; killing: %s", self.timeout, cmd)
                 timed_out = True
                 try:
-                    process.kill()
+                    # #61: kill the whole group, not just the direct child, so
+                    # forked pool workers don't outlive the timeout as PID-1 orphans.
+                    _kill_process_group(pgid, fallback_process=process)
                     await asyncio.wait_for(process.wait(), 5)
                 except Exception:
                     pass
@@ -335,7 +388,14 @@ class QualityVerifier:
                 # non-empty), persist the full tails to a per-iteration artifact, and
                 # emit the parsed failing-test nodeids into the event stream.
                 self._report_failure(result)
+                # #61: a non-zero exit can still leave forked pool workers blocked
+                # on stdin — sweep the group before returning.
+                _kill_process_group(pgid)
                 return self._finalize(result)
+
+            # #61: clean (rc 0) completion can still leak daemon pool workers on a
+            # buggy test suite — sweep the group at the end of each iteration.
+            _kill_process_group(pgid)
 
         logger.info("All verifications passed successfully.")
         final_cmd = "<multi>" if len(self.test_commands) > 1 else self.test_commands[0]
