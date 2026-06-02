@@ -17,7 +17,10 @@ def test_child_env_merges_parent_env_and_extra_env():
     assert env["PATH"] == os.environ["PATH"]
 
 
-def test_child_env_none_when_extra_env_empty():
+def test_child_env_none_when_extra_env_empty_and_bounds_disabled(monkeypatch):
+    # With worker resource bounding off and no extra_env, the inherit-unchanged
+    # path still returns None (prior behavior).
+    monkeypatch.setenv("AGY_WORKER_RESOURCE_BOUND", "0")
     agent = AgyAgent(prompt="x")
     agent.extra_env = {}
     assert agent._child_env() is None

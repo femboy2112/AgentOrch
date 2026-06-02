@@ -64,6 +64,56 @@ def is_usage_wall(stderr: str) -> bool:
         return False
     return any(marker in s for marker in USAGE_MARKERS)
 
+
+# BLAS/numeric thread pools that each oversubscribe cores if left at their
+# library default (= one thread per core). Pinned to 1 in worker child envs so a
+# worker-spawned numeric job (and each of its xdist workers) stays bounded.
+_THREAD_PIN_VARS = (
+    "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+)
+
+
+def _resource_bound_disabled() -> bool:
+    val = (os.environ.get("AGY_WORKER_RESOURCE_BOUND", "1") or "1").strip().lower()
+    return val in ("0", "no", "false", "off")
+
+
+def apply_worker_resource_bounds(env: Dict[str, str]) -> Dict[str, str]:
+    """Inject conservative resource bounds into a worker child env (issue #48).
+
+    ``--test-cmd ... -n 2`` bounds only the orchestrator's OWN verifier. It does
+    NOT constrain commands a generation/refinement step runs itself: a build step
+    that runs its own ``pytest`` inherited the target repo's ``-n auto`` addopts
+    (one xdist worker per core) with no BLAS thread pins, hitting ~5.6 GB inside
+    the build scope. The worker CLI subprocess is the single choke point every
+    such command descends from, so bounding its env propagates the
+    RESOURCE-DISCIPLINE intent to everything the worker spawns.
+
+    Bounds (all opt-out via ``AGY_WORKER_RESOURCE_BOUND=0``):
+      - ``{OPENBLAS,OMP,MKL,NUMEXPR}_NUM_THREADS`` pinned to 1 — only when ABSENT,
+        so an operator/parent value is respected.
+      - ``PYTEST_ADDOPTS`` gains ``-n <K>`` (K = ``AGY_WORKER_PYTEST_XDIST``,
+        default 2; K<=0 -> ``-p no:xdist`` serial). Appended after any existing
+        value so this bound wins over a repo's ini ``-n auto`` (pytest takes the
+        last ``-n``), while preserving the operator's other addopts.
+
+    Returns ``env`` unchanged (same object) when bounding is disabled.
+    """
+    if _resource_bound_disabled():
+        return env
+    out = dict(env)
+    for var in _THREAD_PIN_VARS:
+        out.setdefault(var, "1")
+    try:
+        k = int(os.environ.get("AGY_WORKER_PYTEST_XDIST", "2") or "2")
+    except ValueError:
+        k = 2
+    xdist = f"-n {k}" if k > 0 else "-p no:xdist"
+    existing = (out.get("PYTEST_ADDOPTS") or "").strip()
+    out["PYTEST_ADDOPTS"] = f"{existing} {xdist}".strip() if existing else xdist
+    return out
+
+
 class AgentInstance(ABC):
     """
     Abstract base class representing a single execution of an AI agent CLI.
@@ -224,12 +274,14 @@ class AgentInstance(ABC):
         return []
 
     def _child_env(self) -> Optional[Dict[str, str]]:
-        """Environment for the child subprocess: parent env plus self.extra_env,
-        or None to inherit the parent env unchanged (the default — preserves
-        prior behavior exactly when no overrides are set)."""
-        if not self.extra_env:
+        """Environment for the child subprocess: parent env, plus conservative
+        worker resource bounds (issue #48), plus self.extra_env (which always
+        wins). Returns None to inherit the parent env unchanged when there is
+        nothing to add — i.e. no extra_env AND resource bounding is disabled —
+        preserving prior behavior exactly on that path."""
+        if not self.extra_env and _resource_bound_disabled():
             return None
-        return {**os.environ, **self.extra_env}
+        return {**apply_worker_resource_bounds(dict(os.environ)), **self.extra_env}
 
     @staticmethod
     def _to_int_token(value: object) -> Optional[int]:
