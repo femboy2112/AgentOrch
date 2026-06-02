@@ -71,6 +71,32 @@ or a failed send never crashes the loop.
 | `/status` | Summarize the most recent run (`runs/<id>/meta.json`), or "in progress" if it has no meta yet |
 | `/runs [N=5]` | Compact list of the N most recent runs |
 | `/verbosity [level]` | Show or set the persisted default verbosity |
+| `/track [latest\|<run_id>\|all]` | Follow a live run's progress (default `latest`; `all` aliased as `/showliveall`) |
+| `/untrack [<run_id>\|all]` | Stop following one run (bare `/untrack` = all) |
+
+### Live-run tracking (TEMPORARY, cross-process)
+
+The bot runs in a **separate process** from any `harness do`, so it cannot
+subscribe to that run's in-memory `EventBus`. Instead `/track` **tails the
+persisted on-disk stream** `runs/<id>/events.jsonl`: on every poll iteration the
+daemon reads the lines appended since a per-run **byte cursor**, renders each
+through the same `render_event` formatter at the chat's current verbosity
+(prefixed with a short run tag so concurrent runs don't blur), and advances the
+cursor so history is never re-sent.
+
+- **Discovery** is a pure filesystem scan, so the bot can follow a run it never
+  started: a run is *live* when it has an `events.jsonl` but no terminal
+  `meta.json`. `latest` = the newest live run; `all` tracks every live run at
+  once; you can track multiple runs concurrently.
+- **Auto-untrack**: when a tracked run finishes (`meta.json` appears) the bot
+  sends the polished final-summary card and stops tracking it.
+- Tracking is **per-chat** and persisted in the bot state file (outside the
+  repo). A missing/rotated/garbage `events.jsonl`, a vanished run dir, or a send
+  failure is swallowed+logged per run and never crashes the daemon.
+
+> This command is **explicitly temporary**: once the Phase 3 singleton makes the
+> orchestrator resident in memory, any caller can subscribe to a live run
+> directly and `/track` becomes obsolete.
 
 ## Security notes
 

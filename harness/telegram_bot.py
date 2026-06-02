@@ -12,12 +12,24 @@ ignoring anyone not listed), and answers a deliberately small command set:
     /status           summarize the most recent run (or "in progress")
     /runs [N=5]       compact list of recent runs
     /verbosity [lvl]  show or set the persisted default verbosity
+    /track <target>   follow a live run's progress (latest | <run_id> | all)
+    /untrack [target] stop following one run (or all)
 
 The loop is resilient: one bad update or a failed send never crashes the
 daemon, and SIGINT shuts down cleanly. Everything is stdlib only and the bot
 token is read from ``TELEGRAM_BOT_KEY`` (never hardcoded). The persisted state
 file lives OUTSIDE the repo (default ``/home/leah/tgbot/data/bot_state.json``;
 override via ``AGY_TELEGRAM_STATE``).
+
+TEMPORARY cross-process live-run tracking
+-----------------------------------------
+The bot is a SEPARATE process from any running ``harness do``, so it cannot
+subscribe to that run's in-memory EventBus. To still follow a build live it
+TAILS the on-disk ``runs/<id>/events.jsonl`` (the persisted live stream) on
+every poll iteration, advancing a per-run byte cursor so only NEW lines are
+emitted. This is EXPLICITLY TEMPORARY: once the Phase 3 singleton makes the
+orchestrator resident in memory, any caller can subscribe to a live run
+directly and ``/track`` becomes obsolete.
 """
 from __future__ import annotations
 
@@ -32,10 +44,13 @@ from harness.telegram import (
     DEFAULT_VERBOSITY,
     VERBOSITY_ORDER,
     TelegramClient,
+    TelegramNotifier,
     _e,
     _fmt_duration,
+    _run_tag,
     load_whitelist,
     normalize_verbosity,
+    render_event,
     whitelist_user_ids,
 )
 
@@ -117,6 +132,113 @@ def _read_meta(run_dir: Path) -> Optional[dict]:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# TEMPORARY cross-process live-run tracking (tail runs/<id>/events.jsonl)
+#
+# The bot is a SEPARATE process from any running `harness do`, so it cannot
+# subscribe to that run's in-memory EventBus. It follows runs by tailing the
+# persisted on-disk event stream. OBSOLETE once the Phase 3 singleton makes the
+# orchestrator resident in memory (any caller can then subscribe directly).
+# --------------------------------------------------------------------------- #
+def _events_path(run_dir: Path) -> Path:
+    return run_dir / "events.jsonl"
+
+
+def is_live_run(run_dir: Path) -> bool:
+    """True iff the run has started streaming events but has no terminal meta.
+
+    A run is "live" when ``events.jsonl`` exists (the dispatch is streaming) and
+    ``meta.json`` (written only when the run FINISHES) is absent. This is how the
+    bot catches runs it never started — discovery is pure filesystem scan.
+    """
+    try:
+        if not run_dir.is_dir():
+            return False
+        return _events_path(run_dir).exists() and not (run_dir / "meta.json").exists()
+    except Exception:
+        return False
+
+
+def live_run_dirs() -> List[Path]:
+    """All currently-live run dirs, newest first (by run-id / dir name sort)."""
+    return [d for d in _run_dirs() if is_live_run(d)]
+
+
+def latest_live_run() -> Optional[Path]:
+    dirs = live_run_dirs()
+    return dirs[0] if dirs else None
+
+
+def _run_dir_by_id(run_id: str) -> Optional[Path]:
+    if not run_id:
+        return None
+    d = _runs_dir() / run_id
+    return d if d.is_dir() else None
+
+
+def _short_tag(run_id: str) -> str:
+    s = str(run_id or "").strip()
+    return s[-6:] if len(s) > 6 else s
+
+
+def _tracking_state(state: dict) -> dict:
+    """The per-chat tracking map: ``{chat_id_str: {run_id: byte_cursor}}``."""
+    tracking = state.get("tracking")
+    if not isinstance(tracking, dict):
+        tracking = {}
+        state["tracking"] = tracking
+    return tracking
+
+
+def _chat_tracking(state: dict, chat_id: Any) -> dict:
+    tracking = _tracking_state(state)
+    key = str(chat_id)
+    entry = tracking.get(key)
+    if not isinstance(entry, dict):
+        entry = {}
+        tracking[key] = entry
+    return entry
+
+
+def _read_new_events(events_file: Path, cursor: int) -> tuple:
+    """Read events appended to ``events_file`` since byte offset ``cursor``.
+
+    Returns ``(events, new_cursor)``. Bounded — only the tail past ``cursor`` is
+    read, so the cursor advances and history is never re-sent. A missing /
+    rotated / garbage file never raises: it yields ``([], cursor)`` (rotation,
+    i.e. file shrank below the cursor, resets to read from 0). Individual
+    malformed JSON lines are skipped.
+    """
+    try:
+        size = events_file.stat().st_size
+    except Exception:
+        return [], cursor
+    start = cursor
+    if size < cursor:  # truncated / rotated -> re-read from the top
+        start = 0
+    if size <= start:
+        return [], size
+    events: List[dict] = []
+    try:
+        with events_file.open("r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(start)
+            chunk = fh.read()
+            new_cursor = fh.tell()
+    except Exception:
+        return [], cursor
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue  # skip a single garbage line, keep tailing
+        if isinstance(ev, dict):
+            events.append(ev)
+    return events, new_cursor
+
+
 def summarize_latest() -> str:
     dirs = _run_dirs()
     if not dirs:
@@ -174,12 +296,93 @@ HELP_TEXT = (
     "/verbosity [level] — show or set default ("
     + " / ".join(VERBOSITY_ORDER)
     + ")\n"
+    "/track [latest|&lt;run_id&gt;|all] — follow a live run (default: latest)\n"
+    "/untrack [&lt;run_id&gt;|all] — stop following (default: all)\n"
     "/help — this message"
 )
 
 
-def handle_command(text: str, *, state: dict, state_file: Optional[str] = None) -> Optional[str]:
-    """Map a whitelisted user's message to a reply. Returns None to ignore."""
+def _handle_track(args: List[str], *, state: dict, chat_id: Any,
+                  state_file: Optional[str]) -> str:
+    """/track latest | <run_id> | all — follow a live run's persisted stream."""
+    target = (args[0].strip().lower() if args else "latest")
+    entry = _chat_tracking(state, chat_id)
+    added: List[str] = []
+
+    if target in ("all", ""):
+        for d in live_run_dirs():
+            if d.name not in entry:
+                entry[d.name] = 0
+                added.append(d.name)
+        if not entry:
+            return "📭 No live runs right now."
+    elif target == "latest":
+        d = latest_live_run()
+        if d is None:
+            return "📭 No live runs right now."
+        if d.name not in entry:
+            entry[d.name] = 0
+            added.append(d.name)
+    else:
+        # An explicit run id — allow tracking even a not-yet-discovered dir, but
+        # only if the dir exists (avoids tracking a typo forever).
+        rid = args[0].strip()
+        d = _run_dir_by_id(rid)
+        if d is None:
+            return f"⚠️ Unknown run <code>{_e(rid)}</code>."
+        if not is_live_run(d):
+            return f"ℹ️ Run <code>{_e(rid)}</code> is not live (already finished?)."
+        if rid not in entry:
+            entry[rid] = 0
+            added.append(rid)
+
+    save_state(state, state_file)
+    tracked = sorted(entry.keys())
+    tags = ", ".join(f"<code>{_e(_short_tag(r))}</code>" for r in tracked)
+    n = len(tracked)
+    return f"▶️ Tracking {n} live run{'s' if n != 1 else ''}: {tags}"
+
+
+def _handle_untrack(args: List[str], *, state: dict, chat_id: Any,
+                    state_file: Optional[str]) -> str:
+    """/untrack [<run_id>|all] — stop following one run (bare = all)."""
+    entry = _chat_tracking(state, chat_id)
+    target = (args[0].strip() if args else "all")
+    if target.lower() == "all" or not target:
+        had = len(entry)
+        entry.clear()
+        save_state(state, state_file)
+        if not had:
+            return "⏹ Not tracking any runs."
+        return f"⏹ Stopped tracking all {had} run{'s' if had != 1 else ''}."
+    # Match by full id or short tag.
+    match = None
+    if target in entry:
+        match = target
+    else:
+        for rid in list(entry):
+            if _short_tag(rid) == target:
+                match = rid
+                break
+    if match is None:
+        return f"ℹ️ Not tracking <code>{_e(target)}</code>."
+    entry.pop(match, None)
+    save_state(state, state_file)
+    return f"⏹ Stopped tracking <code>{_e(_short_tag(match))}</code>."
+
+
+def handle_command(
+    text: str,
+    *,
+    state: dict,
+    state_file: Optional[str] = None,
+    chat_id: Any = None,
+) -> Optional[str]:
+    """Map a whitelisted user's message to a reply. Returns None to ignore.
+
+    ``chat_id`` is required for the per-chat /track and /untrack commands (the
+    daemon passes the originating chat); other commands ignore it.
+    """
     text = (text or "").strip()
     if not text.startswith("/"):
         return None
@@ -210,6 +413,12 @@ def handle_command(text: str, *, state: dict, state_file: Optional[str] = None) 
         state["verbosity"] = requested
         save_state(state, state_file)
         return f"✅ Default verbosity set to <b>{_e(requested)}</b>"
+    if cmd == "/track":
+        return _handle_track(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/showliveall":  # alias for /track all
+        return _handle_track(["all"], state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/untrack":
+        return _handle_untrack(args, state=state, chat_id=chat_id, state_file=state_file)
     return None
 
 
@@ -258,6 +467,7 @@ class BotDaemon:
                 message.get("text") or "",
                 state=load_state(self.state_file),
                 state_file=self.state_file,
+                chat_id=chat_id,
             )
             if reply:
                 self.client.send_message(chat_id, reply)
@@ -265,7 +475,12 @@ class BotDaemon:
             logger.debug("telegram update processing failed: %s", exc)
 
     def poll_once(self) -> int:
-        """Fetch + process one batch of updates. Returns count processed."""
+        """Fetch + process one batch of updates. Returns count processed.
+
+        Each iteration also tails any tracked live runs (cheap when none are
+        tracked). Tailing runs alongside command handling without blocking the
+        long-poll: a tracking error is swallowed per run and never bubbles out.
+        """
         updates = self.client.get_updates(offset=self._offset, timeout=self.poll_timeout)
         processed = 0
         for update in updates:
@@ -276,7 +491,112 @@ class BotDaemon:
                 self._offset = uid + 1
             self._process_update(update)
             processed += 1
+        # TEMPORARY cross-process live-run tail (see module docstring).
+        try:
+            self.tail_tracked()
+        except Exception as exc:  # never let tailing crash the poll loop
+            logger.debug("telegram live-run tail failed: %s", exc)
         return processed
+
+    def _send_tail(self, chat_id: Any, text: str) -> None:
+        try:
+            self.client.send_message(chat_id, text)
+        except Exception as exc:  # client already swallows; belt-and-suspenders
+            logger.debug("telegram tail send failed: %s", exc)
+
+    def _final_summary_card(self, run_id: str, meta: Optional[dict]) -> str:
+        """Render meta.json into the same end-of-run card style as the notifier.
+
+        Reuses :meth:`TelegramNotifier._summary_card` so a tracked run's final
+        message matches the dispatch-side summary exactly (success/fail card).
+        """
+        try:
+            stub = TelegramNotifier(
+                run_id=run_id, mode=str((meta or {}).get("mode") or ""),
+                verbosity=DEFAULT_VERBOSITY, client=self.client, chat_ids=[],
+            )
+            return stub._summary_card(meta or {})
+        except Exception:
+            return f"🏁 <b>Run finished</b> · <code>{_e(_short_tag(run_id))}</code>"
+
+    def tail_tracked(self) -> int:
+        """Emit NEW events for every tracked run across all chats.
+
+        For each tracked run: read lines appended to events.jsonl since the
+        stored byte cursor, render each through ``render_event`` at the chat's
+        current verbosity (prefixed with a short run tag so concurrent runs
+        don't blur), and advance the cursor (history is never re-sent). When a
+        tracked run finishes (meta.json appears) a final summary card is sent
+        and the run is AUTO-UNTRACKED. Returns the number of messages sent.
+
+        Fully resilient: a missing/rotated/garbage events.jsonl, a vanished run
+        dir, or a send failure is swallowed+logged per run; the loop keeps going.
+        """
+        state = load_state(self.state_file)
+        tracking = _tracking_state(state)
+        if not tracking:
+            return 0
+        verbosity = get_verbosity(state)
+        sent = 0
+        dirty = False
+        for chat_key, runs in list(tracking.items()):
+            if not isinstance(runs, dict):
+                tracking[chat_key] = {}
+                dirty = True
+                continue
+            for run_id in list(runs.keys()):
+                try:
+                    run_dir = _runs_dir() / run_id
+                    cursor = runs.get(run_id) or 0
+                    try:
+                        cursor = int(cursor)
+                    except Exception:
+                        cursor = 0
+                    if not run_dir.is_dir():
+                        # Run dir vanished — stop tracking it cleanly.
+                        runs.pop(run_id, None)
+                        dirty = True
+                        continue
+                    # Drain any events appended since the last cursor first, so
+                    # the final lines are delivered before the summary card.
+                    events, new_cursor = _read_new_events(_events_path(run_dir), cursor)
+                    if new_cursor != cursor:
+                        runs[run_id] = new_cursor
+                        dirty = True
+                    short = _short_tag(run_id)
+                    prefix = f"<code>{_e(short)}</code> "
+                    for ev in events:
+                        try:
+                            msg = render_event(
+                                ev, verbosity=verbosity,
+                                mode=str(ev.get("data", {}).get("mode") or "")
+                                if isinstance(ev.get("data"), dict) else "",
+                                run_id=run_id,
+                            )
+                        except Exception:
+                            continue
+                        if not msg:
+                            continue
+                        # Label every message with a leading short run tag so
+                        # concurrent tracked runs are distinguishable in a shared
+                        # chat. render_event already appends its own ' · <code>'
+                        # suffix on progress lines; the leading tag is the stable
+                        # per-message label the spec asks for.
+                        self._send_tail(chat_key, f"{prefix}{msg}")
+                        sent += 1
+                    # Auto-untrack on finish (meta.json present).
+                    meta = _read_meta(run_dir)
+                    if meta is not None:
+                        card = self._final_summary_card(run_id, meta)
+                        self._send_tail(chat_key, f"<code>{_e(short)}</code> {card}")
+                        sent += 1
+                        runs.pop(run_id, None)
+                        dirty = True
+                except Exception as exc:  # per-run isolation
+                    logger.debug("telegram tail run %s failed: %s", run_id, exc)
+        if dirty:
+            save_state(state, self.state_file)
+        return sent
 
     def stop(self, *_args: Any) -> None:
         self._running = False
