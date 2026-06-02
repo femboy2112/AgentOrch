@@ -232,7 +232,17 @@ def make_fallback_agent(
             # Repeat the chain ``_cycles`` times: codex -> agy -> claude -> (repeat).
             # ``pending`` is a mutable view we can splice rule-based targets into the
             # front of when a watchdog trips, so the next attempt picks them up.
-            pending: List[Type[AgentInstance]] = list(self._chain) * self._cycles
+            # ``rotate_offset`` (set by a caller, e.g. the adversarial loop after K
+            # consecutive VERIFY-failures, #65) rotates which provider LEADS so the
+            # next generator can attempt a step the previous one couldn't pass —
+            # the fallback chain normally only advances on a produce-FAILURE, never
+            # on a produced-but-failed-verification output.
+            base = list(self._chain)
+            off = int(getattr(self, "rotate_offset", 0) or 0)
+            if base and off:
+                off %= len(base)
+                base = base[off:] + base[:off]
+            pending: List[Type[AgentInstance]] = base * self._cycles
             total = len(pending)
             attempts = 0
             # Per-provider count of bounded same-provider transport retries already
@@ -365,6 +375,10 @@ def make_fallback_agent(
                 self.stdout = sub.stdout
                 self.stderr = sub.stderr
                 self.returncode = sub.returncode
+                # Record which provider actually produced the accepted output, so a
+                # caller (e.g. the adversarial loop) can tell whether a rotation
+                # actually changed the generator (#65).
+                self.last_provider = agent_cls.__name__
                 if attempts > 1:
                     logger.info("[Fallback] recovered via %s", label)
                 return result

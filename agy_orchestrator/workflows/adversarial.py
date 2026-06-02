@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from typing import Callable, Optional
 
@@ -97,6 +98,19 @@ class AdversarialReview:
         # the whole iteration budget against an unfixable host problem. Counts the
         # infra-suspected regenerate attempts already spent.
         self._infra_suspected_retries = 0
+        # #65: rotate the generator's fallback chain after K consecutive VERIFY
+        # failures so a model stuck in a local optimum (re-emitting the same
+        # failing change with full feedback) hands the step to the next configured
+        # generator instead of monopolizing all max_iterations. Only meaningful for
+        # a multi-provider generator (a FallbackAgent with >1 provider); a no-op
+        # otherwise. The critic chain is left untouched.
+        self._consecutive_verify_fails = 0
+        self.generator_rotations = 0
+        try:
+            self._rotate_after = max(1, int(os.environ.get("AGY_GENERATOR_ROTATE_AFTER", "2")))
+        except Exception:
+            self._rotate_after = 2
+        self._gen_chain_len = len(getattr(generator_instance, "_chain", []) or [])
         self.event_callback = event_callback
 
     def _emit_orchestration(self, **fields) -> None:
@@ -253,6 +267,47 @@ class AdversarialReview:
                     # Fall through to the normal regenerate path (feed the failing
                     # code + error back); the retry counter gates the next round.
                 logger.info("Programmatic verification failed. Sending back to generator.")
+                # #65: after K consecutive verify-failures, advance the generator's
+                # fallback chain so the NEXT configured provider attempts the step —
+                # a model stuck re-emitting the same failing change (with full
+                # feedback) shouldn't monopolize every iteration while the other
+                # generators sit idle. No-op for a single-provider generator; the
+                # critic chain is untouched. Capped at chain_len-1 rotations so we
+                # cycle through distinct providers rather than looping back.
+                self._consecutive_verify_fails += 1
+                if (self._gen_chain_len > 1
+                        and self.generator_rotations < self._gen_chain_len - 1
+                        and self._consecutive_verify_fails >= self._rotate_after
+                        and iteration + 1 < self.max_iterations):
+                    self.generator_rotations += 1
+                    self._consecutive_verify_fails = 0
+                    try:
+                        self.generator.rotate_offset = (
+                            int(getattr(self.generator, "rotate_offset", 0) or 0) + 1
+                        )
+                    except Exception:
+                        pass
+                    nxt = None
+                    try:
+                        chain = getattr(self.generator, "_chain", []) or []
+                        if chain:
+                            nxt = chain[self.generator_rotations % len(chain)].__name__
+                    except Exception:
+                        nxt = None
+                    logger.warning(
+                        "Generator failed verification %d× consecutively; rotating to "
+                        "the next configured generator%s for the remaining iterations "
+                        "(#65).",
+                        self._rotate_after, f" ({nxt})" if nxt else "",
+                    )
+                    self._emit_orchestration(
+                        phase="adversarial",
+                        action="generator_rotation",
+                        iteration=iteration + 1,
+                        iteration_total=self.max_iterations,
+                        to_worker=nxt,
+                        generator_rotations=self.generator_rotations,
+                    )
                 # Feed the failing CODE back with the error, not just the error —
                 # regenerating from scratch loses the working parts (matches the
                 # test-feedback loop in workflows/test_feedback.py).
