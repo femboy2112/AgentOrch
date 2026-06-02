@@ -22,6 +22,11 @@ from pathlib import Path
 from harness import roles
 from harness.dispatch import RUNS_DIR, dispatch
 
+# Singleton-broker routing (C4). These imports are stdlib-only / cheap; the
+# broker layer is opt-in and never touched unless --queue/--detach is used or a
+# broker is already reachable on the auto path.
+from harness import broker_client
+
 C_RESET, C_BOLD, C_GREEN, C_RED, C_YELLOW, C_CYAN = (
     "\033[0m", "\033[1m", "\033[32m", "\033[31m", "\033[33m", "\033[36m"
 )
@@ -116,9 +121,162 @@ def _print_result(result) -> None:
     print("              prompt.txt  stdout.log  stderr.log  changed-files.diff  meta.json")
 
 
+# --------------------------------------------------------------------------- #
+# Singleton-broker routing helpers (C4). All additive: a `do` with neither
+# --queue nor --direct and no broker running takes the local path below
+# byte-identically to before.
+# --------------------------------------------------------------------------- #
+
+# Provider tokens that name a real account pool (the account-sharing rule). The
+# broker coordinates these across its two live lines. 'computer-use' is not a
+# provider pool, so it is dropped from a job's pools.
+_POOL_PROVIDERS = ("codex", "agy", "claude", "grok")
+
+
+def _derive_pools(gen_chain, crit_chain) -> list:
+    """The set of provider pools a job can touch, from its resolved gen/critic
+    chains (reuses ``harness.roles`` defaults when a chain was not overridden).
+
+    Returns a sorted list of provider names among codex/agy/claude/grok — the
+    broker uses it to keep two concurrent lines off the same account pool.
+    """
+    gen = list(gen_chain) if gen_chain else list(roles.GENERATOR_CHAIN)
+    crit = list(crit_chain) if crit_chain else list(roles.CRITIC_CHAIN)
+    pools = {tok for tok in (gen + crit) if tok in _POOL_PROVIDERS}
+    return sorted(pools)
+
+
+def _result_from_meta(run_id: str):
+    """Reconstruct a ``DispatchResult`` from a completed run's meta.json so the
+    broker-routed result card is identical to a local run's. Returns None if the
+    run dir / meta.json is missing or unreadable."""
+    from dataclasses import fields as _fields
+
+    from harness.dispatch import DispatchResult
+
+    meta_path = RUNS_DIR / run_id / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    allowed = {f.name for f in _fields(DispatchResult)}
+    kept = {k: v for k, v in meta.items() if k in allowed}
+    try:
+        return DispatchResult(**kept)
+    except TypeError:
+        return None
+
+
+def _print_broker_result(job: dict) -> int:
+    """Print the result card for a terminal broker job and return an exit code.
+
+    Prefers the full meta.json card (identical to a local run); falls back to a
+    compact summary if the run dir is unavailable (e.g. an out-dir run, or a job
+    that failed before minting a run)."""
+    result_obj = None
+    run_id = job.get("run_id")
+    if run_id:
+        result_obj = _result_from_meta(run_id)
+    if result_obj is not None:
+        _print_result(result_obj)
+        return 0 if result_obj.success else 1
+    # Compact fallback: no meta.json to render.
+    res = job.get("result") or {}
+    success = bool(res.get("success")) and job.get("status") == "done"
+    ok = f"{C_GREEN}OK{C_RESET}" if success else f"{C_RED}FAILED{C_RESET}"
+    print(f"\n{C_BOLD}── broker job {job.get('id')} [{ok}] ──{C_RESET}")
+    print(f"  status    : {job.get('status')}")
+    if run_id:
+        print(f"  run_id    : {run_id}")
+    if res.get("error"):
+        print(f"  {C_RED}error     : {res['error']}{C_RESET}")
+    return 0 if success else 1
+
+
+def _wait_for_job(job_id: str, *, poll: float = 0.5):
+    """Poll the broker for ``job_id`` until it reaches a terminal status; return
+    the final job dict (or None if the broker became unreachable / forgot it)."""
+    import time as _time
+
+    from harness.job_queue import _TERMINAL_STATUSES
+
+    while True:
+        try:
+            job = broker_client.status(job_id)
+        except broker_client.BrokerError:
+            return None
+        except OSError:
+            return None
+        if job is None:
+            return None
+        if job.get("status") in _TERMINAL_STATUSES:
+            return job
+        _time.sleep(poll)
+
+
+def _route_to_broker(args, instruction: str, kwargs: dict, pools: list) -> int:
+    """Submit a job to a running broker and either detach or wait+print.
+
+    Caller guarantees a broker is reachable. ``kwargs`` must be json-safe (the
+    caller strips non-serializable members like a live GraphPlan)."""
+    try:
+        job_id = broker_client.submit(instruction, kwargs, pools)
+    except (broker_client.BrokerError, OSError) as exc:
+        print(f"{C_RED}broker submit failed: {exc}{C_RESET}", file=sys.stderr)
+        return 1
+    if getattr(args, "detach", False):
+        # --detach: print the job id only (machine-friendly on stdout).
+        print(job_id)
+        return 0
+    print(
+        f"{C_CYAN}queued job {job_id} on the broker (pools={','.join(pools) or 'none'}); "
+        f"waiting...{C_RESET}",
+        file=sys.stderr,
+    )
+    job = _wait_for_job(job_id)
+    if job is None:
+        print(
+            f"{C_RED}broker became unreachable while waiting for {job_id}; "
+            f"check `harness queue`{C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+    return _print_broker_result(job)
+
+
+def _broker_kwargs(dispatch_kwargs: dict) -> dict:
+    """JSON-safe projection of dispatch kwargs for an IPC submit.
+
+    The broker re-invokes ``dispatch_async(**kwargs)`` in its own process, so the
+    kwargs must survive a JSON round-trip. ``out_dir`` is coerced to ``str``;
+    ``run_id`` is dropped (the broker mints its own run). A live ``plan_graph``
+    object is NOT json-safe — callers must reject broker routing when it is set."""
+    out = dict(dispatch_kwargs)
+    out.pop("run_id", None)
+    if out.get("out_dir") is not None:
+        out["out_dir"] = str(out["out_dir"])
+    return out
+
+
 def _cmd_do(args) -> int:
     gen_chain = args.generator.split(",") if args.generator else None
     crit_chain = args.critic.split(",") if args.critic else None
+
+    # C4 routing flags (additive). --queue / --direct are mutually exclusive.
+    route_queue = getattr(args, "queue", False)
+    route_direct = getattr(args, "direct", False)
+    if route_queue and route_direct:
+        print(f"{C_RED}--queue and --direct are mutually exclusive{C_RESET}", file=sys.stderr)
+        return 1
+    if getattr(args, "detach", False) and route_direct:
+        print(
+            f"{C_RED}--detach requires routing to the broker; it is incompatible "
+            f"with --direct{C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
     spec_text = None
     if args.spec:
         spec_path = Path(args.spec).expanduser()
@@ -305,8 +463,11 @@ def _cmd_do(args) -> int:
             print(f"{C_RED}bad --computer-use-budgets JSON: {e}{C_RESET}", file=sys.stderr)
             return 1
 
-    result = dispatch(
-        args.instruction,
+    # Build the dispatch kwargs ONCE. The local path forwards them verbatim to
+    # dispatch() (byte-identical to today); the broker path forwards a json-safe
+    # projection to dispatch_async() in the broker process. Constructing this dict
+    # does NOT change the local call's arguments.
+    dispatch_kwargs = dict(
         mode=args.mode,
         context=args.context,
         generator_chain=gen_chain,
@@ -363,6 +524,43 @@ def _cmd_do(args) -> int:
         browser_engine=browser_engine,
         browser_display=browser_display,
     )
+
+    # ---------------------------------------------------------------- routing
+    # --direct  -> always local (today's path), even if a broker is up.
+    # --queue   -> require a running broker; error clearly if none.
+    # neither   -> auto: broker reachable => submit to it; else local.
+    # A live GraphPlan object is not json-safe, so it can't cross the IPC wire;
+    # such a run stays local (error under --queue, silent local fallback on auto).
+    if not route_direct:
+        broker_up = route_queue or broker_client.is_running()
+        if route_queue and not broker_up:
+            print(
+                f"{C_RED}--queue requires a running broker, but none is reachable "
+                f"on {broker_client._resolve(None)}. Start one with "
+                f"`python -m harness serve` (or drop --queue to run locally).{C_RESET}",
+                file=sys.stderr,
+            )
+            return 1
+        if broker_up:
+            if plan_graph is not None:
+                msg = (
+                    "a graph DAG plan cannot be routed through the broker yet "
+                    "(the plan object is not serializable over IPC)"
+                )
+                if route_queue:
+                    print(f"{C_RED}{msg}; run it with --direct.{C_RESET}", file=sys.stderr)
+                    return 1
+                print(
+                    f"{C_YELLOW}note: {msg}; running locally.{C_RESET}",
+                    file=sys.stderr,
+                )
+            else:
+                pools = _derive_pools(gen_chain, crit_chain)
+                return _route_to_broker(
+                    args, args.instruction, _broker_kwargs(dispatch_kwargs), pools
+                )
+
+    result = dispatch(args.instruction, **dispatch_kwargs)
     _print_result(result)
     if getattr(args, "plan_only", False) and result.success:
         # Graph round-trip hint (docs §5 M5): if the emitted plan.json is a graph
@@ -455,6 +653,70 @@ def _cmd_show(args) -> int:
     if diff.exists():
         print(f"\n{C_BOLD}changed-files.diff{C_RESET}")
         print(diff.read_text())
+    return 0
+
+
+def _cmd_serve(args) -> int:
+    """Run the singleton broker in the foreground: bind the IPC socket, honor the
+    singleton guard (refuse a rival), and drain the persistent queue with a
+    concurrency cap. The operator daemonizes via nohup/systemd as desired."""
+    import asyncio
+
+    from harness.broker import BrokerAlreadyRunning, make_server
+
+    server = make_server(cap=args.cap)
+    try:
+        asyncio.run(server.serve_forever())
+    except BrokerAlreadyRunning as exc:
+        print(
+            f"{C_RED}{exc} (socket {exc.sock_path}); not starting a rival. "
+            f"Stop the running broker first, or use `harness queue` to inspect "
+            f"it.{C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+    except KeyboardInterrupt:
+        print(f"\n{C_YELLOW}broker stopped{C_RESET}", file=sys.stderr)
+        return 0
+    return 0
+
+
+def _cmd_queue(args) -> int:
+    """List the broker's queue as a table (id, status, mode, instruction head)."""
+    if not broker_client.is_running():
+        print(
+            f"{C_YELLOW}no broker is running (nothing queued). Start one with "
+            f"`python -m harness serve`.{C_RESET}"
+        )
+        return 0
+    try:
+        jobs = broker_client.list_jobs()
+    except (broker_client.BrokerError, OSError) as exc:
+        print(f"{C_RED}could not read broker queue: {exc}{C_RESET}", file=sys.stderr)
+        return 1
+    if not jobs:
+        print("(broker queue is empty)")
+        return 0
+
+    _status_col = {
+        "queued": C_YELLOW, "running": C_CYAN, "done": C_GREEN,
+        "failed": C_RED, "canceled": C_YELLOW,
+    }
+
+    def _head(text: str, width: int = 48) -> str:
+        text = " ".join((text or "").split())
+        return text if len(text) <= width else text[: width - 1] + "…"
+
+    print(f"{C_BOLD}{'ID':<22}  {'STATUS':<9}  {'MODE':<11}  INSTRUCTION{C_RESET}")
+    for job in jobs:
+        kwargs = job.get("kwargs") or {}
+        mode = kwargs.get("mode", "") or ""
+        status = job.get("status", "")
+        col = _status_col.get(status, "")
+        print(
+            f"{job.get('id',''):<22}  {col}{status:<9}{C_RESET}  {mode:<11}  "
+            f"{_head(job.get('instruction', ''))}"
+        )
     return 0
 
 
@@ -723,6 +985,29 @@ def main(argv=None) -> int:
                          "Injected as the authoritative design the worker must implement; "
                          "in master mode the planner decomposes THIS design instead of "
                          "re-inventing one from the instruction.")
+    # C4: singleton-broker routing (additive, opt-in). Default behavior (neither
+    # flag, no broker running) is byte-identical to today's local dispatch.
+    route = do.add_argument_group("broker routing (singleton layer)")
+    route_excl = route.add_mutually_exclusive_group()
+    route_excl.add_argument(
+        "--queue", action="store_true",
+        help="Submit this dispatch to a running broker (`harness serve`) instead "
+             "of running it in-process; error if no broker is reachable. The "
+             "broker drains jobs with a concurrency cap of 2 and keeps the two "
+             "live lines off the same provider account pool.",
+    )
+    route_excl.add_argument(
+        "--direct", action="store_true",
+        help="Force a local in-process dispatch even if a broker is running "
+             "(today's path). Default with no flag is AUTO: route to the broker "
+             "if one is reachable, else run locally.",
+    )
+    route.add_argument(
+        "--detach", action="store_true",
+        help="With broker routing: submit the job and print its id, then exit "
+             "(don't wait for completion). Track it with `harness queue`. "
+             "Incompatible with --direct.",
+    )
     do.set_defaults(func=_cmd_do)
 
     spec = sub.add_parser(
@@ -758,6 +1043,24 @@ def main(argv=None) -> int:
     show = sub.add_parser("show", help="Show a run's diff and metadata")
     show.add_argument("run_id", type=str)
     show.set_defaults(func=_cmd_show)
+
+    serve = sub.add_parser(
+        "serve",
+        help="Run the singleton broker (foreground): persistent queue + cap-2 "
+             "drain loop + IPC socket. Refuses to start if one is already running.",
+    )
+    serve.add_argument(
+        "--cap", type=int, default=None, metavar="N",
+        help="Max concurrent orchestration lines the broker drains at once "
+             "(default 2). Two lines are kept off the same provider account pool.",
+    )
+    serve.set_defaults(func=_cmd_serve)
+
+    queue = sub.add_parser(
+        "queue",
+        help="List the broker's build queue (id, status, mode, instruction head).",
+    )
+    queue.set_defaults(func=_cmd_queue)
 
     dashboard = sub.add_parser("dashboard", help="Launch the AgentOrch control dashboard")
     dashboard.add_argument("--port", type=int, default=8765, help="Dashboard port (default: 8765)")
