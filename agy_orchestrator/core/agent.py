@@ -734,8 +734,28 @@ class AgentInstance(ABC):
             self._watchdog_reason = WATCHDOG_VERBOSE
             logger.warning("watchdog: VERBOSE trip (post-exit) — %d bytes > budget %d",
                            out_total[0], max_output_bytes)
+        # #69: close the subprocess transport IN-loop so its pipe fds are released
+        # now and it is not left for the garbage collector to finalize AFTER the
+        # event loop has been torn down — the source of the "RuntimeError: Event
+        # loop is closed" noise from BaseSubprocessTransport.__del__ at master-run
+        # teardown. (Child reaping itself is handled by the group kill above / #66.)
+        self._close_transport(process)
         self.last_out_bytes = out_total[0]
         return b"".join(out_chunks), b"".join(err_chunks)
+
+    @staticmethod
+    def _close_transport(proc: "asyncio.subprocess.Process") -> None:
+        """Close a finished subprocess's transport in-loop (best-effort, #69).
+
+        asyncio.subprocess leaves a BaseSubprocessTransport whose __del__ logs
+        "RuntimeError: Event loop is closed" if it is garbage-collected after the
+        loop is gone. Closing it here releases the pipe fds and avoids that noise."""
+        try:
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                transport.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _killpg_tree(proc: "asyncio.subprocess.Process") -> None:
@@ -763,13 +783,17 @@ class AgentInstance(ABC):
         Best-effort, bounded so a wedged process can't hang the reaping itself."""
         proc = self._current_process
         self._current_process = None
-        if proc is None or proc.returncode is not None:
+        if proc is None:
             return
-        self._killpg_tree(proc)
-        try:
-            await asyncio.wait_for(proc.wait(), 5)
-        except Exception:
-            pass
+        if proc.returncode is None:
+            self._killpg_tree(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except Exception:
+                pass
+        # #69: close the subprocess transport in-loop so it isn't left for the GC
+        # to finalize after the event loop is gone ("Event loop is closed").
+        self._close_transport(proc)
 
     def _absolute_cap(self) -> float:
         """Hard wall-clock ceiling for a streaming call (0 = uncapped); fires even
