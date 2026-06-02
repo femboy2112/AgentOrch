@@ -195,20 +195,59 @@ def _live_stale_seconds() -> float:
         return 1800.0
 
 
+def _run_pid_alive(run_dir: Path) -> Optional[bool]:
+    """Liveness of the dispatch that owns ``run_dir``, from its recorded run.pid.
+
+    Returns True (process alive), False (recorded but dead — a stillborn/killed
+    run), or None (no pid recorded, or it can't be checked → caller falls back to
+    the recency gate). Same-host check (os.kill(pid, 0)); good enough for the
+    single-workstation bot, conservative on any ambiguity (#67)."""
+    try:
+        raw = (run_dir / "run.pid").read_text(encoding="utf-8").strip()
+    except Exception:
+        return None  # no pid file (old run, or unreadable) -> unknown
+    try:
+        pid = int(raw)
+    except Exception:
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+        return True            # signal 0 delivered -> alive
+    except ProcessLookupError:
+        return False           # no such process -> dead (deregister now)
+    except PermissionError:
+        return True            # exists but not ours -> alive
+    except Exception:
+        return None            # anything else -> unknown, fall back to recency
+
+
 def is_live_run(run_dir: Path) -> bool:
-    """True iff the run is ACTIVELY streaming: events.jsonl exists, no terminal
-    meta.json, AND the event stream was written recently.
+    """True iff the run is ACTIVELY in progress: no terminal meta.json, and either
+    its recorded dispatch PID is still alive (#67) or — when no PID is recorded —
+    its event stream was written recently.
 
     ``meta.json`` is written only when a run FINISHES, so events-without-meta is
-    how the bot discovers runs it never started. The recency gate is the fix for
-    a stale/aborted dir (events.jsonl but no meta, untouched for days) being
-    reported as perpetually "in progress" — a dead run is not a live one.
+    how the bot discovers runs it never started. The PID check deregisters a
+    stillborn/early-exiting/killed run the instant its process is gone; the recency
+    gate is the fallback (and the fix for a stale dir reported as perpetually "in
+    progress" — a dead run is not a live one).
     """
     try:
         if not run_dir.is_dir():
             return False
+        if (run_dir / "meta.json").exists():
+            return False  # finished -> terminal, never "in progress"
+        # Definitive signal first: the owning process's liveness.
+        pid_state = _run_pid_alive(run_dir)
+        if pid_state is True:
+            return True
+        if pid_state is False:
+            return False  # process gone, no terminal meta -> aborted/stillborn
+        # No usable PID (old run): fall back to "events exist AND are recent".
         ev = _events_path(run_dir)
-        if not ev.exists() or (run_dir / "meta.json").exists():
+        if not ev.exists():
             return False
         stale = _live_stale_seconds()
         if stale > 0:
@@ -349,7 +388,15 @@ def summarize_runs(n: int = 5) -> str:
     for d in dirs[:n]:
         meta = _read_meta(d)
         if meta is None:
-            out.append(f"• <code>{_e(d.name)}</code> · in progress")
+            # #67: only call it "in progress" when the run is actually live (its
+            # dispatch PID is alive, or — for an old run with no PID — its events
+            # are recent). A stillborn / early-exited / killed run that never wrote
+            # a terminal meta is shown as aborted, so it stops inflating the
+            # open-run count forever.
+            if is_live_run(d):
+                out.append(f"• <code>{_e(d.name)}</code> · in progress")
+            else:
+                out.append(f"⚠️ <code>{_e(d.name)}</code> · aborted (no result)")
             continue
         icon = "✅" if meta.get("success") else "❌"
         mode = _e(meta.get("mode") or "")

@@ -1416,6 +1416,13 @@ async def dispatch_async(
     run_dir.mkdir(parents=True, exist_ok=True)
     events_path = run_dir / "events.jsonl"
     events_path.touch()
+    # Record the dispatching PID so the run tracker can deregister a stillborn /
+    # early-exiting / killed run the instant its process is gone, instead of
+    # showing it "in progress" forever (issue #67). Best-effort; never fatal.
+    try:
+        (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
 
     # Plan provenance (#56): when --plan injected a file, hash its raw bytes and
     # record where it came from so the executed plan is auditable after the fact.
