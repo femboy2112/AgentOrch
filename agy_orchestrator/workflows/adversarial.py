@@ -82,6 +82,12 @@ class AdversarialReview:
         self.approved = False
         self.verified = False  # programmatic verifier passed
         self.stalled = False   # bailed early on a repeated critique
+        # #50: the verifier TIMED OUT or was RESOURCE-killed (OOM) — an infra
+        # condition, NOT a code defect. Regenerating can't fix a too-slow suite
+        # or an oversubscribed host, so the loop bails instead of burning the
+        # iteration budget against unbroken code. Surfaced for the run ledger.
+        self.verifier_infra_failed = False
+        self.infra_reason: Optional[str] = None
         self.event_callback = event_callback
 
     def _emit_orchestration(self, **fields) -> None:
@@ -110,6 +116,8 @@ class AdversarialReview:
             return "verified"
         if self.approved:
             return "approved"
+        if self.verifier_infra_failed:
+            return self.infra_reason or "verifier_infra_failed"
         if self.stalled:
             return "stalled"
         return "continue"
@@ -150,6 +158,44 @@ class AdversarialReview:
                         iteration=iteration + 1,
                         iteration_total=self.max_iterations,
                         outcome=self._iteration_outcome(),
+                        verified=self.verified,
+                        approved=self.approved,
+                    )
+                    return last_output
+                # #50: a verifier TIMEOUT or RESOURCE-kill is an INFRA condition,
+                # not a code defect. The verifier already distinguishes these
+                # (VerifierResult.timeout / .resource_exceeded) precisely so a
+                # consumer won't misread them — but the old blanket "send back to
+                # generator" discarded that, regenerating against unbroken code
+                # until the iteration budget was exhausted and logging the same
+                # opaque "verification failed" every round. Branch out instead:
+                # don't regenerate (it cannot help a too-slow suite or an OOM),
+                # surface the real cause distinctly, and bail this step now.
+                if result.timeout or result.resource_exceeded:
+                    self.verifier_infra_failed = True
+                    if result.timeout:
+                        self.infra_reason = "verifier_timeout"
+                        logger.error(
+                            "Verifier TIMED OUT (infra, not a code defect): %s. "
+                            "NOT regenerating — regeneration cannot fix a timeout. "
+                            "Raise AGY_TEST_TIMEOUT, or reduce host load / -n so the "
+                            "baseline suite fits the budget.",
+                            result.message,
+                        )
+                    else:
+                        self.infra_reason = "verifier_resource_exceeded"
+                        logger.error(
+                            "Verifier was RESOURCE-killed (OOM, infra not a code "
+                            "defect): %s. NOT regenerating — regeneration cannot fix "
+                            "an OOM. Raise the verifier memory cap or reduce -n.",
+                            result.message,
+                        )
+                    self._emit_orchestration(
+                        phase="adversarial",
+                        action="iteration_completed",
+                        iteration=iteration + 1,
+                        iteration_total=self.max_iterations,
+                        outcome=self.infra_reason,
                         verified=self.verified,
                         approved=self.approved,
                     )
