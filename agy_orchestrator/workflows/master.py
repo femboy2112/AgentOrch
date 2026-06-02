@@ -899,6 +899,22 @@ class MasterWorkflow:
         stalled = bool(getattr(adv, "stalled", False))
         iterations_used = int(getattr(adv, "iterations_used", 0) or 0)
 
+        # Surface the step's *real* terminal outcome on the completed transition so
+        # progress sinks (e.g. the Telegram notifier) can distinguish a verified
+        # step from an infra failure (#50) or a stalled loop. Without this the sink
+        # sees no outcome and renders every step as a benign success.
+        infra_reason = getattr(adv, "infra_reason", None)
+        if verified:
+            step_outcome = "verified"
+        elif approved:
+            step_outcome = "approved"
+        elif bool(getattr(adv, "verifier_infra_failed", False)):
+            step_outcome = infra_reason or "verifier_infra_failed"
+        elif stalled:
+            step_outcome = "stalled"
+        else:
+            step_outcome = None  # no terminal signal -> neutral; sink stays quiet
+
         logger.info(f"Step {step_index} Completed. Summarizing for project context.")
         self._emit_orchestration(
             phase="step",
@@ -906,6 +922,9 @@ class MasterWorkflow:
             step_index=step_index,
             step_total=step_total,
             step_title=_truncate_orch_title(task),
+            outcome=step_outcome,
+            verified=verified or None,
+            approved=approved or None,
         )
         # Summarize the step output to keep project_context compact.
         # Passing full HTML/code outputs into every subsequent prompt balloons to 50KB+.

@@ -50,6 +50,18 @@ runs/
 *credentials*
 *secret*
 
+# Telegram bot — never track bot state, persisted prefs, token, or user data.
+# The whitelist + state files live OUTSIDE the repo by default; these patterns
+# are a defensive backstop so nothing telegram-related can ever be committed.
+bot_state.json
+*.bot_state.json
+.telegram_state.json
+users.json
+*.users.json
+*telegram*users*.json
+/tgbot/
+tgbot/
+
 # Editors / OS
 .idea/
 .vscode/

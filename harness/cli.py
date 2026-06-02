@@ -296,6 +296,8 @@ def _cmd_do(args) -> int:
         notify=args.notify or os.environ.get("AGY_NOTIFY") or None,
         notify_cmd=args.notify_cmd,
         heartbeat_interval=args.heartbeat_interval,
+        telegram_enabled=getattr(args, "telegram_enabled", None),
+        telegram_verbosity=getattr(args, "telegram_verbosity", None),
         gen_effort=args.gen_effort,
         gen_model=args.gen_model,
         critic_effort=args.critic_effort,
@@ -550,6 +552,21 @@ def main(argv=None) -> int:
                          "a watcher/dashboard reads one explicit liveness signal "
                          "instead of inferring it from file mtimes. Default 30 "
                          "(env AGY_HEARTBEAT_SECONDS); 0 disables.")
+    # Telegram build-progress bot. Auto-ON when TELEGRAM_BOT_KEY is set AND the
+    # whitelist (AGY_TELEGRAM_USERS) is non-empty; --no-telegram forces off,
+    # --telegram forces on (warns + stays off if key/whitelist missing).
+    tg = do.add_mutually_exclusive_group()
+    tg.add_argument("--telegram", dest="telegram_enabled", action="store_true", default=None,
+                    help="Force-enable Telegram build-progress notifications "
+                         "(needs TELEGRAM_BOT_KEY + a non-empty whitelist; warns "
+                         "and stays off if missing). Auto-on by default when both "
+                         "are present.")
+    tg.add_argument("--no-telegram", dest="telegram_enabled", action="store_false",
+                    help="Disable Telegram build-progress notifications for this run.")
+    do.add_argument("--telegram-verbosity", choices=["quiet", "normal", "verbose", "debug"],
+                    default=None,
+                    help="Telegram message verbosity (default env "
+                         "AGY_TELEGRAM_VERBOSITY else 'normal').")
     # Per-role / per-provider effort + model overrides (#42). The default tier
     # (codex gpt-5.3-codex / high) is right for routine work; crank these for a
     # mission-critical, invariant-touching build that wants every provider at

@@ -48,6 +48,13 @@ from dashboard.event_bus import EventBus
 from harness import roles
 from harness.run_monitor import Notifier, RunMonitor, RunStalled
 from harness.snapshot import diff_snapshots, take_snapshot
+from harness.telegram import (
+    TelegramClient,
+    TelegramNotifier,
+    load_whitelist,
+    resolve_verbosity,
+    whitelist_chat_ids,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "runs"
@@ -1013,6 +1020,55 @@ async def _run_reconciliation(
     return await station.execute()
 
 
+def _build_telegram_notifier(
+    *,
+    run_id: str,
+    mode: str,
+    enabled: Optional[bool],
+    verbosity: Optional[str],
+) -> Optional["TelegramNotifier"]:
+    """Construct a TelegramNotifier per the tri-state enable policy, or None.
+
+    enabled: None=auto (ON iff key present AND whitelist non-empty), True=force
+    ON (warn + return None if key/whitelist missing — non-fatal), False=off.
+    Any error here is swallowed; telegram never blocks or fails a dispatch.
+    """
+    try:
+        if enabled is False:
+            return None
+        client = TelegramClient()
+        # Default-off path (auto, no token): avoid the whitelist file read entirely
+        # when there's no token, since telegram can't activate anyway. The forced
+        # path (--telegram) still falls through to warn about what's missing.
+        if enabled is not True and not client.configured:
+            return None
+        entries = load_whitelist()
+        chat_ids = whitelist_chat_ids(entries)
+        if not client.configured or not chat_ids:
+            if enabled is True:
+                missing = []
+                if not client.configured:
+                    missing.append("TELEGRAM_BOT_KEY")
+                if not chat_ids:
+                    missing.append("whitelist")
+                logger.warning(
+                    "telegram: --telegram requested but %s missing — staying off "
+                    "(non-fatal)",
+                    " and ".join(missing),
+                )
+            return None
+        return TelegramNotifier(
+            run_id=run_id,
+            mode=mode,
+            verbosity=resolve_verbosity(verbosity),
+            client=client,
+            chat_ids=chat_ids,
+        )
+    except Exception as exc:  # best-effort: telegram never affects dispatch
+        logger.debug("telegram notifier setup failed: %s", exc)
+        return None
+
+
 async def dispatch_async(
     instruction: str,
     *,
@@ -1054,6 +1110,12 @@ async def dispatch_async(
     notify: Optional[str] = None,
     notify_cmd: Optional[str] = None,
     heartbeat_interval: Optional[float] = None,
+    # Telegram build-progress bot. ``telegram_enabled`` is tri-state:
+    #   None  -> auto (ON iff TELEGRAM_BOT_KEY set AND whitelist non-empty),
+    #   True  -> force ON (warn + stay off if key/whitelist missing; non-fatal),
+    #   False -> force OFF. Verbosity falls back to AGY_TELEGRAM_VERBOSITY/normal.
+    telegram_enabled: Optional[bool] = None,
+    telegram_verbosity: Optional[str] = None,
     # Per-role / per-provider effort+model overrides (#42)
     gen_effort: Optional[str] = None,
     gen_model: Optional[str] = None,
@@ -1271,6 +1333,18 @@ async def dispatch_async(
             setattr(agent, "_harness_events_path", str(events_path))
 
     EVENT_BUS.add_sink(run_id, _sink)
+
+    # Telegram build-progress sink (best-effort; fully exception-isolated). Any
+    # telegram error here is swallowed (debug log) and never affects dispatch.
+    telegram_notifier = _build_telegram_notifier(
+        run_id=run_id,
+        mode=mode,
+        enabled=telegram_enabled,
+        verbosity=telegram_verbosity,
+    )
+    if telegram_notifier is not None:
+        EVENT_BUS.add_sink(run_id, telegram_notifier)
+
     dispatch_pub = EVENT_BUS.publisher_for(
         run_id,
         worker=generator_chain[0],
@@ -1768,6 +1842,14 @@ async def dispatch_async(
     (run_dir / "meta.json").write_text(
         json.dumps(meta_dict, indent=2), encoding="utf-8"
     )
+
+    # Telegram final-summary card (best-effort; never affects dispatch result).
+    if telegram_notifier is not None:
+        try:
+            telegram_notifier.finished(meta_dict)
+        except Exception as exc:
+            logger.debug("telegram finish summary failed: %s", exc)
+
     return result
 
 
@@ -1804,6 +1886,8 @@ def dispatch(
     notify: Optional[str] = None,
     notify_cmd: Optional[str] = None,
     heartbeat_interval: Optional[float] = None,
+    telegram_enabled: Optional[bool] = None,
+    telegram_verbosity: Optional[str] = None,
     # Per-role / per-provider effort+model overrides (#42)
     gen_effort: Optional[str] = None,
     gen_model: Optional[str] = None,
@@ -1865,6 +1949,8 @@ def dispatch(
             notify=notify,
             notify_cmd=notify_cmd,
             heartbeat_interval=heartbeat_interval,
+            telegram_enabled=telegram_enabled,
+            telegram_verbosity=telegram_verbosity,
             gen_effort=gen_effort,
             gen_model=gen_model,
             critic_effort=critic_effort,
