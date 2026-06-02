@@ -88,6 +88,17 @@ def _parse_failed_tests(stdout_tail: str, limit: int = 25) -> List[str]:
             break
     return seen
 
+
+def _full_log_cap() -> int:
+    """Max chars of full verifier output persisted to verify_step<N>_iter<M>.full.log
+    (#64). Generous (1 MiB default) so pytest tracebacks survive; head+tail is kept
+    when exceeded. Tunable via AGY_VERIFY_FULL_LOG_MAX (0 = unbounded)."""
+    try:
+        return int(os.environ.get("AGY_VERIFY_FULL_LOG_MAX", str(1024 * 1024)) or 0)
+    except Exception:
+        return 1024 * 1024
+
+
 @dataclass
 class VerifierResult:
     ok: bool
@@ -387,7 +398,8 @@ class QualityVerifier:
                 # persisted nowhere. Log a bounded stdout tail (+ stderr tail when
                 # non-empty), persist the full tails to a per-iteration artifact, and
                 # emit the parsed failing-test nodeids into the event stream.
-                self._report_failure(result)
+                self._report_failure(result, stdout_bytes=stdout or b"",
+                                     stderr_bytes=stderr or b"")
                 # #61: a non-zero exit can still leave forked pool workers blocked
                 # on stdin — sweep the group before returning.
                 _kill_process_group(pgid)
@@ -422,13 +434,37 @@ class QualityVerifier:
         tail = "\n".join(stdout_tail.splitlines()[-max_lines:])
         return tail[-max_chars:]
 
-    def _report_failure(self, result: VerifierResult) -> None:
+    @staticmethod
+    def _head_tail(text: str, max_chars: int) -> str:
+        """Keep both the HEAD and TAIL of ``text`` within ``max_chars`` (#64).
+
+        pytest writes per-failure tracebacks BEFORE the short summary, so a pure
+        tail cut loses the assertion detail. When the output exceeds the budget,
+        retain the first and last halves (tracebacks + summary) with an elision
+        marker between; ``max_chars <= 0`` means unbounded."""
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        half = max_chars // 2
+        elided = len(text) - 2 * half
+        return (f"{text[:half]}\n"
+                f"... [{elided} bytes elided — head+tail kept] ...\n"
+                f"{text[-half:]}")
+
+    def _report_failure(self, result: VerifierResult, *,
+                        stdout_bytes: bytes = b"", stderr_bytes: bytes = b"") -> None:
         """Surface a non-timeout verifier failure (#60): WARNING-log the stdout tail,
-        persist the full tails to a per-iteration artifact, and emit the parsed
-        failing-test nodeids into the event stream. All best-effort and bounded."""
+        persist a quick-glance artifact AND the FULL output (#64), and emit the
+        parsed failing-test nodeids into the event stream. All best-effort/bounded.
+
+        ``stdout_bytes``/``stderr_bytes`` are the FULL captured streams (the result
+        only carries a 2 KB tail, which drops pytest tracebacks — the #64 gap)."""
         # Advance the per-step iteration counter so repeated failures within one
         # build step land in distinct artifacts (verify_step<N>_iter<M>.log).
         self._iter_index += 1
+        # Full decoded streams (fall back to the result tails if not supplied).
+        full_out = stdout_bytes.decode(errors="replace") if stdout_bytes else result.stdout_tail
+        full_err = stderr_bytes.decode(errors="replace") if stderr_bytes else result.stderr_tail
+
         out_tail = self._stdout_log_tail(result.stdout_tail)
         if out_tail:
             logger.warning(
@@ -443,31 +479,44 @@ class QualityVerifier:
                 result.stderr_tail[-1500:],
             )
 
-        # (2) Persist the full captured tails to a per-iteration artifact so
-        # post-hoc diagnosis needs no re-run. Opt-in on run_dir being set.
+        # (2) Persist a per-iteration artifact so post-hoc diagnosis needs no
+        # re-run. Opt-in on run_dir being set. TWO files (#64):
+        #   * verify_step<N>_iter<M>.log      — the 2 KB quick-glance tails;
+        #   * verify_step<N>_iter<M>.full.log — the FULL output (head+tail bounded
+        #     by AGY_VERIFY_FULL_LOG_MAX) so the per-failure pytest TRACEBACKS,
+        #     which precede the summary and were dropped by the tail cut, survive.
         if self.run_dir:
+            from pathlib import Path
+            base = Path(self.run_dir)
+            stem = f"verify_step{self.step_index}_iter{self._iter_index}"
+            header = (
+                f"$ {result.cmd}\n"
+                f"exit code: {result.returncode}\n"
+                f"duration_ms: {result.duration_ms}\n"
+                f"message: {result.message}\n"
+            )
             try:
-                from pathlib import Path
-                artifact = Path(self.run_dir) / (
-                    f"verify_step{self.step_index}_iter{self._iter_index}.log"
-                )
-                artifact.write_text(
-                    f"$ {result.cmd}\n"
-                    f"exit code: {result.returncode}\n"
-                    f"duration_ms: {result.duration_ms}\n"
-                    f"message: {result.message}\n"
-                    "=== STDOUT ===\n"
-                    f"{result.stdout_tail}\n"
-                    "=== STDERR ===\n"
-                    f"{result.stderr_tail}\n",
+                (base / f"{stem}.log").write_text(
+                    f"{header}=== STDOUT (tail) ===\n{result.stdout_tail}\n"
+                    f"=== STDERR (tail) ===\n{result.stderr_tail}\n",
                     encoding="utf-8",
                 )
             except Exception as exc:  # never let observability fail a run
                 logger.debug("Could not persist verify artifact: %s", exc)
+            try:
+                cap = _full_log_cap()
+                (base / f"{stem}.full.log").write_text(
+                    f"{header}=== STDOUT (full) ===\n{self._head_tail(full_out, cap)}\n"
+                    f"=== STDERR (full) ===\n{self._head_tail(full_err, cap)}\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                logger.debug("Could not persist full verify artifact: %s", exc)
 
-        # (3) Parse "FAILED " lines from stdout and emit the failing-test names so
-        # a thrashing step is visible in events.jsonl.
-        failed = _parse_failed_tests(result.stdout_tail)
+        # (3) Parse "FAILED " lines from the FULL stdout (not just the 2 KB tail,
+        # which could miss failing tests listed earlier) and emit the names so a
+        # thrashing step is visible in events.jsonl.
+        failed = _parse_failed_tests(full_out)
         if failed and self.event_callback is not None:
             try:
                 self.event_callback({

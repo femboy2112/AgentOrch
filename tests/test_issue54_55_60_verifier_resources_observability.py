@@ -201,7 +201,9 @@ def test_failure_persists_artifact(tmp_path):
     assert artifact.exists()
     body = artifact.read_text()
     assert "tests/test_x.py::test_boom" in body
-    assert "=== STDOUT ===" in body
+    assert "=== STDOUT (tail) ===" in body  # quick-glance tail (#60/#64)
+    # #64: a sibling .full.log with the full output (head+tail) is also persisted.
+    assert (run_dir / "verify_step2_iter1.full.log").exists()
     # A second failure within the same step lands in a distinct iter artifact.
     _run(v.verify(str(tmp_path)))
     assert (run_dir / "verify_step2_iter2.log").exists()
