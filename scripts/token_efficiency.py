@@ -47,7 +47,7 @@ DEFAULT_GRID = [
     ("codex", "gpt-5.4-mini", "minimal"),
     ("codex", "gpt-5.4-mini", "low"),
     ("codex", "gpt-5.5", "low"),
-    ("codex", "gpt-5.3-codex", "low"),
+    ("codex", "gpt-5.3-codex-spark", "low"),
     ("claude", "haiku", "low"),
     ("claude", "sonnet", "low"),
     ("claude", "opus", "high"),

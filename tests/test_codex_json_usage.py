@@ -32,6 +32,25 @@ def test_build_command_has_json_and_output_file() -> None:
     assert "--skip-git-repo-check" in cmd
 
 
+def test_standard_model_maps_to_account_valid_spark() -> None:
+    # The harness default codex model is the "standard" alias. It MUST map to the
+    # ChatGPT-account-valid "gpt-5.3-codex-spark" — the bare "gpt-5.3-codex" 400s
+    # ("model is not supported when using Codex with a ChatGPT account"), which
+    # silently fell codex back off every call.
+    cmd = CodexAgent(prompt="hi", model="standard").build_command()
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.3-codex-spark"
+    assert "gpt-5.3-codex" not in cmd  # the bare (rejected) name must not appear
+
+
+def test_explicit_model_passes_through_and_none_omits_flag() -> None:
+    # An explicit override is honored verbatim (operator's choice / #42).
+    cmd = CodexAgent(prompt="hi", model="gpt-5.5").build_command()
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.5"
+    # No model => no --model flag => codex uses the account default (also valid).
+    assert "--model" not in CodexAgent(prompt="hi").build_command()
+
+
 def test_extract_usage_normalizes_cache_inclusive() -> None:
     # codex/OpenAI: input_tokens is INCLUSIVE of cached. Numbers from the real probe.
     line = json.dumps({

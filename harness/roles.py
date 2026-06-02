@@ -83,7 +83,7 @@ WORKER_FAMILY: Dict[str, str] = {
 
 # Per-provider model/effort. "best model" per provider, high effort.
 AGENT_DEFAULTS: Dict[str, Dict[str, object]] = {
-    "codex": {"model": "standard", "effort": "high"},   # -> gpt-5.3-codex
+    "codex": {"model": "standard", "effort": "high"},   # -> gpt-5.3-codex-spark
     "agy": {"model": "pro", "effort": "high"},           # agy's best tier
     "claude": {"model": "opus", "effort": "high"},
     # xAI Grok agentic CLI. Only `grok-build` exists today and it REJECTS the

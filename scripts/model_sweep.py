@@ -49,7 +49,7 @@ ALL_TASKS = {**EASY_TASKS, **HARD_TASKS, **BRUTAL_TASKS}
 DEFAULT_GRID = [
     ("codex", "gpt-5.5", "low"),
     ("codex", "gpt-5.5", "high"),
-    ("codex", "gpt-5.3-codex", "medium"),
+    ("codex", "gpt-5.3-codex-spark", "medium"),
     ("codex", "gpt-5.4-mini", "low"),
     ("claude", "haiku", "low"),
     ("claude", "sonnet", "low"),

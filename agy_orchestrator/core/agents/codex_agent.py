@@ -224,7 +224,12 @@ class CodexAgent(AgentInstance):
         if self.model and self.model != "standard":
             cmd.extend(["--model", self.model])
         elif self.model == "standard":
-            cmd.extend(["--model", "gpt-5.3-codex"])
+            # ChatGPT-account codex (codex-cli) REJECTS bare "gpt-5.3-codex" with a
+            # 400 "model is not supported when using Codex with a ChatGPT account";
+            # the account-valid Codex default is the "-spark" variant. Pinning the
+            # bare name 400'd every call -> blank "failed after 3 attempts" -> silent
+            # fallback off codex (looked like a usage wall, wasn't one).
+            cmd.extend(["--model", "gpt-5.3-codex-spark"])
 
         if hasattr(self, "effort") and self.effort:
             effort = "xhigh" if self.effort == "max" else self.effort
