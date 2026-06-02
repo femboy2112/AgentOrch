@@ -138,6 +138,30 @@ def looks_like_infra(stderr_tail: str) -> bool:
     return any(marker in s for marker in _INFRA_MARKERS)
 
 
+# Substrings (lowercased) marking a WEDGED agent SESSION — the worker process is
+# alive but its session is unrecoverably stuck, so it will never make progress and
+# will eventually be stall-killed (-9). codex's exec_command tool emits this when
+# its session stdin was closed and the model keeps trying to drive an interactive
+# command: "write_stdin failed: stdin is closed for this session; rerun
+# exec_command with tty=true to keep stdin open" (issue #62). Retrying the SAME
+# wedged provider just re-wedges and burns another full AGY_STALL_SECONDS cycle, so
+# this is treated as a FAST-FAIL marker (like a usage wall): fail the call now and
+# let the fallback layer roll to the next provider instead of looping.
+_WEDGED_SESSION_MARKERS = (
+    "stdin is closed for this session",
+    "rerun exec_command with tty=true",
+)
+
+
+def is_wedged_session(stderr: str) -> bool:
+    """True when stderr shows an unrecoverably wedged agent session (issue #62).
+
+    A wedged session never recovers and is futile to retry on the same provider —
+    callers should fail fast and fall over, not consume the retry/stall budget."""
+    s = (stderr or "").lower()
+    return any(marker in s for marker in _WEDGED_SESSION_MARKERS)
+
+
 # BLAS/numeric thread pools that each oversubscribe cores if left at their
 # library default (= one thread per core). Pinned to 1 in worker child envs so a
 # worker-spawned numeric job (and each of its xdist workers) stays bounded.
@@ -500,6 +524,12 @@ class AgentInstance(ABC):
                 _mark_progress()
             elif _is_transport_noise_line(text):
                 transport_noise_only[0] = True
+            elif is_wedged_session(text):
+                # A wedged-session error line (codex stdin-closed, #62) is NOT
+                # forward progress — counting it as liveness would keep a frozen
+                # session alive past the stall budget. Leave the stall clock alone
+                # so genuine silence trips on schedule and the call fails over.
+                pass
             else:
                 _mark_progress()
             try:
@@ -861,6 +891,12 @@ class AgentInstance(ABC):
                     if is_usage_wall(self.stderr):
                         # A quota wall won't clear in seconds — let the caller fail over now.
                         raise RuntimeError(f"usage wall: {self.stderr[:200]}")
+                    if is_wedged_session(self.stderr):
+                        # The session is unrecoverably wedged (e.g. codex's
+                        # stdin-closed exec_command hang, #62). Retrying the same
+                        # provider just re-wedges and burns another full stall cycle,
+                        # so fail fast and let the fallback layer roll over now.
+                        raise RuntimeError(f"wedged session: {self.stderr[:200]}")
 
                 except asyncio.CancelledError:
                     await self._kill_current()

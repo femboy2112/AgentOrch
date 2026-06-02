@@ -21,6 +21,7 @@ from agy_orchestrator.core.agent import (
     is_context_overflow,
     is_transport_error,
     is_usage_wall,
+    is_wedged_session,
 )
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
@@ -47,12 +48,21 @@ def _watchdog_reason_in(stderr: str) -> Optional[str]:
 
 
 def _reason_category(*, looked_like_usage: bool, watchdog_reason: Optional[str],
-                     context_overflow: bool = False, transport: bool = False) -> str:
+                     context_overflow: bool = False, transport: bool = False,
+                     wedged: bool = False) -> str:
     # Context overflow is checked FIRST and is distinct from a quota wall: the
     # same provider can serve the next (smaller) step, so telemetry must not fold
     # it into "usage" (issue #47).
     if context_overflow:
         return "context_overflow"
+    # A wedged session (codex stdin-closed hang, #62) is an AGENT-side defect, not
+    # a quota wall and not a code failure. Classify it distinctly so it never reads
+    # as provider exhaustion (and so the adversarial loop doesn't misattribute a
+    # stall-killed generator to a verification failure). Checked before the stall
+    # bucket because a wedged session ends in a -9 stall-kill that would otherwise
+    # fold it into the generic "stalled" reason.
+    if wedged:
+        return "wedged"
     if looked_like_usage:
         return "usage"
     # A transport/network blip (websocket reset, ECONNRESET, transient 502/503)
@@ -249,6 +259,7 @@ def make_fallback_agent(
                     # flags are mutually exclusive and overflow never reads as usage.
                     looked_like_overflow = is_context_overflow(stderr)
                     looked_like_usage = is_usage_wall(stderr)
+                    looked_like_wedged = is_wedged_session(stderr)
                     reason = _watchdog_reason_in(stderr)
                     # A transport blip (plain network reset, or the watchdog's
                     # transport-stall trip) failed the CONNECTION, not the provider.
@@ -258,7 +269,10 @@ def make_fallback_agent(
                     looked_like_transport = (
                         reason == WATCHDOG_TRANSPORT_STALL or is_transport_error(stderr)
                     )
-                    if (looked_like_transport
+                    # A wedged session is futile to retry on the same provider (#62):
+                    # never take the same-provider transport-retry path for it, even
+                    # if earlier transport noise also landed in the accumulated stderr.
+                    if (looked_like_transport and not looked_like_wedged
                             and transport_retries_used.get(agent_cls, 0) < max_transport_retries):
                         n = transport_retries_used.get(agent_cls, 0) + 1
                         transport_retries_used[agent_cls] = n
@@ -307,6 +321,7 @@ def make_fallback_agent(
                                 watchdog_reason=reason,
                                 context_overflow=looked_like_overflow,
                                 transport=looked_like_transport,
+                                wedged=looked_like_wedged,
                             ),
                             attempt=attempts,
                             attempt_total=len(self._chain),
@@ -332,6 +347,7 @@ def make_fallback_agent(
                                 watchdog_reason=reason,
                                 context_overflow=looked_like_overflow,
                                 transport=looked_like_transport,
+                                wedged=looked_like_wedged,
                             ),
                             attempt=attempts,
                             attempt_total=len(self._chain),
