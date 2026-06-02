@@ -162,6 +162,19 @@ def is_wedged_session(stderr: str) -> bool:
     return any(marker in s for marker in _WEDGED_SESSION_MARKERS)
 
 
+def _post_exit_drain_grace() -> float:
+    """Seconds to keep draining a worker's stdout/stderr AFTER it has exited before
+    abandoning the read (issue #66). A live worker's buffered output flushes
+    near-instantly once it exits and closes its pipe ends; the read only lingers
+    when an orphaned grandchild (e.g. a self-check `pytest > out.txt` reparented to
+    init) still holds the inherited write-end, so a few seconds is ample. Tunable
+    via AGY_WORKER_DRAIN_GRACE (0 disables the bound — not recommended)."""
+    try:
+        return float(os.environ.get("AGY_WORKER_DRAIN_GRACE", "5") or 0)
+    except Exception:
+        return 5.0
+
+
 # BLAS/numeric thread pools that each oversubscribe cores if left at their
 # library default (= one thread per core). Pinned to 1 in worker child envs so a
 # worker-spawned numeric job (and each of its xdist workers) stays bounded.
@@ -592,8 +605,16 @@ class AgentInstance(ABC):
         exited = asyncio.Event()
 
         async def _await_exit() -> None:
+            # Detect the worker's REAL exit by polling the child-watcher-set
+            # returncode, NOT `await process.wait()`. asyncio couples an
+            # already-awaiting wait() to pipe EOF (it resolves only at
+            # connection-lost), so an orphaned grandchild holding the inherited
+            # stdout pipe would make wait() — and thus this watcher and the whole
+            # gather — block until that orphan dies (the #66 deadlock). returncode
+            # flips the instant the process is reaped, independent of the pipes.
             try:
-                await process.wait()
+                while process.returncode is None:
+                    await asyncio.sleep(0.1)
             finally:
                 exited.set()
 
@@ -649,13 +670,58 @@ class AgentInstance(ABC):
 
         out_chunks: List[bytes] = []
         err_chunks: List[bytes] = []
+        # Capture the worker's process-group id while it is ALIVE so its orphaned
+        # descendants can be reaped after it exits — by then proc.pid is gone and
+        # getpgid would fail (#66).
+        try:
+            worker_pgid = os.getpgid(process.pid)
+        except Exception:
+            worker_pgid = None
+
+        feed_task = asyncio.ensure_future(_feed())
+        out_task = asyncio.ensure_future(
+            _drain(process.stdout, out_chunks, echo=False, count=True, stream="stdout"))
+        err_task = asyncio.ensure_future(
+            _drain(process.stderr, err_chunks, echo=True, count=False, stream="stderr"))
+        wd_task = asyncio.ensure_future(_watchdog())
+        exit_task = asyncio.ensure_future(_await_exit())
+
+        # Wait for the worker to exit — its own completion, or a watchdog kill. The
+        # _feed and _watchdog tasks wind down on their own around that point.
+        await exit_task
+
+        # #66: the worker is dead, but a grandchild it spawned (e.g. an `agy
+        # --print` self-check `pytest > out.txt`) can be reparented to init while
+        # still holding the inherited stdout/stderr pipe write-end. The _drain
+        # reads would then NEVER see EOF and this gather would hang forever — the
+        # orchestrator wedged in ep_poll on a pipe held only by an orphan (a hard
+        # deadlock, strictly worse than the #61 verifier leak). Reap the whole
+        # process group so those fds close; then BOUND the drains so even a
+        # grandchild that escaped the group (its own setsid) can't wedge the call.
+        if worker_pgid is not None:
+            try:
+                os.killpg(worker_pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        grace = _post_exit_drain_grace()
+        try:
+            if grace > 0:
+                await asyncio.wait_for(asyncio.gather(out_task, err_task), timeout=grace)
+            else:
+                await asyncio.gather(out_task, err_task)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "worker pipe still open %.1fs after exit (orphan holding the fd?); "
+                "abandoning the drain so the call can return (#66)", grace)
+            out_task.cancel()
+            err_task.cancel()
+        # Wind down the helper tasks and collect everything (swallow cancellations).
+        if not feed_task.done():
+            feed_task.cancel()
+        if not wd_task.done():
+            wd_task.cancel()
         await asyncio.gather(
-            _feed(),
-            _drain(process.stdout, out_chunks, echo=False, count=True, stream="stdout"),
-            _drain(process.stderr, err_chunks, echo=True, count=False, stream="stderr"),
-            _watchdog(),
-            _await_exit(),
-        )
+            out_task, err_task, feed_task, wd_task, return_exceptions=True)
         await process.wait()
         # Verbose-runaway is a trip even when the child dumped a pathological amount
         # of output and then EXITED before a 2s poll tick caught it (the watchdog now
