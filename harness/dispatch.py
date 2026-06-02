@@ -1533,8 +1533,21 @@ async def dispatch_async(
         enabled=telegram_enabled,
         verbosity=telegram_verbosity,
     )
+    telegram_poller = None
     if telegram_notifier is not None:
         EVENT_BUS.add_sink(run_id, telegram_notifier)
+        # Serve inbound commands (/status, /track, …) WHILE this build runs, so the
+        # bot isn't notify-only when no standalone daemon is up (issue #63). Cross-
+        # process singleton-guarded (flock): a no-op if a daemon/sibling already
+        # polls. Fully best-effort — never blocks or fails the dispatch.
+        try:
+            from harness.telegram_bot import EmbeddedCommandPoller
+
+            poller = EmbeddedCommandPoller()
+            if poller.start():
+                telegram_poller = poller
+        except Exception as exc:  # telegram must never affect dispatch
+            logger.debug("embedded telegram command poller not started: %s", exc)
 
     dispatch_pub = EVENT_BUS.publisher_for(
         run_id,
@@ -2099,6 +2112,13 @@ async def dispatch_async(
             telegram_notifier.finished(meta_dict)
         except Exception as exc:
             logger.debug("telegram finish summary failed: %s", exc)
+    # Stop the embedded command poller (releases the getUpdates singleton lock so a
+    # standalone daemon or the next dispatch can take over). Best-effort (#63).
+    if telegram_poller is not None:
+        try:
+            telegram_poller.stop()
+        except Exception as exc:
+            logger.debug("telegram command poller stop failed: %s", exc)
 
     return result
 

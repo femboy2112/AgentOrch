@@ -37,8 +37,14 @@ import json
 import logging
 import os
 import signal
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:
+    import fcntl  # POSIX-only; the singleton poller lock degrades gracefully without it
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 from harness.telegram import (
     DEFAULT_VERBOSITY,
@@ -58,6 +64,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_PATH = "/home/leah/tgbot/data/bot_state.json"
 
+# Command list registered with Telegram via setMyCommands so the client shows a
+# command menu/autocomplete (issue #63: "it's not registering my commands"). Kept
+# in sync with handle_command + HELP_TEXT.
+BOT_COMMANDS: List[Dict[str, str]] = [
+    {"command": "status", "description": "most recent run (or in-progress)"},
+    {"command": "runs", "description": "recent runs (default 5)"},
+    {"command": "track", "description": "follow a live run (latest | <id> | all)"},
+    {"command": "untrack", "description": "stop following a live run"},
+    {"command": "verbosity", "description": "show or set notification verbosity"},
+    {"command": "help", "description": "list commands"},
+]
+
 # Resolved lazily from harness.dispatch on first use (keeps the bot's import
 # graph light and avoids any import cycle). Tests override this attribute.
 RUNS_DIR: Optional[Path] = None
@@ -68,6 +86,15 @@ RUNS_DIR: Optional[Path] = None
 # --------------------------------------------------------------------------- #
 def state_path(path: Optional[str] = None) -> str:
     return path or os.environ.get("AGY_TELEGRAM_STATE") or DEFAULT_STATE_PATH
+
+
+def poller_lock_path(state_file: Optional[str] = None) -> str:
+    """Path to the cross-process getUpdates singleton lock (next to the state file,
+    OUTSIDE the repo). Telegram returns 409 Conflict if two processes long-poll
+    getUpdates at once, so only ONE command poller — a standalone daemon OR a
+    dispatch's embedded poller — may run; the flock on this file is the gate (#63).
+    """
+    return str(Path(state_path(state_file)).with_name("telegram_poller.lock"))
 
 
 def load_state(path: Optional[str] = None) -> dict:
@@ -444,6 +471,13 @@ class BotDaemon:
     def allowed_user_ids(self) -> set:
         return whitelist_user_ids(load_whitelist(self.users_path))
 
+    def register_commands(self) -> None:
+        """Register the command menu with Telegram (best-effort, never raises)."""
+        try:
+            self.client.set_my_commands(BOT_COMMANDS)
+        except Exception as exc:
+            logger.debug("telegram setMyCommands failed: %s", exc)
+
     def _process_update(self, update: dict) -> None:
         """Handle one update; never raises."""
         try:
@@ -611,6 +645,8 @@ class BotDaemon:
             signal.signal(signal.SIGTERM, self.stop)
         except Exception:
             pass
+        # Register the command menu so the client shows autocomplete (#63).
+        self.register_commands()
         logger.info("telegram bot started (long-poll)")
         while self._running:
             try:
@@ -621,6 +657,99 @@ class BotDaemon:
                 logger.debug("telegram poll loop error: %s", exc)
         logger.info("telegram bot stopped")
         return 0
+
+
+class EmbeddedCommandPoller:
+    """Run the command long-poll in a background thread for the lifetime of a
+    dispatch, so /status, /track, etc. work WHILE a build runs (issue #63) without
+    a separately-launched daemon. The dispatch already pushes notifications; this
+    adds the inbound half.
+
+    Cross-process singleton-guarded by an flock (:func:`poller_lock_path`): if a
+    standalone daemon — or a sibling dispatch — already holds it, :meth:`start`
+    is a no-op (returns False), so concurrent processes never run rival
+    ``getUpdates`` loops (Telegram returns 409 Conflict on concurrent polls).
+    Fully best-effort: any failure leaves the dispatch untouched.
+    """
+
+    def __init__(self, *, client: Optional[TelegramClient] = None,
+                 users_path: Optional[str] = None, state_file: Optional[str] = None,
+                 poll_timeout: int = 5):
+        self.client = client or TelegramClient()
+        self.users_path = users_path
+        self.state_file = state_file
+        self.poll_timeout = int(poll_timeout)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock_fd: Optional[int] = None
+
+    def _acquire_lock(self) -> bool:
+        """Non-blocking flock; True iff THIS process becomes the sole poller."""
+        if fcntl is None:
+            return False
+        path = poller_lock_path(self.state_file)
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        except Exception as exc:
+            logger.debug("telegram poller lock open failed: %s", exc)
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)  # someone else already polls — stand down
+            return False
+        self._lock_fd = fd
+        return True
+
+    def _release_lock(self) -> None:
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                os.close(self._lock_fd)
+            except Exception:
+                pass
+            self._lock_fd = None
+
+    def start(self) -> bool:
+        """Begin polling if possible. Returns True iff a poller thread started."""
+        if not self.client.configured:
+            return False
+        if not whitelist_user_ids(load_whitelist(self.users_path)):
+            return False  # no whitelisted users -> nothing to serve
+        if not self._acquire_lock():
+            return False  # another poller owns the getUpdates stream
+        daemon = BotDaemon(client=self.client, users_path=self.users_path,
+                           state_file=self.state_file, poll_timeout=self.poll_timeout)
+        daemon.register_commands()
+
+        def _loop() -> None:
+            try:
+                while not self._stop.is_set():
+                    try:
+                        daemon.poll_once()
+                    except Exception as exc:  # one bad batch never kills the loop
+                        logger.debug("embedded telegram poll error: %s", exc)
+            finally:
+                self._release_lock()
+
+        t = threading.Thread(target=_loop, name="telegram-cmd-poller", daemon=True)
+        self._thread = t
+        t.start()
+        return True
+
+    def stop(self, timeout: float = 6.0) -> None:
+        """Signal the loop to stop and release the lock. Best-effort, never raises.
+
+        The in-flight long-poll returns within ``poll_timeout`` (default 5s), so
+        the thread exits promptly; the lock is released in the loop's finally."""
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=timeout)
+        # Belt-and-suspenders: if the thread didn't release in time, release here.
+        if self._lock_fd is not None:
+            self._release_lock()
 
 
 def main(argv: Optional[List[str]] = None) -> int:

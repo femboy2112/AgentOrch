@@ -166,6 +166,18 @@ class TelegramClient:
             },
         )
 
+    def set_my_commands(self, commands: List[Dict[str, str]]) -> Optional[dict]:
+        """Register the bot's command list with Telegram (setMyCommands).
+
+        Best-effort; returns the API result or None. ``commands`` is a list of
+        ``{"command": "status", "description": "..."}`` dicts. Without this call
+        Telegram shows no command menu/autocomplete — the bot's commands look
+        "unregistered" even though the daemon would answer them (issue #63).
+        """
+        if not self.configured or not commands:
+            return None
+        return self._post("setMyCommands", {"commands": json.dumps(commands)})
+
     def get_updates(self, offset: Optional[int] = None, timeout: int = 25) -> List[dict]:
         """Long-poll for updates. Returns the ``result`` list, or [] on failure."""
         if not self.configured:
