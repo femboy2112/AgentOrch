@@ -1,0 +1,16 @@
+# Local defense-in-depth for the secret-scan CI gate.
+#
+#   pip install pre-commit   # one-time
+#   pre-commit install       # install the git hook
+#
+# Thereafter every `git commit` runs gitleaks over the staged changes using the
+# same .gitleaks.toml config as CI, so a credential is caught before it ever
+# leaves the machine. CI (.github/workflows/secret-scan.yml) remains the
+# authoritative gate; this hook just shortens the feedback loop.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        name: gitleaks (staged secret scan)
+        args: ["--config", ".gitleaks.toml"]

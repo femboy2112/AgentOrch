@@ -1,0 +1,47 @@
+# gitleaks configuration for AgentOrch
+#
+# Durable secret-scan: this config drives both the CI workflow
+# (.github/workflows/secret-scan.yml) and local runs (scripts/secret_scan.sh,
+# .pre-commit-config.yaml). It extends the upstream default ruleset and adds a
+# tight allowlist for the repo's *deliberately fake* test fixtures so genuine
+# leaks are never masked.
+#
+# Operator invariants this protects (see harness/telegram.py):
+#   * TELEGRAM_BOT_KEY lives only in ~/.bashrc, never committed.
+#   * The telegram whitelist + chat ids live OUTSIDE the repo (/home/leah/tgbot).
+# Anything matching a real-looking secret in tracked content should FAIL CI.
+
+title = "AgentOrch secret-scan"
+
+[extend]
+# Inherit gitleaks' built-in rules (AWS, GCP, Telegram bot tokens, generic
+# high-entropy strings, etc.), then layer the allowlist below on top.
+useDefault = true
+
+[allowlist]
+description = "Deliberately fake fixtures and documented vendor example keys"
+
+# Regexes matched against the detected secret. Keep these as narrow as possible
+# — allowlist the *exact* fake values, never a whole directory, so a real secret
+# accidentally added to tests/ still trips the scanner.
+regexes = [
+  # Telegram fake token used across tests/test_telegram*.py.
+  '''123456:FAKE-TEST-TOKEN-not-real''',
+  # AWS's own canonical documentation example key (used in redaction tests:
+  # tests/test_computer_use_*.py). Not a real credential.
+  '''AKIAIOSFODNN7EXAMPLE''',
+  # Fake GitHub-PAT-shaped input to redact_secrets() (test_computer_use_perception.py).
+  '''ghp_ABCDEF0123456789''',
+  # Fake confirmation token in the safety-kernel test (test_computer_use_safety.py).
+  '''tok-12345678''',
+]
+
+# Paths that are intentionally excluded from the working tree anyway (gitignored
+# run artifacts) — listed for defense-in-depth in case a stray file is force-added.
+paths = [
+  '''runs/''',
+  '''(^|/)\.venv/''',
+]
+
+# Commit-level allowlist: none. We deliberately do NOT blanket-skip any commit;
+# the regex allowlist above is the only escape hatch.

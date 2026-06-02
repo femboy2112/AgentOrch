@@ -49,6 +49,11 @@ runs/
 *.token
 *credentials*
 *secret*
+# Allow the secret-scan TOOLING itself (config/CI/scripts) — these contain the
+# word "secret" by name but hold no credentials; they ARE the leak gate.
+!.gitleaks.toml
+!.github/workflows/secret-scan.yml
+!scripts/secret_scan.sh
 
 # Telegram bot — never track bot state, persisted prefs, token, or user data.
 # The whitelist + state files live OUTSIDE the repo by default; these patterns
