@@ -38,7 +38,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -46,7 +45,8 @@ from typing import List, Optional, Tuple
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.execution.workspace import (
-    COPY_IGNORE_PATTERNS,
+    _ManagedWorkspace,
+    apply_workspace,
     candidate_workspace,
     diff_workspace_against_base,
 )
@@ -71,29 +71,10 @@ class CandidateScore:
     has_test_changes: bool
 
 
-class _ManagedWorkspace:
-    """One candidate's workspace lifecycle, managed manually so the winner
-    can be applied to base_dir BEFORE all workspaces are torn down."""
-
-    def __init__(self, base_dir: str, candidate_id: str, prefer_worktree: bool = True):
-        self._cm = candidate_workspace(
-            Path(base_dir),
-            candidate_id=candidate_id,
-            prefer_worktree=prefer_worktree,
-        )
-        self.path: Optional[Path] = None
-        self.backend: Optional[str] = None
-
-    async def open(self) -> "_ManagedWorkspace":
-        self.path, self.backend = await self._cm.__aenter__()
-        return self
-
-    async def close(self) -> None:
-        try:
-            await self._cm.__aexit__(None, None, None)
-        except Exception as exc:
-            logger.debug("workspace close failed (already torn down?): %s", exc)
-
+# ``_ManagedWorkspace`` (worktree-or-copy isolation, #36 dirty-tree fallback)
+# now lives in execution/workspace.py so vote AND the master graph walker share
+# ONE isolation implementation (docs §3.5). Re-exported here for back-compat with
+# any caller that imports it from this module.
 
 class VoteWorkflow:
     """K candidates in isolated workspaces; verifier picks the winner.
@@ -595,58 +576,7 @@ class VoteWorkflow:
     async def _apply_workspace(self, src: Path, dst: Path) -> None:
         """Mirror the winner's contents over the operator's actual work_dir.
 
-        Walks src for regular files, copies any whose bytes differ from the
-        destination's. Skips the same heavy/regenerable tree list the
-        workspace clone uses (.git, __pycache__, runs, …) so an unintended
-        meta-file can't sneak into work_dir.
-
-        Runs in a thread because shutil.copy2 + large diffs can block the
-        loop noticeably on multi-MB writes."""
-
-        def _do_apply() -> None:
-            for src_path in src.rglob("*"):
-                if not src_path.is_file():
-                    continue
-                rel = src_path.relative_to(src)
-                # Skip ignored top-level dirs (the clone wouldn't have
-                # included these, but in worktree mode .git lives inside;
-                # double-check at the apply boundary).
-                top = rel.parts[0]
-                if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
-                    continue
-                dst_path = dst / rel
-                # Only copy when content actually differs — avoids touching
-                # mtimes on identical files and gives a cleaner diff if the
-                # operator inspects work_dir after.
-                if dst_path.exists():
-                    try:
-                        if dst_path.read_bytes() == src_path.read_bytes():
-                            continue
-                    except OSError:
-                        pass
-                dst_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_path, dst_path)
-
-            # Remove files that no longer exist in the winner workspace.
-            for dst_path in dst.rglob("*"):
-                if not dst_path.is_file():
-                    continue
-                rel = dst_path.relative_to(dst)
-                top = rel.parts[0]
-                if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
-                    continue
-                if (src / rel).exists():
-                    continue
-                try:
-                    dst_path.unlink()
-                except OSError:
-                    continue
-                parent = dst_path.parent
-                while parent != dst:
-                    try:
-                        parent.rmdir()
-                    except OSError:
-                        break
-                    parent = parent.parent
-
-        await asyncio.to_thread(_do_apply)
+        Thin wrapper over the shared :func:`apply_workspace` so vote and the
+        master graph walker apply isolated writes through ONE implementation
+        (docs §3.5)."""
+        await apply_workspace(src, dst)

@@ -24,7 +24,11 @@ orchestration, verification loops, and run bookkeeping in a repeatable way.
 ## Why use it?
 - Compose multiple worker CLIs through seven workflow modes (`direct`,
   `adversarial`, `feedback`, `cascade`, `master`, `pat`, `vote`) depending on
-  task size, quality bar, and cost constraints.
+  task size, quality bar, and cost constraints. `master` also executes
+  **dependency DAGs** — hand it a graph plan and concurrent branches run in
+  isolated workspaces with a switchable merge policy
+  (`--plan graph.json --merge-policy reconcile`; see
+  `docs/graph-execution-design.md`).
 - Gate outputs with a programmatic verifier (`--test-cmd`) in the modes that
   require hard pass/fail signals, instead of relying on LLM self-evaluation.
 - Capture each run with artifacts (`prompt.txt`, `stdout.log`, `stderr.log`,

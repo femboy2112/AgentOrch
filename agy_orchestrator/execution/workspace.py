@@ -37,7 +37,7 @@ import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Tuple
+from typing import AsyncIterator, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -237,3 +237,172 @@ def diff_workspace_against_base(
     before = take_snapshot(Path(base))
     after = take_snapshot(workspace)
     return diff_snapshots(before, after).unified or ""
+
+
+class _ManagedWorkspace:
+    """One isolated workspace's lifecycle, managed manually so its writes can be
+    applied back to base_dir BEFORE all workspaces are torn down.
+
+    Shared by ``vote`` (per-candidate isolation) and the master graph walker
+    (per-DAG-node isolation) so both modes use ONE isolation implementation
+    (docs §3.5): worktree-or-copy with the #36 dirty-tree copy fallback, all
+    living in :func:`candidate_workspace`.
+    """
+
+    def __init__(self, base_dir: str, candidate_id: str, prefer_worktree: bool = True):
+        self._cm = candidate_workspace(
+            Path(base_dir),
+            candidate_id=candidate_id,
+            prefer_worktree=prefer_worktree,
+        )
+        self.path: Optional[Path] = None
+        self.backend: Optional[str] = None
+
+    async def open(self) -> "_ManagedWorkspace":
+        self.path, self.backend = await self._cm.__aenter__()
+        return self
+
+    async def close(self) -> None:
+        try:
+            await self._cm.__aexit__(None, None, None)
+        except Exception as exc:
+            logger.debug("workspace close failed (already torn down?): %s", exc)
+
+
+def _snapshot_tree(root: Path) -> Dict[str, bytes]:
+    """Map every non-ignored regular file under ``root`` to its bytes.
+
+    Skips the heavy/regenerable top-level dirs the clone skips (.git, runs, …).
+    Used by the graph walker to capture a DAG node's workspace at open so a
+    later apply can diff against it and write back ONLY what the node changed
+    (not a whole-tree mirror that would clobber a concurrent sibling's writes).
+    """
+    snapshot: Dict[str, bytes] = {}
+    root = Path(root)
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        top = rel.parts[0]
+        if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
+            continue
+        try:
+            snapshot[str(rel)] = path.read_bytes()
+        except OSError:
+            continue
+    return snapshot
+
+
+async def apply_node_writes(src: Path, dst: Path, base_snapshot: Dict[str, bytes]) -> None:
+    """Apply ONLY the files a DAG node changed (vs its open-time snapshot) to dst.
+
+    Unlike :func:`apply_workspace` (a whole-tree mirror that DELETES dst files
+    absent from src — right for vote's single winner), this writes back just the
+    node's own diff: files added/modified relative to ``base_snapshot`` are
+    copied, files the node deleted are removed. Files the node never touched are
+    left alone, so a concurrently-finishing sibling's disjoint writes survive
+    (docs §5 M3). Overlap detection (two nodes touching the SAME path) is M4;
+    here it's last-writer-wins.
+
+    Runs in a thread (file I/O can block the loop on large writes).
+    """
+    src = Path(src)
+    dst = Path(dst)
+
+    def _do_apply() -> None:
+        current = _snapshot_tree(src)
+        # Added or modified vs the node's base: copy into the live tree.
+        for rel, data in current.items():
+            if base_snapshot.get(rel) == data:
+                continue  # unchanged by this node — don't touch the live tree
+            dst_path = dst / rel
+            if dst_path.exists():
+                try:
+                    if dst_path.read_bytes() == data:
+                        continue
+                except OSError:
+                    pass
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            dst_path.write_bytes(data)
+        # Files the node DELETED (present at open, gone now): remove from dst.
+        for rel in base_snapshot:
+            if rel in current:
+                continue
+            dst_path = dst / rel
+            if not dst_path.exists():
+                continue
+            try:
+                dst_path.unlink()
+            except OSError:
+                continue
+            parent = dst_path.parent
+            while parent != dst:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
+    await asyncio.to_thread(_do_apply)
+
+
+async def apply_workspace(src: Path, dst: Path) -> None:
+    """Mirror a workspace's contents over the operator's actual work_dir.
+
+    Walks src for regular files, copies any whose bytes differ from the
+    destination's. Skips the same heavy/regenerable tree list the workspace
+    clone uses (.git, __pycache__, runs, …) so an unintended meta-file can't
+    sneak into work_dir. Files that no longer exist in src are removed from dst.
+
+    Shared by vote (winner-apply) and the master graph walker (per-node
+    disjoint-write apply, docs §5 M3). Runs in a thread because shutil.copy2 +
+    large diffs can block the loop noticeably on multi-MB writes.
+    """
+
+    def _do_apply() -> None:
+        for src_path in src.rglob("*"):
+            if not src_path.is_file():
+                continue
+            rel = src_path.relative_to(src)
+            # Skip ignored top-level dirs (the clone wouldn't have included
+            # these, but in worktree mode .git lives inside; double-check at
+            # the apply boundary).
+            top = rel.parts[0]
+            if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
+                continue
+            dst_path = dst / rel
+            # Only copy when content actually differs — avoids touching mtimes
+            # on identical files and gives a cleaner diff if the operator
+            # inspects work_dir after.
+            if dst_path.exists():
+                try:
+                    if dst_path.read_bytes() == src_path.read_bytes():
+                        continue
+                except OSError:
+                    pass
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+
+        # Remove files that no longer exist in the source workspace.
+        for dst_path in dst.rglob("*"):
+            if not dst_path.is_file():
+                continue
+            rel = dst_path.relative_to(dst)
+            top = rel.parts[0]
+            if top in COPY_IGNORE_PATTERNS or top.startswith(".git"):
+                continue
+            if (src / rel).exists():
+                continue
+            try:
+                dst_path.unlink()
+            except OSError:
+                continue
+            parent = dst_path.parent
+            while parent != dst:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
+    await asyncio.to_thread(_do_apply)

@@ -141,17 +141,35 @@ def _cmd_do(args) -> int:
         )
 
     # Plan injection: --plan feeds an edited plan.json back for verbatim execution
-    # (the review->revise->execute round-trip). Fail fast on misuse and on a
-    # malformed plan file so the error is at the CLI, not deep in a dispatch.
+    # (the review->revise->execute round-trip). --plan-graph is a STRICT alias that
+    # additionally errors if the file is NOT a graph DAG (clear operator intent +
+    # a useful error when a flat plan is passed where a graph was expected). Fail
+    # fast on misuse and on a malformed plan file so the error is at the CLI, not
+    # deep in a dispatch.
     plan_steps = None
-    if getattr(args, "plan", None):
+    plan_graph = None
+    plan_path = getattr(args, "plan", None)
+    plan_graph_path = getattr(args, "plan_graph", None)
+    if plan_path and plan_graph_path:
+        print(
+            f"{C_RED}--plan and --plan-graph are mutually exclusive (--plan-graph "
+            f"is a strict-graph alias of --plan){C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+    plan_file = plan_path or plan_graph_path
+    strict_graph = plan_graph_path is not None
+    if plan_file:
         if getattr(args, "plan_only", False):
             print(
-                f"{C_RED}--plan and --plan-only are mutually exclusive "
+                f"{C_RED}--plan/--plan-graph and --plan-only are mutually exclusive "
                 f"(--plan-only generates a plan; --plan executes one){C_RESET}",
                 file=sys.stderr,
             )
             return 1
+        # Graphs are restricted to --mode master for v1 (pat's Stage-1 is a single
+        # direct attempt; a DAG only makes sense in the escalation path). A flat
+        # plan still runs on master OR pat.
         if args.mode not in ("master", "pat"):
             print(
                 f"{C_RED}--plan only applies to --mode master/pat (got "
@@ -159,17 +177,55 @@ def _cmd_do(args) -> int:
                 file=sys.stderr,
             )
             return 1
-        from harness.dispatch import load_plan_steps
+        # Load the full Plan so a graph 'nodes' DAG threads plan_graph (the
+        # frontier scheduler routes on it); a flat plan keeps the legacy
+        # linearization. load_plan validates both shapes (fail-fast at the CLI).
+        from harness.dispatch import load_plan
+        from agy_orchestrator.execution.graph_plan import GraphPlan
         try:
-            plan_steps = load_plan_steps(args.plan)
+            plan = load_plan(plan_file)
         except ValueError as exc:
             print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
             return 1
+        plan_steps = plan.as_steps()
+        if isinstance(plan, GraphPlan):
+            plan_graph = plan
+            shape = "graph DAG"
+        else:
+            if strict_graph:
+                print(
+                    f"{C_RED}--plan-graph requires a graph plan (a 'nodes' DAG); "
+                    f"{plan_file} is a flat plan — use --plan for it{C_RESET}",
+                    file=sys.stderr,
+                )
+                return 1
+            shape = "flat plan"
+        # A graph DAG (with non-linear deps) only runs on master (the frontier
+        # scheduler is master-only for v1); error for pat rather than silently
+        # linearizing it.
+        if plan_graph is not None and args.mode != "master":
+            print(
+                f"{C_RED}a graph DAG plan requires --mode master (got "
+                f"--mode {args.mode}); graph execution is master-only for v1{C_RESET}",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            f"{C_YELLOW}note: executing supplied plan ({len(plan_steps)} step(s)) "
-            f"from {args.plan}; the planner is skipped{C_RESET}",
+            f"{C_YELLOW}note: executing supplied {shape} ({len(plan_steps)} "
+            f"step(s)) from {plan_file}; the planner is skipped{C_RESET}",
             file=sys.stderr,
         )
+
+    # Graph execution (docs §5 M3): cap concurrent DAG nodes. CLI flag wins over
+    # the AGY_MAX_PARALLEL_NODES env; None = unbounded (all-ready nodes run at
+    # once). Only affects a graph plan with non-linear deps — linear runs ignore
+    # it. (The MasterWorkflow re-resolves the env itself when this is None, so the
+    # env still applies on the direct-construction path.)
+    max_parallel_nodes = getattr(args, "max_parallel_nodes", None)
+    if max_parallel_nodes is None:
+        _env_mpn = os.environ.get("AGY_MAX_PARALLEL_NODES", "")
+        if _env_mpn.strip().isdigit():
+            max_parallel_nodes = int(_env_mpn)
 
     # #42: validate effort/model overrides up front so a typo'd tier/model fails
     # fast with an enumerated message instead of surfacing deep in a dispatch.
@@ -233,6 +289,9 @@ def _cmd_do(args) -> int:
         allow_paths=[g for g in (args.allow_paths or "").split(",") if g.strip()] or None,
         plan_only=getattr(args, "plan_only", False),
         plan_steps=plan_steps,
+        plan_graph=plan_graph,
+        max_parallel_nodes=max_parallel_nodes,
+        merge_policy=getattr(args, "merge_policy", "reconcile"),
         run_stall_abort=args.run_stall_abort,
         notify=args.notify or os.environ.get("AGY_NOTIFY") or None,
         notify_cmd=args.notify_cmd,
@@ -267,11 +326,27 @@ def _cmd_do(args) -> int:
     )
     _print_result(result)
     if getattr(args, "plan_only", False) and result.success:
+        # Graph round-trip hint (docs §5 M5): if the emitted plan.json is a graph
+        # DAG (the operator echoed a --plan graph through --plan-only), point them
+        # back through --plan, and note they can add deps / split a step into
+        # parallel nodes before re-feeding it.
+        plan_json = Path(result.run_dir) / "plan.json"
+        is_graph_emit = False
+        try:
+            is_graph_emit = "nodes" in json.loads(plan_json.read_text())
+        except Exception:
+            is_graph_emit = False
         print(
             f"  {C_BOLD}round-trip{C_RESET}: review/edit {result.run_dir}/plan.json, then\n"
             f"    python -m harness do \"{args.instruction}\" --mode {args.mode} "
             f"--plan {result.run_dir}/plan.json"
         )
+        if is_graph_emit:
+            print(
+                f"  {C_CYAN}graph plan{C_RESET}: edit 'nodes' deps (or split a step "
+                f"into parallel nodes), then re-feed via --plan / --plan-graph "
+                f"(--merge-policy reconcile|disjoint|fail, --max-parallel-nodes N)."
+            )
     return 0 if result.success else 1
 
 
@@ -418,10 +493,30 @@ def main(argv=None) -> int:
                          "any worker writes to the out-dir.")
     do.add_argument("--plan", type=str, default=None, metavar="FILE",
                     help="master/pat: execute the steps in this plan file VERBATIM, "
-                         "skipping the planner. Accepts a --plan-only plan.json (or a "
-                         "bare JSON list of step strings), closing the round-trip: "
-                         "--plan-only -> review/edit plan.json -> --plan <file>. "
-                         "Mutually exclusive with --plan-only.")
+                         "skipping the planner. Accepts a --plan-only plan.json (a "
+                         "bare JSON list of step strings, OR a graph 'nodes' DAG), "
+                         "closing the round-trip: --plan-only -> review/edit "
+                         "plan.json -> --plan <file>. A graph DAG with non-linear "
+                         "deps runs the concurrent frontier scheduler. Mutually "
+                         "exclusive with --plan-only.")
+    do.add_argument("--plan-graph", type=str, default=None, metavar="FILE",
+                    help="master: like --plan, but STRICT — the file MUST be a "
+                         "graph 'nodes' DAG (errors on a flat plan). Runs the "
+                         "concurrent frontier scheduler. Graphs are master-only "
+                         "for v1. Mutually exclusive with --plan / --plan-only.")
+    do.add_argument("--max-parallel-nodes", type=int, default=None, metavar="N",
+                    help="master: cap how many DAG nodes run concurrently when "
+                         "executing a graph plan (env AGY_MAX_PARALLEL_NODES; "
+                         "default unbounded). 1 serializes a wide layer. Only "
+                         "affects a --plan graph with non-linear deps.")
+    do.add_argument("--merge-policy", choices=("disjoint", "reconcile", "fail"),
+                    default="reconcile",
+                    help="master graph mode: how two parallel nodes that write the "
+                         "SAME file are reconciled. reconcile (default) auto-applies "
+                         "disjoint writes and sends overlaps to the reconcile station "
+                         "(then re-verifies the merged tree); disjoint/fail abort on "
+                         "any overlap (fail records the conflicting paths in "
+                         "meta.json). Only affects a --plan graph with non-linear deps.")
     do.add_argument("--protect-paths", type=str, default=None, metavar="GLOB[,GLOB...]",
                     help="Fail the run if any worker modifies a path matching these "
                          "denylist globs (e.g. 'docs/core/**,**/*.lock,migrations/**'). "

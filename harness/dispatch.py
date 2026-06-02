@@ -25,6 +25,12 @@ from typing import Any, Dict, List, Optional, Union
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.calibration import append_live_row
+from agy_orchestrator.execution.graph_plan import (
+    ChainPlan,
+    GraphPlan,
+    Plan,
+    validate_graph,
+)
 from agy_orchestrator.execution.ledger import build_ledger
 from agy_orchestrator.execution.verifier import QualityVerifier, VerifierResult
 from agy_orchestrator.workflows.adversarial import (
@@ -32,6 +38,7 @@ from agy_orchestrator.workflows.adversarial import (
     AdversarialReview,
 )
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
+from agy_orchestrator.workflows.graph_merge import DEFAULT_MERGE_POLICY
 from agy_orchestrator.workflows.master import MasterWorkflow
 from agy_orchestrator.workflows.pat import PatWorkflow
 from agy_orchestrator.workflows.reconcile import ReconciliationReview
@@ -198,6 +205,11 @@ class DispatchResult:
     # ``reconciliation`` in meta.json is never ambiguous: "ran", "skipped:<why>",
     # or "error:<ExcType>".
     reconcile_status: Optional[str] = None
+    # Graph-execution summary (docs §5 M4/M5), present only when a graph DAG ran:
+    # ``{"merge_policy": "...", "merges": [{node_id, layer, overlapping_paths,
+    # conflict, resolution}, ...]}``. getattr-guarded off the workflow so a flat
+    # plan / non-master mode leaves this None and meta.json is byte-identical.
+    graph: Optional[Dict[str, Any]] = None
 
 
 def _decide_reconcile_status(
@@ -225,20 +237,24 @@ def _decide_reconcile_status(
     return "run"
 
 
-def load_plan_steps(path: Union[str, Path]) -> List[str]:
-    """Load + validate an operator-supplied plan file for master/pat execution.
+def load_plan(path: Union[str, Path]) -> Plan:
+    """Load + validate an operator-supplied plan file (flat OR graph shape).
 
     Closes the plan round-trip: ``--plan-only`` emits ``runs/<id>/plan.json``,
     the operator reviews/edits it, then feeds it back via ``--plan <file>`` and
-    master executes those steps verbatim (no re-planning).
+    master executes it verbatim (no re-planning).
 
-    Accepts BOTH shapes so the emitted artifact round-trips unedited:
-      * the plan.json object — ``{"instruction": ..., "steps": ["...", ...]}``
-      * a bare JSON list of step strings — ``["...", "..."]``
+    Auto-detects the shape, in order (never silently picks a precedence):
+      * a bare JSON list of step strings ``["...", ...]``     -> ``ChainPlan``
+      * an object with ``"nodes"``                            -> ``GraphPlan``
+        (a dependency DAG; validated immediately — dup/dangling/cycle/empty/
+        non-string-task all raise here so the operator sees errors before any
+        worker writes)
+      * an object with ``"steps"`` and **no** ``"nodes"``     -> ``ChainPlan``
+      * neither, or BOTH ``"steps"`` and ``"nodes"``          -> ``ValueError``
 
-    Returns the list of step strings. Raises ``ValueError`` with an
-    operator-facing message on any malformed input (missing file, bad JSON,
-    wrong shape, empty plan, or a non-string/empty step).
+    Raises ``ValueError`` with an operator-facing message on any malformed input
+    (missing file, bad JSON, wrong shape, empty plan, or a non-string/empty step).
     """
     p = Path(path).expanduser()
     if not p.exists():
@@ -247,15 +263,38 @@ def load_plan_steps(path: Union[str, Path]) -> List[str]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"plan file is not valid JSON ({path}): {exc}")
+
+    if isinstance(data, list):
+        return ChainPlan(steps=_clean_chain_steps(data, path))
+
     if isinstance(data, dict):
-        steps = data.get("steps")
-    elif isinstance(data, list):
-        steps = data
-    else:
-        raise ValueError(
-            f"plan file must be a JSON list of step strings, or an object with a "
-            f"'steps' list ({path})"
-        )
+        has_nodes = "nodes" in data
+        has_steps = "steps" in data
+        if has_nodes and has_steps:
+            raise ValueError(
+                f"plan file has BOTH 'nodes' and 'steps'; supply exactly one "
+                f"shape (a graph 'nodes' DAG or a flat 'steps' list) ({path})"
+            )
+        if has_nodes:
+            try:
+                nodes = validate_graph(data["nodes"])
+            except ValueError as exc:
+                # Surface the specific graph-validation reason with the file path.
+                raise ValueError(f"invalid graph plan ({path}): {exc}")
+            return GraphPlan(nodes=nodes)
+        # No "nodes": treat as a flat plan. A missing/empty "steps" raises the
+        # legacy "no steps to execute" message (back-compat with the prior
+        # load_plan_steps behaviour on a shape-less object).
+        return ChainPlan(steps=_clean_chain_steps(data.get("steps"), path))
+
+    raise ValueError(
+        f"plan file must be a JSON list of step strings, or an object with a "
+        f"'steps' list or a graph 'nodes' list ({path})"
+    )
+
+
+def _clean_chain_steps(steps: Any, path: Union[str, Path]) -> List[str]:
+    """Validate a flat step list (shared by the bare-list and 'steps' shapes)."""
     if not isinstance(steps, list) or not steps:
         raise ValueError(f"plan file has no steps to execute ({path})")
     cleaned: List[str] = []
@@ -266,6 +305,16 @@ def load_plan_steps(path: Union[str, Path]) -> List[str]:
             )
         cleaned.append(step)
     return cleaned
+
+
+def load_plan_steps(path: Union[str, Path]) -> List[str]:
+    """Backward-compat shim: load a plan file and return its flat linearization.
+
+    Keeps the historical ``List[str]`` signature for ``cli.py`` and the existing
+    plan-injection tests. A graph plan linearizes via ``as_steps()`` (stable
+    topological order), so the existing linear master loop runs it verbatim.
+    """
+    return load_plan(path).as_steps()
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -516,6 +565,78 @@ def _build_role_agent_compat(
     return roles.build_role_agent(chain, **kwargs)
 
 
+def _build_merge_reconciler_factory(
+    *,
+    critic_chain: List[str],
+    fallback: bool,
+    cycles: int,
+    codex_config: Optional[List[str]],
+    critic_overrides: Optional[Dict[str, Dict[str, str]]],
+    watchdog_scale: float,
+    post_construct_hook: Optional[roles.RolePostConstructHook],
+):
+    """Build the per-node reconciler factory for the ``reconcile`` merge policy (M4).
+
+    Returns a callable ``factory(node, working_directory) -> Reconciler`` where the
+    reconciler is an async ``(rel, base, sibling, node) -> bytes`` that resolves ONE
+    overlapping file by running an independent critic-chain reviewer over the three
+    byte views (base / already-merged sibling / this node) — the SAME cross-provider
+    reviewer principle as the #43 reconcile station, here producing a merged FILE.
+    The merged tree is re-verified by the join node's verifier (docs §4), so a bad
+    merge is caught by the existing gate. Non-text/binary or worker-failure cases
+    fall back to the node's own bytes (last-writer-wins) rather than corrupt a file.
+    """
+    def factory(*, node, working_directory: str):
+        async def _reconcile(
+            rel: str,
+            base_bytes: Optional[bytes],
+            sibling_bytes: bytes,
+            node_bytes: bytes,
+        ) -> bytes:
+            # Binary files can't be three-way text-merged by a reviewer; keep the
+            # node's write (the merge is then last-writer-wins, recorded as an
+            # overlap in meta) rather than ask the model to invent bytes.
+            try:
+                base_text = (base_bytes or b"").decode("utf-8")
+                sibling_text = sibling_bytes.decode("utf-8")
+                node_text = node_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                return node_bytes
+            merge_prompt = (
+                "Two parallel build steps modified the SAME file. Produce a single "
+                "MERGED version that preserves BOTH steps' intent and is internally "
+                "consistent. Output ONLY the full merged file content (no fences, no "
+                f"commentary).\n\n--- FILE: {rel} ---\n"
+                f"\n=== COMMON BASE (before either step) ===\n{base_text}\n"
+                f"\n=== SIBLING STEP'S VERSION ===\n{sibling_text}\n"
+                f"\n=== THIS STEP'S VERSION ===\n{node_text}\n"
+            )
+            try:
+                agent = _build_role_agent_compat(
+                    critic_chain,
+                    prompt=merge_prompt,
+                    fallback=fallback,
+                    cycles=cycles,
+                    codex_config=codex_config,
+                    computer_use_config=None,
+                    post_construct_hook=post_construct_hook,
+                    overrides=critic_overrides,
+                    watchdog_scale=watchdog_scale,
+                )
+                merged = await agent.run_async()
+            except Exception as exc:
+                logger.warning(
+                    "Merge reconciler failed on %s (%s); keeping this node's bytes.",
+                    rel, exc,
+                )
+                return node_bytes
+            return (merged or "").encode("utf-8") if merged.strip() else node_bytes
+
+        return _reconcile
+
+    return factory
+
+
 async def _run_workflow(
     mode: str,
     prompt: str,
@@ -538,11 +659,16 @@ async def _run_workflow(
     resume_policy: str = "auto",
     plan_only: bool = False,
     plan_steps: Optional[List[str]] = None,
+    plan_graph: Optional[GraphPlan] = None,
+    max_parallel_nodes: Optional[int] = None,
+    verifier_concurrency: int = 1,
+    merge_policy: str = DEFAULT_MERGE_POLICY,
     gen_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     critic_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
     max_parallel_workers: Optional[int] = None,
     critic_requirement: Optional[str] = None,
+    workflow_sink: Optional[List[Any]] = None,
 ) -> tuple:
     """Run the workflow; return (output, workflow_or_None) so the caller can read
     the workflow's quality signals for the run ledger.
@@ -550,7 +676,20 @@ async def _run_workflow(
     ``gen_overrides``/``critic_overrides`` are per-provider model/effort maps
     (issue #42) applied to the generator-role and critic-role chains
     respectively; ``watchdog_scale`` widens the armed budgets for heavy tiers;
-    ``max_parallel_workers`` caps concurrent candidate generation in vote."""
+    ``max_parallel_workers`` caps concurrent candidate generation in vote.
+
+    ``workflow_sink`` is a mutable single-element holder: the constructed
+    workflow is appended to it BEFORE ``execute`` runs so the caller can recover
+    it even when ``execute`` raises (e.g. a graph ``--merge-policy fail`` abort).
+    Without this, an exception from ``execute`` discards the workflow ref and the
+    graph/merge outcomes it accumulated never reach ``meta.json``."""
+    def _register(_wf):
+        # Surface the in-flight workflow to the caller before execute() runs, so
+        # an abort policy's MergeConflict (recorded on the workflow) survives the
+        # re-raise and lands in meta.json.
+        if workflow_sink is not None:
+            workflow_sink.append(_wf)
+        return _wf
     # Plan-only / dry-run (#41): for master/pat, run JUST the planner and stop
     # before any worker mutates the out-dir. pat's "plan" is the master planner,
     # so both modes route through a plan-only MasterWorkflow — no verifier needed
@@ -572,6 +711,8 @@ async def _run_workflow(
             agent_class=agent_class,
             working_directory=working_directory,
             plan_only=True,
+            plan_steps=plan_steps,
+            plan_graph=plan_graph,
             event_callback=EVENT_BUS.publisher_for(
                 run_id, worker="orchestrator", model=model, effort=effort, branch=None,
             ),
@@ -693,6 +834,21 @@ async def _run_workflow(
             checkpoint_path=_master_checkpoint_path(prompt),
             resume_policy=resume_policy,
             plan_steps=plan_steps,
+            plan_graph=plan_graph,
+            # Graph-execution concurrency caps (docs §5 M3). Linear runs ignore
+            # both; a DAG plan bounds whole-node parallelism by max_parallel_nodes
+            # and serializes the verifier spike at verifier_concurrency.
+            max_parallel_workers=max_parallel_nodes,
+            verifier_concurrency=verifier_concurrency,
+            # Overlapping parallel writes (docs §4 / M4): reconcile (default) /
+            # disjoint / fail. reconcile wires a critic-chain file reconciler;
+            # the join node's verifier re-runs on the merged tree.
+            merge_policy=merge_policy,
+            reconcile_station_factory=_build_merge_reconciler_factory(
+                critic_chain=critic_chain, fallback=fallback, cycles=cycles,
+                codex_config=codex_config, critic_overrides=critic_overrides,
+                watchdog_scale=watchdog_scale, post_construct_hook=post_construct_hook,
+            ),
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -701,6 +857,7 @@ async def _run_workflow(
                 branch=None,
             ),
         )
+        _register(wf)
         return await wf.execute(prompt), wf
 
     if mode == "vote":
@@ -781,6 +938,15 @@ async def _run_workflow(
             checkpoint_path=_master_checkpoint_path(prompt),
             resume_policy=resume_policy,
             plan_steps=plan_steps,
+            plan_graph=plan_graph,
+            max_parallel_workers=max_parallel_nodes,
+            verifier_concurrency=verifier_concurrency,
+            merge_policy=merge_policy,
+            reconcile_station_factory=_build_merge_reconciler_factory(
+                critic_chain=critic_chain, fallback=fallback, cycles=cycles,
+                codex_config=codex_config, critic_overrides=critic_overrides,
+                watchdog_scale=watchdog_scale, post_construct_hook=post_construct_hook,
+            ),
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
                 worker="orchestrator",
@@ -795,6 +961,7 @@ async def _run_workflow(
             verifier=verifier,
             working_directory=working_directory,
         )
+        _register(wf)
         return await wf.execute(prompt), wf
 
     raise ValueError(f"unknown mode: {mode}")
@@ -871,6 +1038,17 @@ async def dispatch_async(
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
     plan_steps: Optional[List[str]] = None,
+    # Graph execution (docs §5 M3): an operator-supplied dependency DAG +
+    # concurrency caps for the master graph walker. plan_graph routes to the
+    # frontier scheduler when it has non-linear deps; max_parallel_nodes bounds
+    # whole-node parallelism; verifier_concurrency serializes the verifier spike.
+    plan_graph: Optional[GraphPlan] = None,
+    max_parallel_nodes: Optional[int] = None,
+    verifier_concurrency: int = 1,
+    # Overlapping-parallel-write merge policy for the graph walker (docs §4 / M4):
+    # reconcile (default) | disjoint | fail. Only affects a graph plan with a true
+    # branch/join; linear runs ignore it.
+    merge_policy: str = DEFAULT_MERGE_POLICY,
     # Run-level watchdog / heartbeat / notify (#40)
     run_stall_abort: Optional[float] = None,
     notify: Optional[str] = None,
@@ -1200,6 +1378,10 @@ async def dispatch_async(
     error: Optional[str] = None
     output = ""
     workflow = None
+    # Mutable holder the workflow registers itself into BEFORE execute() runs, so
+    # a workflow that raised (e.g. a graph --merge-policy fail/disjoint abort) is
+    # still recoverable here — otherwise its merge_outcomes never reach meta.json.
+    workflow_sink: List[Any] = []
     run_outcome: Optional[str] = None
     reconciliation_result = None  # #43: set after a converged build if --reconcile
     reconcile_status = None  # #44: why reconcile did/didn't run; persisted to meta.json
@@ -1246,11 +1428,16 @@ async def dispatch_async(
                 resume_policy=resume_policy,
                 plan_only=plan_only,
                 plan_steps=plan_steps,
+                plan_graph=plan_graph,
+                max_parallel_nodes=max_parallel_nodes,
+                verifier_concurrency=verifier_concurrency,
+                merge_policy=merge_policy,
                 gen_overrides=gen_overrides,
                 critic_overrides=critic_overrides,
                 watchdog_scale=eff_watchdog_scale,
                 max_parallel_workers=max_parallel_workers,
                 critic_requirement=critic_requirement,
+                workflow_sink=workflow_sink,
             ))
 
             # Reconciliation / Integration-Skeptic station (#43): runs AFTER the
@@ -1305,6 +1492,11 @@ async def dispatch_async(
         error = f"{type(exc).__name__}: {exc}"
         logger.error("Dispatch %s failed: %s", run_id, error)
     finally:
+        # execute() may have raised before the (output, workflow) unpack (e.g. a
+        # graph --merge-policy fail/disjoint abort): recover the in-flight
+        # workflow from the sink so its merge_outcomes still reach meta.json.
+        if workflow is None and workflow_sink:
+            workflow = workflow_sink[-1]
         # Always populate reconcile_status for meta.json (#44), even on paths that
         # never reached the gate (computer-use, watchdog stall, or an exception):
         # if reconcile wasn't enabled say so, otherwise the build didn't reach a
@@ -1445,15 +1637,59 @@ async def dispatch_async(
     # Plan-only / dry-run (#41): persist the decomposed plan as a structured
     # artifact so it can be reviewed/edited before a real run. The out-dir is
     # untouched in this mode (the diff is empty by construction).
+    #
+    # Round-trip emit (docs §5 M5): when the workflow produced a GraphPlan (an
+    # injected --plan graph echoed back via --plan-only), emit the v2 ``nodes``
+    # shape so it re-loads as a graph; a flat plan stays the byte-identical legacy
+    # ``steps`` object. Both are getattr-guarded off the workflow.
     plan_steps = getattr(workflow, "plan_steps", None) if workflow else None
     if plan_only and plan_steps is not None:
-        (run_dir / "plan.json").write_text(
-            json.dumps(
-                {"instruction": instruction, "n_steps": len(plan_steps), "steps": plan_steps},
-                indent=2, ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        plan_graph_out = getattr(workflow, "plan_graph", None) if workflow else None
+        if plan_graph_out is not None:
+            from agy_orchestrator.execution.graph_plan import to_json as _plan_to_json
+            graph_obj = _plan_to_json(plan_graph_out)
+            graph_obj["instruction"] = instruction
+            (run_dir / "plan.json").write_text(
+                json.dumps(graph_obj, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        else:
+            (run_dir / "plan.json").write_text(
+                json.dumps(
+                    {"instruction": instruction, "n_steps": len(plan_steps), "steps": plan_steps},
+                    indent=2, ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+    # Graph-execution summary for meta.json (docs §5 M5). Read the graph
+    # observability off the master workflow (pat wraps one in .master_workflow).
+    # All fields are getattr-guarded so a flat plan / non-graph run leaves
+    # graph_meta None and meta.json is byte-identical: a run that never entered the
+    # frontier scheduler has an empty node_status AND no merge_outcomes.
+    #   * "nodes"        — per-node statuses {id: "passed"/"failed"/"pending"}
+    #   * "layers"       — Kahn levels [[id, ...], ...], the concurrency units
+    #   * "merges"       — one MergeOutcome per merged node (M4)
+    #   * "merge_policy" — the active policy (disjoint/reconcile/fail)
+    graph_meta = None
+    if workflow is not None:
+        _mwf = getattr(workflow, "master_workflow", None) or workflow
+        _node_status = getattr(_mwf, "node_status", None)
+        _merges = getattr(_mwf, "merge_outcomes", None)
+        if _node_status or _merges:
+            _layers: List[List[str]] = []
+            _plan_graph = getattr(_mwf, "plan_graph", None)
+            if _plan_graph is not None:
+                try:
+                    _layers = _plan_graph.parallel_groups()
+                except Exception:
+                    _layers = []
+            graph_meta = {
+                "nodes": dict(_node_status) if _node_status else {},
+                "layers": _layers,
+                "merges": [m.to_dict() for m in (_merges or [])],
+                "merge_policy": getattr(_mwf, "merge_policy", DEFAULT_MERGE_POLICY),
+            }
 
     stage_used = getattr(workflow, "stage_used", None) if workflow else None
     n_candidates = getattr(workflow, "n_candidates", None) if workflow else None
@@ -1518,6 +1754,7 @@ async def dispatch_async(
         resolved_config=resolved_config,
         reconciliation=reconciliation,
         reconcile_status=reconcile_status,
+        graph=graph_meta,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
@@ -1550,6 +1787,10 @@ def dispatch(
     allow_paths: Optional[List[str]] = None,
     plan_only: bool = False,
     plan_steps: Optional[List[str]] = None,
+    plan_graph: Optional[GraphPlan] = None,
+    max_parallel_nodes: Optional[int] = None,
+    verifier_concurrency: int = 1,
+    merge_policy: str = DEFAULT_MERGE_POLICY,
     run_stall_abort: Optional[float] = None,
     notify: Optional[str] = None,
     notify_cmd: Optional[str] = None,
@@ -1607,6 +1848,10 @@ def dispatch(
             allow_paths=allow_paths,
             plan_only=plan_only,
             plan_steps=plan_steps,
+            plan_graph=plan_graph,
+            max_parallel_nodes=max_parallel_nodes,
+            verifier_concurrency=verifier_concurrency,
+            merge_policy=merge_policy,
             run_stall_abort=run_stall_abort,
             notify=notify,
             notify_cmd=notify_cmd,
