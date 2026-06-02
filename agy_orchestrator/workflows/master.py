@@ -465,11 +465,44 @@ class MasterWorkflow:
         except Exception as exc:
             logger.warning("Could not read checkpoint %s: %s", path, exc)
             return None
+        # Tolerate a corrupt checkpoint (#master-checkpoint-1): a top-level JSON
+        # value that is a list/number/string is VALID JSON, so json.load above
+        # succeeds, but `data.get(...)` below would then raise AttributeError and
+        # abort execute(). A malformed checkpoint must return None (start fresh),
+        # never crash, like every other corrupt-checkpoint path here.
+        if not isinstance(data, dict):
+            logger.warning(
+                "Checkpoint %s top-level JSON is %s, not an object; "
+                "discarding and starting fresh.",
+                path, type(data).__name__,
+            )
+            return None
         if data.get("key") != self._checkpoint_key(initial_prompt):
             logger.info("Checkpoint %s is for a different project; starting fresh.", path)
             return None
         tasks = data.get("tasks") or []
-        completed = int(data.get("completed", 0))
+        # Tolerate a corrupt checkpoint (#master-checkpoint-2): a malformed file
+        # must return None (start fresh), never crash execute(). The json.load
+        # above only guards parse errors — a syntactically valid JSON whose
+        # fields are the wrong shape (non-numeric "completed", a dict "tasks")
+        # would otherwise blow up here or, worse, silently flow downstream into
+        # the linear loop's `tasks[i]` as a KeyError.
+        if not isinstance(tasks, list):
+            logger.warning(
+                "Checkpoint %s has a malformed 'tasks' field (%s, not a list); "
+                "discarding and starting fresh.",
+                path, type(tasks).__name__,
+            )
+            return None
+        try:
+            completed = int(data.get("completed", 0))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Checkpoint %s has a non-integer 'completed' field (%r); "
+                "discarding and starting fresh.",
+                path, data.get("completed"),
+            )
+            return None
         if not tasks or completed >= len(tasks):
             logger.info("Checkpoint shows project already complete; nothing to resume.")
             return None

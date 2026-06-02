@@ -107,7 +107,14 @@ class GraphPlan:
             if cur in seen:
                 continue
             seen.add(cur)
-            stack.extend(by_id[cur].deps)
+            dep_node = by_id.get(cur)
+            if dep_node is None:
+                # A dangling/unknown dep id (only reachable on a directly-built,
+                # un-validated GraphPlan). Raise the same typed, message-bearing
+                # error this method uses for an unknown queried node instead of
+                # leaking a bare KeyError from the by_id lookup.
+                raise ValueError(f"unknown node id: {cur}")
+            stack.extend(dep_node.deps)
         # Return in topological order so callers compose context deterministically.
         return [nid for nid in self.topo_order() if nid in seen]
 

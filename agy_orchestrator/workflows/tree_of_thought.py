@@ -107,6 +107,8 @@ class TreeOfThought:
         event_callback: Optional[Callable[[dict], None]] = None,
         requirement: Optional[str] = None,
     ):
+        if not branch_instances:
+            raise ValueError("TreeOfThought needs at least one branch instance")
         self.branch_instances = branch_instances
         self.evaluator = evaluator_instance
         self.selector = selector

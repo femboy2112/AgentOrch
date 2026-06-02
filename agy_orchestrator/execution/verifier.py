@@ -247,11 +247,14 @@ class QualityVerifier:
                 "Verifier -n %d exceeds host core count %d; clamping to -n %d "
                 "to avoid oversubscription.", k, cpu, cpu,
             )
-            return f"{m.group('flag')}{m.group('sep')}{cpu}"
+            return f"{m.group('pre')}{m.group('flag')}{m.group('sep')}{cpu}"
 
         # Match `-n 8` and `-n8` and `--numprocesses 8`, but NOT `-n auto`/`logical`.
+        # The flag must START a token (preceded by whitespace or the string start)
+        # so a substring like a test-file path `tests/foo-n99.py` or a `-k` filter
+        # `test-n99` is NOT mistaken for an xdist flag and silently rewritten.
         pattern = re.compile(
-            r"(?P<flag>--numprocesses|-n)(?P<sep>=|\s+|)(?P<k>\d+)"
+            r"(?P<pre>^|\s)(?P<flag>--numprocesses|-n)(?P<sep>=|\s+|)(?P<k>\d+)"
         )
         return pattern.sub(_sub, cmd)
 
@@ -445,10 +448,23 @@ class QualityVerifier:
         if max_chars <= 0 or len(text) <= max_chars:
             return text
         half = max_chars // 2
-        elided = len(text) - 2 * half
-        return (f"{text[:half]}\n"
-                f"... [{elided} bytes elided — head+tail kept] ...\n"
-                f"{text[-half:]}")
+        head = text[:half]
+        tail = text[len(text) - half:] if half > 0 else ""
+        elided = len(text) - len(head) - len(tail)
+        framed = (f"{head}\n"
+                  f"... [{elided} bytes elided — head+tail kept] ...\n"
+                  f"{tail}")
+        # The head+tail framing carries a FIXED elision-marker overhead (~44
+        # chars). For a tiny budget there is no room for it: the split's `half`
+        # is 0 (so ``text[-0:]`` returns the WHOLE string — a slice quirk) and/or
+        # the marker pushes the framed output LONGER than the raw input, defeating
+        # the very bound this helper exists to enforce. Whenever the framing would
+        # not actually shrink the text, degrade to a plain head cut so the output
+        # is never longer than the input. Generous (real-world, MiB-scale) caps
+        # are unaffected: there the framing is far shorter than the input.
+        if half <= 0 or len(framed) >= len(text):
+            return text[:max_chars]
+        return framed
 
     def _report_failure(self, result: VerifierResult, *,
                         stdout_bytes: bytes = b"", stderr_bytes: bytes = b"") -> None:

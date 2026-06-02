@@ -178,10 +178,19 @@ class GrokAgent(AgentInstance):
             if isinstance(obj, dict):
                 return obj
         except Exception:
-            m = re.search(r"\{.*\}", s, re.DOTALL)
-            if m:
+            # Fallback: slice from the first '{' to the last '}' in O(n) instead of
+            # re.search(r"\{.*\}", ...). The greedy regex re-anchors at every '{'
+            # start position and rescans to the end before failing, so on large,
+            # brace-heavy, NON-balanced stdout (a truncated stream / log/code dump
+            # with many '{' and no late '}') it backtracks O(n^2) and wedges the
+            # whole dispatch for tens of seconds. find()/rfind() are linear and
+            # match the same {...} span the regex would have for a well-formed
+            # object.
+            i = s.find("{")
+            j = s.rfind("}")
+            if i != -1 and j > i:
                 try:
-                    obj = json.loads(m.group(0))
+                    obj = json.loads(s[i:j + 1])
                     if isinstance(obj, dict):
                         return obj
                 except Exception:

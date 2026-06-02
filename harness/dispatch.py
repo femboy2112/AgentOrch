@@ -272,9 +272,13 @@ def plan_file_sha256(path: Union[str, Path]) -> str:
     failure surface).
     """
     p = Path(path).expanduser()
-    if not p.exists():
+    if not p.is_file():
         raise ValueError(f"no such plan file: {path}")
-    return hashlib.sha256(p.read_bytes()).hexdigest()
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"cannot read plan file ({path}): {exc}")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def load_plan(path: Union[str, Path]) -> Plan:
@@ -297,10 +301,14 @@ def load_plan(path: Union[str, Path]) -> Plan:
     (missing file, bad JSON, wrong shape, empty plan, or a non-string/empty step).
     """
     p = Path(path).expanduser()
-    if not p.exists():
+    if not p.is_file():
         raise ValueError(f"no such plan file: {path}")
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read plan file ({path}): {exc}")
+    try:
+        data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"plan file is not valid JSON ({path}): {exc}")
 

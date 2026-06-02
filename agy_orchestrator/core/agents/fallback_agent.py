@@ -249,6 +249,18 @@ def make_fallback_agent(
             # spent, so a flapping link can't loop a single provider forever (#57).
             transport_retries_used: Dict[Type[AgentInstance], int] = {}
             max_transport_retries = _transport_retries()
+            # Global budget on watchdog-rule re-route splices. Without a cap a self-
+            # or mutually-referencing rules table (e.g. A trips 'verbose'->[B],
+            # B trips 'stalled'->[A]) re-splices a fresh target every failure, so
+            # ``pending`` never drains and run_async() spins forever instead of
+            # reaching the exhaustion RuntimeError below (the docstring's "can't get
+            # stuck in an infinite rules-table ping-pong" invariant). The budget is
+            # generous enough that every legitimate per-trip re-route in a normal
+            # chain still fires (one rule fan-out per normal attempt, across every
+            # cycle), but bounded so a pathological rules table always terminates.
+            reroute_budget = total + sum(
+                len(targets) for targets in self._watchdog_rules.values()
+            ) * self._cycles
             while pending:
                 agent_cls = pending.pop(0)
                 attempts += 1
@@ -309,11 +321,15 @@ def make_fallback_agent(
                             await asyncio.sleep(backoff)
                         last_error = exc
                         continue
-                    if reason and reason in self._watchdog_rules:
+                    if reason and reason in self._watchdog_rules and reroute_budget > 0:
                         targets = self._watchdog_rules[reason]
                         # Splice rule-based re-route targets to the FRONT of pending,
                         # then continue. The targets pre-empt the normal sequence once;
                         # the normal sequence still runs afterwards if they too fail.
+                        # Spend from the global re-route budget so a self-/mutually-
+                        # referencing rules table can't re-splice forever (it drains
+                        # to the exhaustion RuntimeError instead of hanging).
+                        reroute_budget -= len(targets)
                         pending[0:0] = list(targets)
                         logger.warning(
                             "[Fallback] %s tripped watchdog:%s — re-routing to %s",

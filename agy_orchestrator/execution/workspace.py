@@ -293,6 +293,41 @@ def _snapshot_tree(root: Path) -> Dict[str, bytes]:
     return snapshot
 
 
+def _clear_path_conflicts(dst_path: Path, dst_root: Path) -> None:
+    """Remove anything on dst that blocks writing a regular file at ``dst_path``.
+
+    A file<->directory refactor (e.g. ``mod.py`` becomes the package
+    ``mod.py/__init__.py``, or vice versa) leaves the destination with a node
+    of the WRONG type along the path we're about to create:
+
+    * an intermediate component (``mod.py``) is a regular FILE on dst but must
+      become a directory — ``mkdir(parents=True)`` would raise FileExistsError;
+    * the final ``dst_path`` is a DIRECTORY on dst but the winner wants a regular
+      file there — ``write_bytes``/``copy2`` would raise IsADirectoryError, and
+      naively copying a file INTO that dir then unlinking it loses the write.
+
+    Both are resolved by removing the conflicting node (rmtree for dirs, unlink
+    for files) so the subsequent ``mkdir(parents=True, exist_ok=True)`` + write
+    lands the winner's file at the intended path. Never escapes ``dst_root``.
+    """
+    # Walk each intermediate parent (excluding dst_root): if it exists as a
+    # non-directory, it blocks mkdir — remove it.
+    parents = []
+    p = dst_path.parent
+    while p != dst_root and dst_root in p.parents:
+        parents.append(p)
+        p = p.parent
+    for parent in reversed(parents):  # outermost first
+        if parent.exists() and not parent.is_dir():
+            try:
+                parent.unlink()
+            except OSError:
+                pass
+    # The final target itself: a directory where we want a file must go.
+    if dst_path.is_dir() and not dst_path.is_symlink():
+        shutil.rmtree(dst_path, ignore_errors=True)
+
+
 async def apply_node_writes(src: Path, dst: Path, base_snapshot: Dict[str, bytes]) -> None:
     """Apply ONLY the files a DAG node changed (vs its open-time snapshot) to dst.
 
@@ -316,12 +351,16 @@ async def apply_node_writes(src: Path, dst: Path, base_snapshot: Dict[str, bytes
             if base_snapshot.get(rel) == data:
                 continue  # unchanged by this node — don't touch the live tree
             dst_path = dst / rel
-            if dst_path.exists():
+            if dst_path.is_file():
                 try:
                     if dst_path.read_bytes() == data:
                         continue
                 except OSError:
                     pass
+            # A file<->dir refactor can leave a wrong-typed node blocking this
+            # write (intermediate file where we need a dir, or a dir where we
+            # need a file). Clear it so mkdir + write can't raise.
+            _clear_path_conflicts(dst_path, dst)
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             dst_path.write_bytes(data)
         # Files the node DELETED (present at open, gone now): remove from dst.
@@ -374,12 +413,16 @@ async def apply_workspace(src: Path, dst: Path) -> None:
             # Only copy when content actually differs — avoids touching mtimes
             # on identical files and gives a cleaner diff if the operator
             # inspects work_dir after.
-            if dst_path.exists():
+            if dst_path.is_file():
                 try:
                     if dst_path.read_bytes() == src_path.read_bytes():
                         continue
                 except OSError:
                     pass
+            # A file<->dir refactor can leave a wrong-typed node blocking this
+            # write (intermediate file where we need a dir, or a dir where we
+            # need a file). Clear it so mkdir + copy2 can't raise / misplace.
+            _clear_path_conflicts(dst_path, dst)
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_path, dst_path)
 

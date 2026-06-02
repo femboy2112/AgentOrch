@@ -31,6 +31,8 @@ def _is_approved(feedback: str) -> bool:
     whole reply is exactly ``APPROVED`` OR its last non-empty line is exactly
     ``APPROVED`` (trailing punctuation allowed).
     """
+    if not isinstance(feedback, str):
+        feedback = "" if feedback is None else str(feedback)
     stripped = _THINK_RE.sub("", feedback).strip()
     if stripped.upper() == "APPROVED":
         return True
@@ -354,6 +356,14 @@ class AdversarialReview:
                 critic_prompt = self.critic_preamble + critic_prompt
             self.critic.prompt = critic_prompt
             critic_feedback = await self.critic.run_async()
+            # A critic worker can legitimately return None / a non-string: e.g. a
+            # claude worker emitting {"type":"result","result":null} for an empty
+            # or cancelled turn surfaces as None. Coerce here so the downstream
+            # re.sub-based approval and stall checks never raise TypeError; an
+            # empty reply is correctly treated as "not approved" and the loop
+            # continues instead of aborting the whole dispatch.
+            if not isinstance(critic_feedback, str):
+                critic_feedback = "" if critic_feedback is None else str(critic_feedback)
 
             if _is_approved(critic_feedback):
                 logger.info("Critic approved the output.")

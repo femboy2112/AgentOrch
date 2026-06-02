@@ -354,18 +354,42 @@ def _extract_json_blob(text: str) -> Optional[str]:
     return None
 
 
+def _finite_or_dead(value: float) -> float:
+    """Map a non-finite witness magnitude (NaN/±Inf) to 0.0 (dead).
+
+    A NaN/Inf is not a real ablation signal — it carries no numeric witness, so it
+    must read as DEAD WIRING (value 0), not as load-bearing. Crucially this also
+    keeps a non-JSON-compliant ``NaN``/``Infinity`` token out of the durable
+    ``reconcile.json`` artifact: ``Witness.is_dead`` checks ``value == 0`` and
+    ``nan == 0`` is False, so a NaN witness would otherwise silently bless a
+    mechanism as load-bearing AND corrupt the persisted JSON (strict readers reject
+    the bare ``NaN``)."""
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return value
+
+
 def _coerce_float(value: Any) -> float:
-    """Best-effort numeric coercion for a witness value; non-numeric -> 0.0 (dead)."""
+    """Best-effort numeric coercion for a witness value; non-numeric -> 0.0 (dead).
+
+    Non-finite results (NaN, ±Inf) and values too large to represent as a float are
+    coerced to 0.0 (dead): they are not a real numeric witness, and they must never
+    crash parsing (OverflowError on a giant int) or corrupt the durable
+    ``reconcile.json`` (a bare ``NaN``/``Infinity`` token is not valid JSON)."""
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            return _finite_or_dead(float(value))
+        except (OverflowError, ValueError):
+            # e.g. an int too large to convert to a float -> no real signal -> dead.
+            return 0.0
     if isinstance(value, str):
         m = re.search(r"-?\d+(?:\.\d+)?", value)
         if m:
             try:
-                return float(m.group(0))
-            except ValueError:
+                return _finite_or_dead(float(m.group(0)))
+            except (ValueError, OverflowError):
                 return 0.0
     return 0.0
 
@@ -388,14 +412,14 @@ def _parse_witness_signal(stdout: str) -> Optional[float]:
     tags = _WITNESS_TAG_RE.findall(stdout or "")
     if tags:
         try:
-            return float(tags[-1])
-        except ValueError:
+            return _finite_or_dead(float(tags[-1]))
+        except (ValueError, OverflowError):
             pass
     nums = _NUMBER_RE.findall(stdout or "")
     if nums:
         try:
-            return float(nums[-1])
-        except ValueError:
+            return _finite_or_dead(float(nums[-1]))
+        except (ValueError, OverflowError):
             return None
     return None
 
@@ -618,6 +642,13 @@ class ReconciliationReview:
                 data = json.loads(blob)
             except json.JSONDecodeError as exc:
                 parse_error = f"invalid JSON: {exc}"
+                data = {}
+            except RecursionError as exc:
+                # A pathologically deep ``{...}``/``[...]`` blob blows Python's
+                # parser recursion limit. That is a malformed reply, not a station
+                # bug — treat it as a parse_error rather than letting the
+                # RecursionError escape parse()/execute() and crash the run.
+                parse_error = f"invalid JSON: input nested too deeply ({exc})"
                 data = {}
             raw_findings = data.get("findings") if isinstance(data, dict) else None
             if isinstance(raw_findings, list):

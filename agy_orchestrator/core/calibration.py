@@ -91,7 +91,16 @@ class CalibrationTable:
         self._success: dict[tuple[str, str, Optional[str]], list[tuple[int, float]]] = defaultdict(list)
 
     def ingest(self, rows: Iterable[dict]) -> int:
-        """Add rows; return count actually used (passing rows with usable telemetry)."""
+        """Add rows; return count actually used (passing rows with usable telemetry).
+
+        A corrupt ledger row (non-numeric or non-finite ``out_tokens`` /
+        ``wall_ms``) is skipped rather than allowed to crash or poison the
+        table. ``load()`` promises never to error on a partially-written
+        live ledger, and ``budget_for()`` must never see a string (TypeError
+        on ``str > 0``) or an Infinity/NaN (which would silently disable the
+        watchdog by inflating the stall budget to inf). Validate here, at the
+        single point telemetry enters the table.
+        """
         used = 0
         for r in rows:
             if not r.get("ok"):
@@ -101,9 +110,37 @@ class CalibrationTable:
             wall_ms = r.get("wall_ms")
             if out_tok is None and wall_ms is None:
                 continue
-            self._success[key].append((out_tok or 0, float(wall_ms or 0)))
+            out_val = self._coerce_finite(out_tok)
+            wall_val = self._coerce_finite(wall_ms)
+            # Drop a row only if BOTH telemetry fields are unusable; a row that
+            # carries one valid metric (e.g. wall-only grok/agy rows) is still
+            # recorded, with the unusable field zeroed.
+            if out_val is None and wall_val is None:
+                continue
+            self._success[key].append((int(out_val or 0), float(wall_val or 0.0)))
             used += 1
         return used
+
+    @staticmethod
+    def _coerce_finite(value) -> Optional[float]:
+        """Return ``value`` as a finite float, or None if it isn't usable.
+
+        Handles corrupt ledger rows: non-numeric strings, bool (rejected —
+        a stray ``true`` is not a token count), and Infinity/NaN literals
+        (which json.loads accepts by default)."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if not isinstance(value, (int, float)):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+        f = float(value)
+        if f != f or f in (float("inf"), float("-inf")):  # NaN or +/-inf
+            return None
+        return f
 
     @classmethod
     def load(
@@ -138,7 +175,12 @@ class CalibrationTable:
             except Exception as exc:
                 logger.warning("calibration: failed to read %s %s: %s", label, p, exc)
                 continue
-            used = table.ingest(rows)
+            try:
+                used = table.ingest(rows)
+            except Exception as exc:  # defense in depth: load() must never error
+                logger.warning("calibration: failed to ingest %s rows from %s: %s",
+                               label, p, exc)
+                continue
             logger.info("calibration: loaded %d/%d passing %s rows from %s",
                         used, len(rows), label, p)
         return table

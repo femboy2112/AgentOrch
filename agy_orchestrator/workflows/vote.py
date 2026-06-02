@@ -138,7 +138,20 @@ class VoteWorkflow:
         # spike — a venv + pip install per candidate).
         self.candidate_setup = candidate_setup
         if setup_timeout is None:
-            setup_timeout = float(os.environ.get("AGY_SETUP_TIMEOUT", "1200") or 0)
+            # A malformed AGY_SETUP_TIMEOUT (e.g. "abc", "10s") must not brick
+            # vote at construction time — fall back to the 1200s default rather
+            # than letting float() raise an uncaught ValueError out of __init__
+            # (which would crash every vote dispatch on a fat-fingered env var).
+            # An explicit empty / "0" still means "no timeout" (-> 0.0).
+            raw = os.environ.get("AGY_SETUP_TIMEOUT", "1200")
+            try:
+                setup_timeout = float(raw or 0)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "AGY_SETUP_TIMEOUT=%r is not a number; using default 1200s",
+                    raw,
+                )
+                setup_timeout = 1200.0
         self.setup_timeout = setup_timeout
         # Host-safety cap (#42 item 7): bound how many candidates run end-to-end
         # at once (generation + verification). None = all K concurrent (legacy).

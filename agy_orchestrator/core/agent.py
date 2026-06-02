@@ -941,8 +941,17 @@ class AgentInstance(ABC):
                         self._emit_usage_event("", self.stderr, attempt=attempt, success=False)
                         raise RuntimeError(self.stderr)  # fail fast, no retry
 
-                    raw_stdout = stdout_bytes.decode()
-                    self.stderr = self.filter_stderr(stderr_bytes.decode())
+                    # Decode tolerantly: a worker can emit a stray non-UTF-8 byte
+                    # (binary noise, a mojibake stack-trace fragment) even on a
+                    # SUCCESSFUL (returncode 0) run, and a strict .decode() would
+                    # raise — turning a success into a generic exception that burns
+                    # the whole retry budget, and (worse) crashing BEFORE the
+                    # usage-wall / context-overflow / wedged-session fast-fail
+                    # classification below, so a quota wall carrying one bad byte
+                    # would no longer fail over fast. errors="replace" matches the
+                    # streaming _drain path, which already decodes leniently.
+                    raw_stdout = stdout_bytes.decode(errors="replace")
+                    self.stderr = self.filter_stderr(stderr_bytes.decode(errors="replace"))
                     self.returncode = process.returncode
                     self._current_process = None
                     self.last_wall_ms = (time.monotonic() - attempt_start) * 1000

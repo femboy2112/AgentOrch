@@ -15,9 +15,17 @@ verifier, no subprocess). The orchestrator wires real workers into the callables
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any, Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Headroom kept below the interpreter's recursion limit so a deeply nested
+# decomposition gives up gracefully (the documented max_depth contract) instead
+# of overflowing the Python stack with a RecursionError. ``_solve`` recurses once
+# per decomposition level, so the effective give-up depth is clamped to
+# ``recursionlimit - _RECURSION_MARGIN`` when an operator sets max_depth above it.
+_RECURSION_MARGIN = 64
 
 
 class DecompNode:
@@ -102,9 +110,17 @@ class AdaptiveDecomposer:
 
         # 2) Failed. If we're out of depth budget, return the failed attempt as-is
         #    (no further splitting — a weak model can't recurse forever).
-        if node.depth >= self.max_depth:
-            logger.info("Decompose: failed at depth %d and max_depth reached — giving up.",
-                        node.depth)
+        #    The give-up bound is max_depth, but it is also clamped below the
+        #    interpreter's recursion limit: ``_solve`` recurses once per level, so
+        #    an operator-supplied max_depth above the limit would overflow the
+        #    stack (RecursionError) before this branch is ever reached. Treat the
+        #    safe ceiling as an equivalent give-up so the documented
+        #    ``(output, False)`` contract holds instead of crashing.
+        safe_ceiling = sys.getrecursionlimit() - _RECURSION_MARGIN
+        if node.depth >= self.max_depth or node.depth >= safe_ceiling:
+            bound = "max_depth" if node.depth >= self.max_depth else "recursion ceiling"
+            logger.info("Decompose: failed at depth %d and %s reached — giving up.",
+                        node.depth, bound)
             return output, False
 
         # 3) Decompose ON FAILURE and solve each subtask recursively.

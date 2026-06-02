@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 from typing import List, Optional
@@ -191,7 +192,16 @@ class CodexAgent(AgentInstance):
         # claude convention, cache-exclusive). Normalize codex to match so the
         # hit-rate is correct and cross-provider sums line up: fresh = total - cached.
         fresh_input = raw_input
-        if isinstance(raw_input, (int, float)) and isinstance(cache_read, (int, float)):
+        # JSON can legally carry non-finite floats (json.loads accepts 'NaN', and
+        # '1e400' -> inf), and int(nan)/int(inf) raise ValueError/OverflowError.
+        # Guard with isfinite() so a poisoned token count can't crash usage
+        # extraction and silently discard the whole (otherwise valid) usage row.
+        if (
+            isinstance(raw_input, (int, float))
+            and isinstance(cache_read, (int, float))
+            and math.isfinite(raw_input)
+            and math.isfinite(cache_read)
+        ):
             fresh_input = max(int(raw_input) - int(cache_read), 0)
         return {
             "token_source": "cli",
