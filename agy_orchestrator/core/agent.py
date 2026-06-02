@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import shlex
 import signal
 import sys
 import time
@@ -96,6 +97,14 @@ def apply_worker_resource_bounds(env: Dict[str, str]) -> Dict[str, str]:
         default 2; K<=0 -> ``-p no:xdist`` serial). Appended after any existing
         value so this bound wins over a repo's ini ``-n auto`` (pytest takes the
         last ``-n``), while preserving the operator's other addopts.
+      - ``PYTEST_ADDOPTS`` also gains ``-m <expr>`` when ``AGY_WORKER_PYTEST_MARKERS``
+        is set (issue #49) — propagating the in-loop verifier's selection policy
+        (e.g. ``not slow``) to worker-spawned bare ``pytest`` so a refinement step
+        doesn't run the at-scale suite the loop excludes. Opt-in (default unset),
+        because "slow" is a per-repo convention. CAVEAT: addopts is lower
+        precedence than an explicit command-line ``-m`` (pytest takes the last
+        ``-m``), so a worker that *explicitly* runs ``pytest -m slow`` still wins;
+        the wall-clock kill (``AGY_WORKER_CMD_TIMEOUT``) is the backstop for that.
 
     Returns ``env`` unchanged (same object) when bounding is disabled.
     """
@@ -108,9 +117,13 @@ def apply_worker_resource_bounds(env: Dict[str, str]) -> Dict[str, str]:
         k = int(os.environ.get("AGY_WORKER_PYTEST_XDIST", "2") or "2")
     except ValueError:
         k = 2
-    xdist = f"-n {k}" if k > 0 else "-p no:xdist"
+    fragments = [f"-n {k}" if k > 0 else "-p no:xdist"]
+    markers = (os.environ.get("AGY_WORKER_PYTEST_MARKERS") or "").strip()
+    if markers:
+        fragments.append(f"-m {shlex.quote(markers)}")
     existing = (out.get("PYTEST_ADDOPTS") or "").strip()
-    out["PYTEST_ADDOPTS"] = f"{existing} {xdist}".strip() if existing else xdist
+    parts = ([existing] if existing else []) + fragments
+    out["PYTEST_ADDOPTS"] = " ".join(parts)
     return out
 
 
@@ -157,6 +170,17 @@ class AgentInstance(ABC):
         # on liveness-based extension. 0/unset => default to ABSOLUTE_TIMEOUT_FACTOR
         # x timeout. Override with AGY_ABSOLUTE_TIMEOUT (seconds).
         self.absolute_timeout = float(os.environ.get("AGY_ABSOLUTE_TIMEOUT", "0") or 0)
+        # Hard per-worker-call wall-clock kill that fires even while the child is
+        # actively emitting output (issue #49). The orchestrator cannot wrap a
+        # command the worker CLI runs *internally* (e.g. a step running its own
+        # `pytest -m slow`) in `timeout`, but it CAN bound the worker call that
+        # contains it: the idle watchdog (AGY_STALL_SECONDS) never fires on a
+        # long-but-chatty command, so without this a single such command can block
+        # a step for the better part of an hour. 0/unset disables (no regression of
+        # the #28 long-active-turn allowance); set AGY_WORKER_CMD_TIMEOUT (seconds)
+        # on small/mission-critical hosts. Composes with absolute_timeout: the
+        # TIGHTER of the two wins (see _absolute_cap).
+        self.worker_cmd_timeout = float(os.environ.get("AGY_WORKER_CMD_TIMEOUT", "0") or 0)
         # Last time the child emitted output on either stream (monotonic). Shared
         # between the stream drain, the watchdog, and the liveness-aware wait.
         self._last_progress: float = 0.0
@@ -539,10 +563,17 @@ class AgentInstance(ABC):
             pass
 
     def _absolute_cap(self) -> float:
-        """Hard wall-clock ceiling for a streaming call (0 = uncapped). Explicit
-        AGY_ABSOLUTE_TIMEOUT wins; otherwise default to a multiple of timeout."""
-        if self.absolute_timeout and self.absolute_timeout > 0:
-            return self.absolute_timeout
+        """Hard wall-clock ceiling for a streaming call (0 = uncapped); fires even
+        while the child is actively emitting output. The TIGHTEST set ceiling wins:
+        an explicit per-call ``AGY_WORKER_CMD_TIMEOUT`` (#49) and/or
+        ``AGY_ABSOLUTE_TIMEOUT`` are combined by min; with neither set, default to
+        a multiple of ``timeout``."""
+        caps = [
+            c for c in (getattr(self, "worker_cmd_timeout", 0.0), self.absolute_timeout)
+            if c and c > 0
+        ]
+        if caps:
+            return min(caps)
         if self.timeout and self.timeout > 0:
             return self.timeout * ABSOLUTE_TIMEOUT_FACTOR
         return 0.0
@@ -564,8 +595,13 @@ class AgentInstance(ABC):
                 now = time.monotonic()
                 last = self._last_progress or attempt_start
                 if hard_cap > 0 and (now - attempt_start) >= hard_cap:
+                    # Active-but-too-long: the child may still be emitting output
+                    # (e.g. a worker running `pytest -m slow`), so only the hard
+                    # wall-clock cap can stop it (#49).
+                    self._timeout_kind = "wallclock"
                     raise asyncio.TimeoutError
                 if idle_window > 0 and (now - last) >= idle_window:
+                    self._timeout_kind = "idle"
                     raise asyncio.TimeoutError
                 slice_s = 2.0  # poll cadence; matches the watchdog tick
                 if idle_window > 0:
@@ -608,6 +644,7 @@ class AgentInstance(ABC):
         try:
             for attempt in range(1, self.max_retries + 1):
                 self._watchdog_reason = None
+                self._timeout_kind = None
                 attempt_start = time.monotonic()
                 self._last_progress = attempt_start
                 try:
@@ -659,9 +696,13 @@ class AgentInstance(ABC):
                             stdout_bytes, stderr_bytes = await comm
                     except asyncio.TimeoutError:
                         waited = time.monotonic() - attempt_start
-                        logger.error("Agent subprocess exceeded liveness/abs ceiling "
-                                     "(%.0fs elapsed, idle>%.0fs or cap %.0fs); killing and "
-                                     "failing over.", waited, self.timeout, self._absolute_cap())
+                        kind = getattr(self, "_timeout_kind", None)
+                        reason = ("wall-clock cap" if kind == "wallclock"
+                                  else "idle stall" if kind == "idle" else "ceiling")
+                        logger.error("Agent subprocess exceeded %s "
+                                     "(%.0fs elapsed, idle>%.0fs, cap %.0fs); killing and "
+                                     "failing over.", reason, waited, self.timeout,
+                                     self._absolute_cap())
                         await self._kill_current()
                         self.stderr = f"timed out after {waited:.0f}s"
                         self._emit_usage_event("", self.stderr, attempt=attempt, success=False)
