@@ -301,6 +301,25 @@ class AgentInstance(ABC):
         # directly (e.g. orchestration picks per-config budgets from a CalibrationTable).
         self.max_output_bytes = int(os.environ.get("AGY_MAX_OUTPUT_BYTES", "0") or 0)
         self.stall_seconds = float(os.environ.get("AGY_STALL_SECONDS", "0") or 0)
+        # Transport-degradation bound (issues #72/#73). The #53 transport-stall
+        # heuristic is gated on transport_noise_only / _last_progress, both of
+        # which a busy-failing provider RESETS by interleaving ordinary stdout
+        # chatter between its websocket-reset stderr lines — so a chatty-but-wedged
+        # codex (sustained "Connection reset by peer (os error 104)", subprocess
+        # alive retrying internally for ~72 min) never trips either stall and the
+        # call never terminates, so FallbackAgent never advances and AGY_STALL_SECONDS
+        # never fires. This tracker is DECOUPLED from _last_progress / stdout resets:
+        # it counts genuine transport errors (is_transport_error, NOT the broader
+        # noise list) across a degraded "spell" that survives interleaved progress.
+        # Default-ON and conservative — a HEALTHY call emits ZERO transport errors,
+        # so a default-on bound can never trip on it. 0 disables each signal.
+        #   transport_max_errors:     cumulative transport-error lines that trip a spell.
+        #   transport_max_seconds:    max wall-clock a degraded spell may persist.
+        #   transport_recovery_window: seconds with NO transport error that clears a spell.
+        self.transport_max_errors = int(os.environ.get("AGY_TRANSPORT_MAX_ERRORS", "25") or 0)
+        self.transport_max_seconds = float(os.environ.get("AGY_TRANSPORT_MAX_SECONDS", "300") or 0)
+        self.transport_recovery_window = float(
+            os.environ.get("AGY_TRANSPORT_RECOVERY_WINDOW", "60") or 0)
         # Set by the watchdog when it trips so callers (and FallbackAgent) can
         # distinguish a runaway from a normal failure. Cleared at each run start.
         self._watchdog_reason: Optional[str] = None
@@ -514,6 +533,20 @@ class AgentInstance(ABC):
         # (issue #53). Reset whenever real progress (stdout, or non-noise stderr)
         # advances the stall clock.
         transport_noise_only = [False]
+        # Transport-degradation "spell" state (issues #72/#73). DELIBERATELY NOT
+        # reset by _mark_progress / stdout: a chatty-but-wedged provider interleaves
+        # ordinary stdout between its websocket-reset stderr lines, which is exactly
+        # what defeats the transport_noise_only heuristic above. We count GENUINE
+        # transport-error lines (is_transport_error) across a spell that survives
+        # that interleaving, and let a recovery window of clean output clear it.
+        #   transport_err_count: cumulative transport errors in the active spell.
+        #   transport_spell_start: monotonic time the active spell began.
+        #   last_transport_err: monotonic time of the most recent transport error.
+        #   transport_spell_active: whether a degraded spell is currently open.
+        transport_err_count = [0]
+        transport_spell_start = [0.0]
+        last_transport_err = [0.0]
+        transport_spell_active = [False]
         # Reset the shared last-progress clock at the start of this attempt so a
         # stale value from a prior attempt can't make the liveness wait think the
         # child is already idle.
@@ -533,6 +566,23 @@ class AgentInstance(ABC):
             # only when it is NOT transport-retry noise: real worker chatter
             # (codex exec lines, apply_patch traces, status) advances the stall
             # clock, but "connection reset / retrying" spam does not (issue #53).
+            # Transport-degradation tracking (issues #72/#73): a GENUINE transport
+            # error on stderr opens or extends a degraded spell. CRITICAL: this is
+            # independent of _mark_progress / stdout — it must NOT be reset by the
+            # interleaved progress that a chatty-but-wedged provider emits (that
+            # interleaving is the whole bug). Use is_transport_error (the conservative
+            # COUNTING helper) so generic "timeout"/"retry"/"network" chatter — which
+            # the broader noise list matches — does not over-count. A usage wall /
+            # context overflow is never a transport error (excluded in the helper).
+            if stream == "stderr" and is_transport_error(text):
+                now_te = time.monotonic()
+                if not transport_spell_active[0]:
+                    transport_spell_active[0] = True
+                    transport_spell_start[0] = now_te
+                    transport_err_count[0] = 1
+                else:
+                    transport_err_count[0] += 1
+                last_transport_err[0] = now_te
             if stream == "stdout":
                 _mark_progress()
             elif _is_transport_noise_line(text):
@@ -618,11 +668,19 @@ class AgentInstance(ABC):
             finally:
                 exited.set()
 
+        # Transport-degradation bound is armed when either of its bounds is set
+        # (issues #72/#73). It is INDEPENDENT of max_output_bytes / stall_seconds,
+        # so the watchdog must run even when those are disabled.
+        transport_max_errors = self.transport_max_errors
+        transport_max_seconds = self.transport_max_seconds
+        transport_recovery_window = self.transport_recovery_window
+        transport_armed = transport_max_errors > 0 or transport_max_seconds > 0
+
         async def _watchdog() -> None:
             # Wake on child-exit OR every 2s, whichever comes first; 2s is cheap
             # relative to subprocess scheduling, fine-grained enough that a runaway
             # emitting 10KB/s trips within one tick of budget.
-            if max_output_bytes <= 0 and stall_seconds <= 0:
+            if max_output_bytes <= 0 and stall_seconds <= 0 and not transport_armed:
                 return
             while process.returncode is None:
                 try:
@@ -639,6 +697,37 @@ class AgentInstance(ABC):
                                    out_total[0], max_output_bytes)
                     self._killpg_tree(process)
                     return
+                # Transport-degradation trip (issues #72/#73): a degraded spell that
+                # accumulates too many genuine transport errors or persists too long.
+                # INDEPENDENT of stall_seconds and of transport_noise_only — the spell
+                # state is NOT reset by the interleaved stdout chatter that a busy-
+                # failing provider emits, which is exactly why the #53 heuristics miss
+                # the chatty-but-wedged case. A recovery window of clean output (no
+                # transport error) clears the spell first, so a transient blip that
+                # recovers can never trip (no false positive on a healthy/recovered call).
+                if transport_armed and transport_spell_active[0]:
+                    now_wd = time.monotonic()
+                    if (transport_recovery_window > 0
+                            and (now_wd - last_transport_err[0]) > transport_recovery_window):
+                        # No transport error for the recovery window -> genuine
+                        # recovery; close the spell so it can't trip on stale state.
+                        transport_spell_active[0] = False
+                        transport_err_count[0] = 0
+                    elif ((transport_max_errors > 0
+                           and transport_err_count[0] >= transport_max_errors)
+                          or (transport_max_seconds > 0
+                              and (now_wd - transport_spell_start[0]) > transport_max_seconds)):
+                        self._watchdog_reason = WATCHDOG_TRANSPORT_STALL
+                        which = ("error-count %d>=%d" % (transport_err_count[0], transport_max_errors)
+                                 if (transport_max_errors > 0
+                                     and transport_err_count[0] >= transport_max_errors)
+                                 else "spell-duration %.0fs>%.0fs" % (
+                                     now_wd - transport_spell_start[0], transport_max_seconds))
+                        logger.warning(
+                            "watchdog: TRANSPORT DEGRADATION trip — %s of sustained "
+                            "transport errors (chatty-but-wedged provider); killing", which)
+                        self._killpg_tree(process)
+                        return
                 if stall_seconds > 0 and (time.monotonic() - self._last_progress) > stall_seconds:
                     # `_last_progress` advances on REAL progress only (stdout, or
                     # non-noise stderr); transport-retry noise does not move it.
@@ -848,11 +937,35 @@ class AgentInstance(ABC):
                     return task.result()
         finally:
             if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except BaseException:
-                    pass
+                # Teardown must be reliable now that the transport bound is
+                # default-ON: with it armed, _stream_communicate's watchdog task
+                # always loops (its early-return guard no longer short-circuits), and
+                # cancelling the streaming coroutine while that watchdog is mid-loop
+                # leaves the watchdog orphaned and wedges the teardown (the coroutine
+                # never finishes unwinding). So when there is a REAL child, KILL it
+                # and let the coroutine COMPLETE NATURALLY: the reap flips
+                # process.returncode, the inner _await_exit returns, and
+                # _stream_communicate runs its own cleanup (cancelling the watchdog/
+                # feed tasks, gathering the drains) and returns the partial bytes.
+                # Bounded so a child that refuses to die can't hang the teardown; on
+                # that timeout (or when there is no real process to reap — e.g. a
+                # unit test driving this with a bare coroutine) fall back to a direct
+                # cancel. (issues #72/#73)
+                proc = getattr(self, "_current_process", None)
+                if proc is not None:
+                    self._killpg_tree(proc)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), 10)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                    except BaseException:
+                        pass
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
 
     async def run_async(self, piped_input: Optional[str] = None) -> str:
         """Run the agent CLI, retrying only on transient errors.
@@ -869,7 +982,14 @@ class AgentInstance(ABC):
         # Force streaming mode when any watchdog budget is set — the watchdog
         # needs line-by-line visibility to count bytes and detect stalls. Stays
         # opt-in: with no budgets set, behaviour is identical to the prior path.
-        watchdog_armed = self.max_output_bytes > 0 or self.stall_seconds > 0
+        # The transport-degradation bound (issues #72/#73) also requires streaming
+        # so the watchdog gets line-by-line stderr to count transport errors. It is
+        # default-ON, so a worker call now streams by default — but a healthy call
+        # emits ZERO transport errors, so the tracker can never trip on it and the
+        # only added cost is the (already cheap) line-by-line drain path.
+        transport_bound_armed = self.transport_max_errors > 0 or self.transport_max_seconds > 0
+        watchdog_armed = (
+            self.max_output_bytes > 0 or self.stall_seconds > 0 or transport_bound_armed)
         stream_mode = bool(os.environ.get("AGY_STREAM")) or watchdog_armed or self.event_callback is not None
 
         # Stamp the agent's ROLE (set by the orchestrator at construction, e.g.

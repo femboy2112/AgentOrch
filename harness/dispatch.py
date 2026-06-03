@@ -293,6 +293,67 @@ def _resolve_reconcile_disposition(
     return reconcile_disposition
 
 
+# Generous run-level stall default armed under --mission-critical (#72, Layer 2).
+# This is a COARSE backstop, not a tight bound — a healthy multi-step build can
+# legitimately go minutes between run-level forward-progress events (a long
+# worker call, a slow verifier). 1800s (30 min) is well above any healthy gap we
+# have measured, so default-arming it can never trip a healthy run; it only
+# engages when a run is wedged with NO run-level progress for half an hour. The
+# fine-grained transport-degradation detection + provider cycling lives at the
+# worker layer (Layer 1); this run-level net only ABORTS.
+MISSION_CRITICAL_RUN_STALL_DEFAULT = 1800.0
+
+
+def _resolve_run_stall_abort(
+    run_stall_abort: Optional[float],
+    mission_critical: bool,
+) -> Optional[float]:
+    """Resolve the effective run-level stall-abort window (#72, Layer 2).
+
+    ``run_stall_abort`` is None when the operator did NOT pass --run-stall-abort
+    (argparse default), else the literal flag value (a float, possibly 0.0 to
+    disable). --mission-critical means "this must actually work unattended", so
+    an UNSPECIFIED window under --mission-critical now DEFAULT-ARMS a generous
+    run-level stall backstop (``MISSION_CRITICAL_RUN_STALL_DEFAULT``, overridable
+    via ``AGY_MISSION_CRITICAL_RUN_STALL``; 0 disables) instead of leaving the
+    run-level net dark.
+
+    An EXPLICIT --run-stall-abort always WINS — including an explicit 0/off,
+    which honors the operator's choice to disable the run-level net. Without
+    --mission-critical the value passes through unchanged (None stays None), so
+    behaviour is byte-identical to the pre-#72 path.
+
+    Cases:
+      1. None + mission_critical=True  -> default (env-overridable; 0 disables -> None)
+      2. None + mission_critical=False -> None (unchanged)
+      3. explicit value (any mission_critical) -> passthrough verbatim (0 = off)
+    """
+    if run_stall_abort is not None:
+        return run_stall_abort
+    if not mission_critical:
+        return None
+    try:
+        default = float(
+            os.environ.get(
+                "AGY_MISSION_CRITICAL_RUN_STALL",
+                str(MISSION_CRITICAL_RUN_STALL_DEFAULT),
+            )
+            or 0
+        )
+    except ValueError:
+        default = MISSION_CRITICAL_RUN_STALL_DEFAULT
+    if default <= 0:
+        return None  # env-disabled
+    logger.info(
+        "--mission-critical with no explicit --run-stall-abort: default-arming the "
+        "run-level stall backstop at %gs (no run-level forward progress for that "
+        "long aborts the run). Pass --run-stall-abort 0 to disable, or a value to "
+        "override. Provider cycling is handled at the worker layer.",
+        default,
+    )
+    return default
+
+
 def plan_file_sha256(path: Union[str, Path]) -> str:
     """Return the sha256 (hex) of a plan file's raw bytes (#56).
 
@@ -1484,6 +1545,13 @@ async def dispatch_async(
         or os.environ.get("AGY_RECONCILE", "").lower() in ("1", "true", "on")
     )
     recon_disposition = _resolve_reconcile_disposition(reconcile_disposition, mission_critical)
+
+    # Run-level stall backstop (#72, Layer 2): default-arm a generous run-level
+    # stall under --mission-critical when the operator did not pass an explicit
+    # --run-stall-abort, so the coarse abort net is engaged even if Layer 1's
+    # worker-transport bound is somehow defeated. Explicit values (incl. 0/off)
+    # always win; non-mission-critical runs are unchanged.
+    run_stall_abort = _resolve_run_stall_abort(run_stall_abort, mission_critical)
 
     # Where the worker actually writes files. Default = AgentOrch repo root,
     # which preserves the prior behaviour exactly.
