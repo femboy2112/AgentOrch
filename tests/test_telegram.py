@@ -534,3 +534,111 @@ def test_build_notifier_forced_missing_warns_and_stays_off(monkeypatch, caplog):
             run_id="R", mode="m", enabled=True, verbosity=None)
     assert n is None
     assert any("telegram" in r.message.lower() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# LIVE /verbosity: a persisted level change takes effect on a running dispatch's
+# push notifications (was frozen at construction — "/verbosity did nothing").
+# --------------------------------------------------------------------------- #
+def _spinup_event():
+    # Canonical worker spin-up: rendered at normal+, silent at quiet. Used to
+    # probe the effective gating level of a live notifier.
+    return {
+        "kind": "lifecycle", "run_id": "R",
+        "worker": "codex", "model": "gpt-5.3-codex-spark", "effort": "high",
+        "data": {"event": "agent_started", "detail": {}},
+    }
+
+
+def _write_persisted_verbosity(level):
+    # Mirror what the bot's /verbosity command persists.
+    bot.save_state({"verbosity": level})
+
+
+def test_load_persisted_verbosity_reads_state_file():
+    _write_persisted_verbosity("debug")
+    assert tg.load_persisted_verbosity() == "debug"
+
+
+def test_load_persisted_verbosity_none_when_absent_or_garbage(tmp_path, monkeypatch):
+    # No file yet -> None (autouse isolation points at a non-existent tmp file).
+    assert tg.load_persisted_verbosity() is None
+    # Garbage / no key -> None, never raises.
+    p = tmp_path / "garbage_state.json"
+    p.write_text("not json {", encoding="utf-8")
+    monkeypatch.setenv("AGY_TELEGRAM_STATE", str(p))
+    assert tg.load_persisted_verbosity() is None
+    p.write_text(json.dumps({"tracking": {}}), encoding="utf-8")
+    assert tg.load_persisted_verbosity() is None
+
+
+def test_notifier_follows_live_persisted_verbosity(fake_key, capture_client):
+    """An unpinned notifier honors a MID-RUN /verbosity change (the bug)."""
+    _write_persisted_verbosity("quiet")
+    client = tg.TelegramClient()
+    notifier = tg.TelegramNotifier(
+        run_id="R", mode="master", verbosity="normal",
+        client=client, chat_ids=[FAKE_CHAT_ID],
+        dynamic_verbosity=tg.load_persisted_verbosity,
+    )
+    # quiet: a spin-up is suppressed ...
+    notifier(_spinup_event())
+    notifier.flush(timeout=5.0)
+    assert not [s for s in capture_client if s["method"] == "sendMessage"]
+
+    # ... operator raises it to debug mid-build; the SAME notifier now emits it.
+    _write_persisted_verbosity("debug")
+    notifier(_spinup_event())
+    notifier.flush(timeout=5.0)
+    sends = [s for s in capture_client if s["method"] == "sendMessage"]
+    assert sends and "spun up" in sends[-1]["params"]["text"]
+
+
+def test_notifier_pinned_ignores_persisted_verbosity(fake_key, capture_client):
+    """A pinned notifier (dynamic_verbosity=None) ignores the persisted level."""
+    _write_persisted_verbosity("debug")
+    client = tg.TelegramClient()
+    notifier = tg.TelegramNotifier(
+        run_id="R", mode="master", verbosity="quiet",
+        client=client, chat_ids=[FAKE_CHAT_ID],
+        dynamic_verbosity=None,
+    )
+    notifier(_spinup_event())
+    notifier.flush(timeout=5.0)
+    # Stays quiet despite persisted debug — the explicit pin wins.
+    assert not [s for s in capture_client if s["method"] == "sendMessage"]
+
+
+def test_effective_verbosity_falls_back_when_reader_raises(fake_key):
+    def boom():
+        raise RuntimeError("state file exploded")
+
+    n = tg.TelegramNotifier(
+        run_id="R", mode="m", verbosity="verbose",
+        client=tg.TelegramClient(), chat_ids=[FAKE_CHAT_ID],
+        dynamic_verbosity=boom,
+    )
+    # A failing reader must not raise and must fall back to the constructed level.
+    assert n._effective_verbosity() == "verbose"
+
+
+def test_build_notifier_unpinned_tracks_persisted(fake_key, users_file):
+    """No --telegram-verbosity flag -> notifier follows persisted /verbosity."""
+    from harness import dispatch
+    _write_persisted_verbosity("debug")
+    n = dispatch._build_telegram_notifier(
+        run_id="R", mode="m", enabled=None, verbosity=None)
+    assert n is not None
+    assert n._dynamic_verbosity is not None
+    assert n._effective_verbosity() == "debug"
+
+
+def test_build_notifier_explicit_flag_pins_level(fake_key, users_file):
+    """An explicit --telegram-verbosity flag PINS and ignores persisted state."""
+    from harness import dispatch
+    _write_persisted_verbosity("debug")
+    n = dispatch._build_telegram_notifier(
+        run_id="R", mode="m", enabled=None, verbosity="quiet")
+    assert n is not None
+    assert n._dynamic_verbosity is None
+    assert n._effective_verbosity() == "quiet"

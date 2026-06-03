@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
 
 from harness.telegram import (
+    DEFAULT_STATE_PATH,
     DEFAULT_VERBOSITY,
     VERBOSITY_ORDER,
     TelegramClient,
@@ -57,12 +58,11 @@ from harness.telegram import (
     load_whitelist,
     normalize_verbosity,
     render_event,
+    state_path,
     whitelist_user_ids,
 )
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_STATE_PATH = "/home/leah/tgbot/data/bot_state.json"
 
 # Command list registered with Telegram via setMyCommands so the client shows a
 # command menu/autocomplete (issue #63: "it's not registering my commands"). Kept
@@ -84,10 +84,6 @@ RUNS_DIR: Optional[Path] = None
 # --------------------------------------------------------------------------- #
 # State (persisted OUTSIDE the repo)
 # --------------------------------------------------------------------------- #
-def state_path(path: Optional[str] = None) -> str:
-    return path or os.environ.get("AGY_TELEGRAM_STATE") or DEFAULT_STATE_PATH
-
-
 def poller_lock_path(state_file: Optional[str] = None) -> str:
     """Path to the cross-process getUpdates singleton lock (next to the state file,
     OUTSIDE the repo). Telegram returns 409 Conflict if two processes long-poll

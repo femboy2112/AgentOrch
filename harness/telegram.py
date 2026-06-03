@@ -27,13 +27,17 @@ import queue
 import threading
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 DEFAULT_USERS_PATH = "/home/leah/tgbot/data/users.json"
+# Persisted bot state (the /verbosity default, /track cursors) lives OUTSIDE the
+# repo. This module owns the path so both the dispatch-side notifier and the bot
+# daemon read the SAME file (telegram_bot re-imports these).
+DEFAULT_STATE_PATH = "/home/leah/tgbot/data/bot_state.json"
 
 # Verbosity ladder (low -> high). Each level is a strict superset of the prior.
 VERBOSITY_ORDER = ["quiet", "normal", "verbose", "debug"]
@@ -531,10 +535,20 @@ class TelegramNotifier:
         client: TelegramClient,
         chat_ids: List[Any],
         max_queue: int = 1000,
+        dynamic_verbosity: Optional["Callable[[], Optional[str]]"] = None,
     ):
         self.run_id = run_id
         self.mode = mode
         self.verbosity = normalize_verbosity(verbosity)
+        # When the dispatch did NOT pin a level (no --telegram-verbosity flag),
+        # follow the operator's persisted /verbosity default LIVE: a callable that
+        # returns the current level (or None to mean "use the constructed
+        # default"), re-read on EVERY event in __call__. This is the fix for
+        # "setting /verbosity doesn't change anything" — the running dispatch's
+        # push notifications now track a mid-build /verbosity change instead of
+        # being frozen at construction. A pinned dispatch passes None and stays
+        # fixed. Never trusted blindly: _effective_verbosity normalizes + isolates.
+        self._dynamic_verbosity = dynamic_verbosity
         self.client = client
         self.chat_ids = list(chat_ids or [])
         self.sent = 0
@@ -556,6 +570,24 @@ class TelegramNotifier:
     @property
     def active(self) -> bool:
         return bool(self.client and self.client.configured and self.chat_ids)
+
+    def _effective_verbosity(self) -> str:
+        """The verbosity to gate on right now.
+
+        Consults the live persisted level (``_dynamic_verbosity``) when the
+        dispatch left the level unpinned, so a mid-build ``/verbosity`` change
+        is honored immediately; otherwise the constructed level. Best-effort —
+        a failing reader falls back to the constructed default, never raises.
+        """
+        reader = self._dynamic_verbosity
+        if reader is not None:
+            try:
+                live = reader()
+            except Exception:
+                live = None
+            if live:
+                return normalize_verbosity(live)
+        return self.verbosity
 
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -665,7 +697,7 @@ class TelegramNotifier:
         try:
             text = render_event(
                 event,
-                verbosity=self.verbosity,
+                verbosity=self._effective_verbosity(),
                 mode=self.mode,
                 run_id=self.run_id,
                 context=self._ctx,
@@ -736,3 +768,35 @@ def resolve_verbosity(explicit: Optional[str] = None) -> str:
     if explicit:
         return normalize_verbosity(explicit)
     return normalize_verbosity(os.environ.get("AGY_TELEGRAM_VERBOSITY"))
+
+
+def state_path(path: Optional[str] = None) -> str:
+    """Path to the bot's persisted state file (verbosity, /track cursors).
+
+    Lives OUTSIDE the repo (default ``/home/leah/tgbot/data/bot_state.json``;
+    override via ``AGY_TELEGRAM_STATE``). Owned here so the dispatch-side notifier
+    and the bot daemon agree on one file.
+    """
+    return path or os.environ.get("AGY_TELEGRAM_STATE") or DEFAULT_STATE_PATH
+
+
+def load_persisted_verbosity(path: Optional[str] = None) -> Optional[str]:
+    """The operator's ``/verbosity``-set default from the bot state file, or None.
+
+    Returns the normalized level when the state file records one, else ``None``
+    (file absent / unreadable / garbage / no ``verbosity`` key). Best-effort and
+    never raises — a missing file just means "no persisted preference", and the
+    caller falls back to its own default. This is what lets a ``/verbosity``
+    change take effect on a LIVE dispatch's push notifications: the notifier
+    re-reads this each event rather than freezing the level at construction.
+    """
+    try:
+        with open(state_path(path), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        v = data.get("verbosity")
+        if v:
+            return normalize_verbosity(v)
+    return None

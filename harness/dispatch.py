@@ -51,6 +51,7 @@ from harness.snapshot import diff_snapshots, take_snapshot
 from harness.telegram import (
     TelegramClient,
     TelegramNotifier,
+    load_persisted_verbosity,
     load_whitelist,
     resolve_verbosity,
     whitelist_chat_ids,
@@ -1246,12 +1247,22 @@ def _build_telegram_notifier(
                     " and ".join(missing),
                 )
             return None
+        # Only an explicit per-dispatch --telegram-verbosity flag PINS the level.
+        # Otherwise follow the operator's persisted /verbosity default LIVE, so a
+        # mid-build /verbosity change takes effect on this run's push
+        # notifications (the prior behavior froze it at construction → the
+        # /verbosity command appeared to do nothing). The constructed default
+        # still resolves env/normal for the very first events before any state
+        # file exists; the reader overrides it whenever a persisted level is set.
+        pinned = bool(verbosity)
+        dynamic = None if pinned else load_persisted_verbosity
         return TelegramNotifier(
             run_id=run_id,
             mode=mode,
             verbosity=resolve_verbosity(verbosity),
             client=client,
             chat_ids=chat_ids,
+            dynamic_verbosity=dynamic,
         )
     except Exception as exc:  # best-effort: telegram never affects dispatch
         logger.debug("telegram notifier setup failed: %s", exc)
