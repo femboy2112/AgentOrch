@@ -141,6 +141,9 @@ class MasterWorkflow:
         max_iterations: int = 5,
         verifier: Optional[QualityVerifier] = None,
         agent_class=AgyAgent,
+        critic_agent_class=None,
+        critic_model: Optional[str] = None,
+        critic_effort: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
         compaction_interval: int = 6,
         max_context_chars: int = 12000,
@@ -163,6 +166,20 @@ class MasterWorkflow:
         self.max_iterations = max_iterations
         self.verifier = verifier
         self.agent_class = agent_class
+        # #70: the in-loop adversarial reviewer (Phase B) must be a DISTINCT critic
+        # agent built from the CRITIC chain, not a reuse of the generator's
+        # (codex-led) class. Reusing agent_class made every master review
+        # same-family self-verification — the exact failure mode
+        # ``check_chains_cross_family`` documents, which until now only guarded the
+        # ``spec``/``adversarial`` paths and never ``master``. agy (the default
+        # critic lead) was parsed, logged in meta/banner, and then silently dropped.
+        # When the harness wires no distinct critic class, fall back to the generator
+        # class + generator model so a caller passing only ``agent_class`` keeps
+        # byte-identical behavior (back-compat for the many tests that do so).
+        self.critic_agent_class = critic_agent_class or agent_class
+        self.critic_is_distinct = critic_agent_class is not None
+        self.critic_model = critic_model or model
+        self.critic_effort = critic_effort or "high"
         # Two-tier compaction: when the running context is digested, the
         # most recent N step summaries are kept VERBATIM and only older
         # steps go through the compactor. Avoids the "I lost the file
@@ -889,13 +906,16 @@ class MasterWorkflow:
         # Phase B: Adversarial Review (Refinement) — resume main workflow session
         logger.info("Phase B: Adversarial Review Refinement")
         gen_kwargs = dict(model=self.model, effort=self.effort)
-        critic_kwargs = dict(model=self.model, effort="high")
+        critic_kwargs = dict(model=self.critic_model, effort=self.critic_effort)
         if workflow_session_id:
-            try:
-                gen_kwargs["session_id"] = workflow_session_id
+            gen_kwargs["session_id"] = workflow_session_id
+            # Only share the generator's provider-specific session id with the
+            # critic when the critic is the SAME agent (no distinct critic chain
+            # wired). A cross-provider critic (#70) cannot resume a codex session,
+            # so handing it the generator's session id is meaningless at best and a
+            # crash at worst — let the distinct critic open its own session.
+            if not self.critic_is_distinct:
                 critic_kwargs["session_id"] = workflow_session_id
-            except Exception:
-                pass
         adv_generator = self.agent_class(prompt=step_prompt, **gen_kwargs)
 
         if best_tot_output:
@@ -909,7 +929,7 @@ class MasterWorkflow:
             # No exploration draft (branches<=1): implement the step directly.
             adv_prompt = step_prompt
 
-        adv_critic = self.agent_class(prompt="", **critic_kwargs)
+        adv_critic = self.critic_agent_class(prompt="", **critic_kwargs)
 
         adv = AdversarialReview(
             generator_instance=adv_generator,

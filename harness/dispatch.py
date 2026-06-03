@@ -941,9 +941,24 @@ async def _run_workflow(
             watchdog_scale=watchdog_scale,
             post_construct_hook=post_construct_hook,
         )
+        # #70: build a DISTINCT critic agent class from the critic chain so the
+        # in-loop Phase-B adversarial reviewer is cross-family (agy-led by default)
+        # rather than codex critiquing codex. Same builder the generator uses, but
+        # seeded from critic_chain + critic_overrides so --critic / CRITIC_CHAIN and
+        # --critic-effort/--codex-model actually take effect in master mode.
+        critic_agent_class, critic_model, critic_effort = roles.build_master_agent_class(
+            critic_chain, fallback=fallback, cycles=cycles,
+            codex_config=codex_config,
+            overrides=critic_overrides,
+            watchdog_scale=watchdog_scale,
+            post_construct_hook=post_construct_hook,
+        )
         wf = MasterWorkflow(
             model=model,
             effort=effort,
+            critic_agent_class=critic_agent_class,
+            critic_model=critic_model,
+            critic_effort=critic_effort,
             branches=branches,
             max_iterations=max_iterations,
             verifier=verifier,
@@ -1045,9 +1060,20 @@ async def _run_workflow(
             watchdog_scale=watchdog_scale,
             post_construct_hook=post_construct_hook,
         )
+        # #70: distinct critic agent for pat's escalated master (cross-family).
+        critic_agent_class, critic_model, critic_effort = roles.build_master_agent_class(
+            critic_chain, fallback=fallback, cycles=cycles,
+            codex_config=codex_config,
+            overrides=critic_overrides,
+            watchdog_scale=watchdog_scale,
+            post_construct_hook=post_construct_hook,
+        )
         master_wf = MasterWorkflow(
             model=model,
             effort=effort,
+            critic_agent_class=critic_agent_class,
+            critic_model=critic_model,
+            critic_effort=critic_effort,
             branches=branches,
             max_iterations=max_iterations,
             verifier=verifier,
@@ -1498,9 +1524,11 @@ async def dispatch_async(
     )
 
     # Cross-family verifier guard: warn (don't block) when the critic chain
-    # leads with the same provider family as the generator. Only meaningful
-    # for adversarial mode — other modes don't use a separate critic chain.
-    if mode == "adversarial":
+    # leads with the same provider family as the generator. Meaningful for every
+    # mode that runs a separate critic chain: adversarial, and — since #70 wired
+    # critic_chain into the in-loop reviewer — master/pat as well. (pat escalates
+    # to master, which now builds a distinct critic agent from critic_chain.)
+    if mode in ("adversarial", "master", "pat"):
         family_warning = roles.check_chains_cross_family(generator_chain, critic_chain)
         if family_warning:
             logger.warning(family_warning)
