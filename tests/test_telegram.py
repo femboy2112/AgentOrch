@@ -159,17 +159,23 @@ def test_gating_quiet_only_lifecycle():
 
 
 def test_gating_normal_adds_steps_and_failures():
-    # quiet 1 + step started + step completed(verified) + verifier_timeout = 4
-    assert _rendered_count("normal") == 4
+    # OPERATOR-REQUESTED RE-TIER: spin-ups + adversarial rounds + plan/reconcile/
+    # fallback now surface at `normal` (the operator was "not seeing adversarial
+    # rounds, just step 1 / step 1 finish"). So in this stream `normal` now
+    # renders: dispatch_started(1) + step started + step completed(verified) +
+    # verifier_timeout + adversarial iteration_completed + plan transition = 6.
+    assert _rendered_count("normal") == 6
 
 
-def test_gating_verbose_adds_iteration_and_plan():
-    # normal 4 + adversarial iteration + plan transition = 6
+def test_gating_verbose_is_superset_of_normal():
+    # verbose adds ToT branch activity + finer per-iteration detail; this stream
+    # carries none of those, so the count matches `normal` (6). (Adversarial +
+    # plan were promoted to `normal` by the operator-requested re-tier above.)
     assert _rendered_count("verbose") == 6
 
 
 def test_gating_debug_adds_heartbeat_and_usage():
-    # verbose 6 + heartbeat + usage = 8 (stderr never forwarded)
+    # normal/verbose 6 + heartbeat + usage = 8 (stderr never forwarded)
     assert _rendered_count("debug") == 8
     # stderr is never rendered at any level
     stderr_ev = {"kind": "stderr", "data": {}, "text": "x"}

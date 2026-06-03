@@ -281,6 +281,51 @@ def _orchestration(event: dict) -> Optional[dict]:
     return orch if isinstance(orch, dict) else None
 
 
+# Phase letters for a compact build-context suffix ("Phase B" etc.). Maps the
+# orchestration ``phase`` string to a short human label so a spin-up/round line
+# can say which kind of work it belongs to without a long word.
+_PHASE_LABEL = {
+    # "step" is intentionally absent: the step_pos chip ("Step 2/5") already
+    # conveys it, so a "Step phase" label would read redundantly.
+    "adversarial": "Adversarial",
+    "fallback": "Fallback",
+    "plan": "Plan",
+    "reconcile": "Reconcile",
+    "tot": "ToT",
+}
+
+
+def _chip(value: Any) -> str:
+    """Normalize a model/effort chip value; '' when absent/'n/a'."""
+    s = str(value or "").strip()
+    if not s or s.lower() in ("n/a", "na", "none"):
+        return ""
+    return s
+
+
+def _build_context_suffix(context: Optional[dict]) -> str:
+    """Format a build-context dict into a compact, escaped HTML suffix.
+
+    ``context`` carries ``{step_pos, step_title, phase}`` (any subset). Returns
+    a leading-separator suffix like ``"  · <i>Step 2/5</i>"`` or
+    ``"  · <i>Step 2/5 · Adversarial</i>"`` — or ``""`` when there's nothing to
+    say. All dynamic text is escaped via :func:`_e` (parse_mode is HTML).
+    """
+    if not isinstance(context, dict):
+        return ""
+    bits: List[str] = []
+    pos = context.get("step_pos")
+    if pos:
+        bits.append(f"Step {_e(pos)}")
+    phase = context.get("phase")
+    plabel = _PHASE_LABEL.get(str(phase)) if phase else None
+    if plabel:
+        bits.append(_e(plabel))
+    if not bits:
+        return ""
+    return f" · <i>{' · '.join(bits)}</i>"
+
+
 # --------------------------------------------------------------------------- #
 # Pure gating + rendering
 # --------------------------------------------------------------------------- #
@@ -290,14 +335,26 @@ def render_event(
     verbosity: str = DEFAULT_VERBOSITY,
     mode: str = "",
     run_id: str = "",
+    context: Optional[dict] = None,
 ) -> Optional[str]:
     """Return an HTML message for ``event`` at ``verbosity``, else None.
 
-    Gating (each level is a superset of the prior):
-      quiet   : dispatch start + dispatch finish only.
-      normal  : + step started/completed, + failures/stalls.
-      verbose : + adversarial iteration_completed, fallback reroutes,
-                reconcile/plan transitions.
+    Pure function (no I/O, no global state). ``context`` is an OPTIONAL
+    build-context dict ``{step_pos, step_title, phase}`` used only to annotate
+    worker spin-up and adversarial-round lines with where they sit in the build
+    ("· Step 2/5 · Adversarial"). The caller (:class:`TelegramNotifier`) owns
+    that state; render stays stateless.
+
+    Gating (each level is a superset of the prior). This tiering changed by
+    operator request: spin-ups + adversarial rounds now surface at ``normal``
+    so the operator sees models come up and critic verdicts, not just bare
+    steps.
+      quiet   : dispatch start + end-of-run summary card only.
+      normal  : + step started/completed, + failures/stalls,
+                + WORKER SPIN-UPS (every agent_started),
+                + ADVERSARIAL ROUNDS (draft / verdict / generator rotation),
+                + plan / reconcile / fallback transitions.
+      verbose : + ToT branch activity + finer per-iteration detail.
       debug   : + heartbeats + per-call token usage.
     """
     if not isinstance(event, dict):
@@ -307,6 +364,7 @@ def render_event(
     data = event.get("data") if isinstance(event.get("data"), dict) else {}
     rid = _e(run_id or event.get("run_id") or "")
     safe_mode = _e(mode)
+    ctx_suffix = _build_context_suffix(context)
 
     # ---- quiet (level 0): dispatch lifecycle only ------------------------- #
     if kind == "lifecycle":
@@ -320,15 +378,44 @@ def render_event(
             # let the summary card be the single end-of-run notification.
             return None
 
-    # ---- normal (level 1): steps + failures/stalls ------------------------ #
+        # ---- normal (level 1): WORKER SPIN-UPS ---------------------------- #
+        # Every worker CLI call emits agent_started at the start of run_async;
+        # worker/model/effort are stamped on the event TOP LEVEL by the bus.
+        # This is the "a model spun up" signal the operator asked to see.
+        if level >= 1 and ev == "agent_started":
+            # agent_started is emitted at TWO layers: the canonical once-per-CLI-call
+            # spin-up (agy_orchestrator/core/agent.py, detail={}) and per-internal-turn
+            # events from the dashboard stream adapters (codex detail="turn.started",
+            # claude detail="message_start"). Render ONLY the canonical spin-up — a
+            # non-empty string detail is per-turn adapter noise that would emit many
+            # duplicate "spun up" lines for a single multi-turn call (the exact spam
+            # the one-message-per-spin-up intent must avoid).
+            detail = data.get("detail")
+            if isinstance(detail, str) and detail.strip():
+                return None
+            worker = _e(event.get("worker") or "worker")
+            model = _chip(event.get("model"))
+            effort = _chip(event.get("effort"))
+            chips = " · ".join(c for c in (model, effort) if c)
+            chip_str = f" · <code>{_e(chips)}</code>" if chips else ""
+            return f"🤖 <b>{worker}</b> spun up{chip_str}{ctx_suffix}"
+
+    # ---- orchestration transitions (steps, rounds, plan, …) --------------- #
     orch = _orchestration(event)
     if orch is not None:
         phase = orch.get("phase")
         action = orch.get("action")
         outcome = orch.get("outcome")
 
-        # Failures/stalls — normal and above, regardless of phase.
-        if level >= 1 and str(outcome) in _FAILURE_OUTCOMES:
+        # Failures/stalls — normal and above. Routed to the banner EXCEPT inside
+        # an adversarial round, where the verdict line below keys on the same
+        # outcomes (so an infra OOM mid-round reads as ⚠️ Verdict, with the
+        # round position, rather than a context-free banner).
+        if (
+            level >= 1
+            and str(outcome) in _FAILURE_OUTCOMES
+            and phase != "adversarial"
+        ):
             title = _e(orch.get("step_title") or phase or "step")
             label = _OUTCOME_LABEL.get(str(outcome), str(outcome).replace("_", " "))
             return f"<b>{_e(label)}</b> · <i>{title}</i>{_run_tag(rid)}"
@@ -353,21 +440,56 @@ def render_event(
                     ok = "▪"
                 return f"{ok} <b>Step {pos} done</b> · <i>{title}</i>{_run_tag(rid)}"
 
-        # ---- verbose (level 2): iteration / fallback / plan / reconcile --- #
-        if level >= 2:
-            if phase == "adversarial" and action in ("iteration_completed", "completed"):
-                it = orch.get("iteration")
-                itn = orch.get("iteration_total")
-                pos = f"{it}/{itn}" if itn else (str(it) if it is not None else "")
-                verdict = orch.get("verified")
-                tag = "approved" if (orch.get("approved") or verdict) else "revised"
-                extra = f" · iter {pos}" if pos else ""
-                return f"🔁 <b>Adversarial {_e(tag)}</b>{_e(extra)}{_run_tag(rid)}"
+        # ---- ADVERSARIAL ROUNDS — normal and above (operator request) ----- #
+        # The operator was "not seeing adversarial rounds"; surface the draft
+        # (generator spinning up for a round), the critic verdict, and any
+        # generator rotation at the DEFAULT level.
+        if level >= 1 and phase == "adversarial":
+            it = orch.get("iteration")
+            itn = orch.get("iteration_total")
+            pos = f"{it}/{itn}" if itn else (str(it) if it is not None else "")
+            it_str = f" · iter {_e(pos)}" if pos else ""
+            if action == "generator_rotation":
+                to_worker = _e(orch.get("to_worker") or "next worker")
+                return f"↪️ <b>Rotation</b> → <b>{to_worker}</b>{it_str}{ctx_suffix}"
+            if action == "iteration_started":
+                # Generator drafting this round (carries its model+effort).
+                model = _chip(orch.get("model"))
+                mchip = f" · <code>{_e(model)}</code>" if model else ""
+                return f"✍️ <b>Draft</b>{it_str}{mchip}{ctx_suffix}"
+            if action in ("iteration_completed", "completed"):
+                # Critic verdict, keyed on outcome so an infra OOM never reads
+                # as a benign revision.
+                if str(outcome) in _INFRA_OUTCOMES:
+                    glyph, tag = "⚠️", _OUTCOME_LABEL.get(
+                        str(outcome), "verifier infra"
+                    )
+                elif str(outcome) == "stalled":
+                    glyph, tag = "⏹", "stalled"
+                elif orch.get("approved") or orch.get("verified") or outcome in (
+                    "verified", "approved"
+                ):
+                    glyph, tag = "✅", "approved"
+                elif str(outcome) == "continue":
+                    glyph, tag = "♻️", "revised"
+                else:
+                    glyph, tag = "♻️", "revised"
+                return f"{glyph} <b>Verdict</b> · {_e(tag)}{it_str}{ctx_suffix}"
+
+        # ---- plan / reconcile / fallback — normal and above --------------- #
+        if level >= 1:
             if phase == "fallback":
                 return f"↪️ <b>Reroute</b> · <i>{_e(orch.get('action') or 'fallback')}</i>{_run_tag(rid)}"
             if phase in ("plan", "reconcile"):
                 act = _e(action or phase)
                 return f"🗂 <b>{_e(str(phase).title())}</b> · <i>{act}</i>{_run_tag(rid)}"
+
+        # ---- verbose (level 2): ToT branch activity ----------------------- #
+        if level >= 2 and phase == "tot":
+            act = _e(action or "branch")
+            branch = _e(event.get("branch") or orch.get("branch") or "")
+            btag = f" · <code>{branch}</code>" if branch else ""
+            return f"🌿 <b>ToT</b> · <i>{act}</i>{btag}{_run_tag(rid)}"
 
     # ---- debug (level 3): heartbeats + per-call usage --------------------- #
     if level >= 3:
@@ -416,6 +538,12 @@ class TelegramNotifier:
         self.client = client
         self.chat_ids = list(chat_ids or [])
         self.sent = 0
+        # Build-context tracked across events so a worker spin-up / adversarial
+        # round can be annotated with the step + phase it belongs to. Updated
+        # from orchestration events in __call__ BEFORE a non-orchestration event
+        # is rendered, so a spin-up shows the step that just started. render_event
+        # stays pure — this state lives only here.
+        self._ctx: Dict[str, Any] = {"step_pos": "", "step_title": "", "phase": ""}
         # Delivery runs on a single background daemon thread so a slow/hung
         # Telegram endpoint never blocks the event-loop thread (mirrors
         # harness.run_monitor.Notifier). Rendered messages are pushed onto a
@@ -503,16 +631,44 @@ class TelegramNotifier:
         except Exception:
             pass
 
+    def _update_context(self, event: dict) -> None:
+        """Track current step + phase from orchestration events. Never raises."""
+        try:
+            orch = _orchestration(event)
+            if not orch:
+                return
+            phase = orch.get("phase")
+            if phase:
+                self._ctx["phase"] = phase
+            # Only a real "step" transition carries step position/title; keep the
+            # last known step so an interleaved spin-up/round shows its step.
+            if phase == "step":
+                idx = orch.get("step_index")
+                total = orch.get("step_total")
+                if idx is not None or total is not None:
+                    self._ctx["step_pos"] = (
+                        f"{idx}/{total}" if total else (str(idx) if idx is not None else "")
+                    )
+                title = orch.get("step_title")
+                if title is not None:
+                    self._ctx["step_title"] = str(title)
+        except Exception as exc:
+            logger.debug("telegram context update failed: %s", exc)
+
     def __call__(self, event: dict) -> None:
         """EventBus sink entrypoint — never raises."""
         if not self.active:
             return
+        # Update build-context FIRST so a spin-up/round event that arrives right
+        # after a step transition is annotated with that step.
+        self._update_context(event)
         try:
             text = render_event(
                 event,
                 verbosity=self.verbosity,
                 mode=self.mode,
                 run_id=self.run_id,
+                context=self._ctx,
             )
         except Exception as exc:
             logger.debug("telegram render failed: %s", exc)
