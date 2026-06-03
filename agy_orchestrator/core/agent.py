@@ -872,7 +872,18 @@ class AgentInstance(ABC):
         watchdog_armed = self.max_output_bytes > 0 or self.stall_seconds > 0
         stream_mode = bool(os.environ.get("AGY_STREAM")) or watchdog_armed or self.event_callback is not None
 
-        self._emit_event({"kind": "lifecycle", "data": {"event": "agent_started", "detail": {}}})
+        # Stamp the agent's ROLE (set by the orchestrator at construction, e.g.
+        # "draft"/"critic"/"summary"/"compact"/"plan") into the spin-up event so a
+        # consumer can tell distinct codex jobs apart — a per-step summarizer and
+        # the next step's generator are both codex and otherwise render as two
+        # identical, confusing "spun up" lines. Stays a DICT detail (un-roled
+        # agents keep the byte-identical empty {} → canonical; per-turn adapter
+        # noise stays a non-empty STRING and is still gated out downstream).
+        _role = getattr(self, "role", None)
+        self._emit_event({
+            "kind": "lifecycle",
+            "data": {"event": "agent_started", "detail": {"role": _role} if _role else {}},
+        })
         finished: Optional[bool] = None
         try:
             for attempt in range(1, self.max_retries + 1):

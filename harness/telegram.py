@@ -299,6 +299,22 @@ _PHASE_LABEL = {
 }
 
 
+# What a worker spin-up is DOING, from the agent's role (stamped on agent_started
+# by the orchestrator). Lets the operator tell apart the several distinct codex
+# calls a master step makes — a per-step summarizer + the next step's generator
+# are both codex and otherwise render as two identical, confusing "spun up" lines.
+_ROLE_LABEL = {
+    "draft": "drafting",
+    "critic": "reviewing",
+    "summary": "summarizing",
+    "compact": "compacting context",
+    "plan": "planning",
+    "tot": "exploring",
+    "tot-judge": "scoring branches",
+    "reconcile": "reconciling",
+}
+
+
 def _chip(value: Any) -> str:
     """Normalize a model/effort chip value; '' when absent/'n/a'."""
     s = str(value or "").strip()
@@ -397,12 +413,19 @@ def render_event(
             detail = data.get("detail")
             if isinstance(detail, str) and detail.strip():
                 return None
+            # The orchestrator stamps the agent's role in the (dict) detail; turn
+            # it into a human verb so two same-provider calls (e.g. a step's
+            # summarizer vs the next step's generator) are distinguishable rather
+            # than two identical "spun up" lines.
+            role = detail.get("role") if isinstance(detail, dict) else None
+            role_label = _ROLE_LABEL.get(str(role)) if role else None
+            role_str = f" · {_e(role_label)}" if role_label else ""
             worker = _e(event.get("worker") or "worker")
             model = _chip(event.get("model"))
             effort = _chip(event.get("effort"))
             chips = " · ".join(c for c in (model, effort) if c)
             chip_str = f" · <code>{_e(chips)}</code>" if chips else ""
-            return f"🤖 <b>{worker}</b> spun up{chip_str}{ctx_suffix}"
+            return f"🤖 <b>{worker}</b> spun up{role_str}{chip_str}{ctx_suffix}"
 
     # ---- orchestration transitions (steps, rounds, plan, …) --------------- #
     orch = _orchestration(event)

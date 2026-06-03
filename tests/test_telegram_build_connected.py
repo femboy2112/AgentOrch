@@ -261,3 +261,66 @@ def test_canonical_spinup_still_renders_with_empty_detail():
         ev["data"] = data
         msg = tg.render_event(ev, verbosity="normal", mode="master", run_id="R")
         assert msg is not None and "spun up" in msg
+
+
+# --------------------------------------------------------------------------- #
+# Role-labeled spin-ups: distinct codex jobs (draft vs summary vs critic vs
+# compact vs plan) must render with their role so two same-provider calls
+# around a verdict/step-done aren't two identical, confusing "spun up" lines.
+# --------------------------------------------------------------------------- #
+def _agent_started_role(role, worker="codex", model="standard", effort="high"):
+    return {
+        "kind": "lifecycle", "run_id": "R",
+        "worker": worker, "model": model, "effort": effort,
+        "data": {"event": "agent_started", "detail": {"role": role} if role else {}},
+    }
+
+
+@pytest.mark.parametrize("role,verb", [
+    ("draft", "drafting"),
+    ("critic", "reviewing"),
+    ("summary", "summarizing"),
+    ("compact", "compacting context"),
+    ("plan", "planning"),
+    ("tot", "exploring"),
+    ("tot-judge", "scoring branches"),
+])
+def test_spinup_carries_role_verb(role, verb):
+    msg = tg.render_event(
+        _agent_started_role(role), verbosity="normal", mode="master", run_id="R")
+    assert msg is not None
+    assert verb in msg
+    assert "spun up" in msg
+
+
+def test_summary_and_draft_spinups_are_distinguishable():
+    # The exact confusion the operator reported: a step summarizer then the next
+    # step's generator, both codex. They must NOT render identically.
+    summ = tg.render_event(
+        _agent_started_role("summary"), verbosity="normal", mode="master", run_id="R")
+    draft = tg.render_event(
+        _agent_started_role("draft"), verbosity="normal", mode="master", run_id="R")
+    assert summ != draft
+    assert "summarizing" in summ and "drafting" in draft
+
+
+def test_unknown_or_missing_role_is_bare_spinup():
+    # No role (un-roled agent) -> byte-compatible bare spin-up, no role suffix.
+    bare = tg.render_event(
+        _agent_started_role(None), verbosity="normal", mode="master", run_id="R")
+    assert bare is not None and "spun up" in bare
+    for verb in ("drafting", "summarizing", "reviewing"):
+        assert verb not in bare
+    # An unrecognized role string is ignored (no crash, no junk suffix).
+    weird = tg.render_event(
+        _agent_started_role("wat-is-this"), verbosity="normal", mode="master", run_id="R")
+    assert weird is not None and "spun up" in weird
+
+
+def test_per_turn_string_detail_still_gated_with_role_change():
+    # The spam-gate must still drop per-turn adapter events (string detail),
+    # which now coexist with the dict-detail role path.
+    for d in ("turn.started", "message_start"):
+        ev = _agent_started_role("draft")
+        ev["data"] = {"event": "agent_started", "detail": d}
+        assert tg.render_event(ev, verbosity="normal", mode="master", run_id="R") is None

@@ -412,6 +412,7 @@ class MasterWorkflow:
             ),
             model=self.model,
             effort="low",
+            role="compact",
         )
         try:
             digest = await compactor.run_async()
@@ -654,7 +655,7 @@ class MasterWorkflow:
             f"Example: [\"Step 1: Setup project structure and core utilities...\", \"Step 2: Implement UI component X...\"]\n\n"
             f"Project Request:\n{initial_prompt}"
         )
-        planner = self.agent_class(prompt=planner_prompt, model=self.model, effort="high")
+        planner = self.agent_class(prompt=planner_prompt, model=self.model, effort="high", role="plan")
         plan_output = await planner.run_async()
 
         # Capture session established by planner for reuse across all subsequent calls
@@ -883,14 +884,14 @@ class MasterWorkflow:
             # ToT branches run fresh sessions — concurrent --fork-session on the same parent
             # causes race conditions. They're throwaway explorers anyway.
             tot_branches = [
-                self.agent_class(prompt=step_prompt, model=self.model, effort=self.effort)
+                self.agent_class(prompt=step_prompt, model=self.model, effort=self.effort, role="tot")
                 for _ in range(self.branches)
             ]
             # The judge clones this evaluator per branch and scores them in
             # parallel with independent (sessionless) instances, so do NOT bind
             # the workflow session here — resuming it would both contaminate
             # per-branch scoring and pollute the main thread.
-            tot_evaluator = self.agent_class(prompt="", model=self.model, effort="high")
+            tot_evaluator = self.agent_class(prompt="", model=self.model, effort="high", role="tot-judge")
             tot = TreeOfThought(
                 tot_branches,
                 tot_evaluator,
@@ -905,8 +906,8 @@ class MasterWorkflow:
 
         # Phase B: Adversarial Review (Refinement) — resume main workflow session
         logger.info("Phase B: Adversarial Review Refinement")
-        gen_kwargs = dict(model=self.model, effort=self.effort)
-        critic_kwargs = dict(model=self.critic_model, effort=self.critic_effort)
+        gen_kwargs = dict(model=self.model, effort=self.effort, role="draft")
+        critic_kwargs = dict(model=self.critic_model, effort=self.critic_effort, role="critic")
         if workflow_session_id:
             gen_kwargs["session_id"] = workflow_session_id
             # Only share the generator's provider-specific session id with the
@@ -981,7 +982,7 @@ class MasterWorkflow:
         )
         # Summarize the step output to keep project_context compact.
         # Passing full HTML/code outputs into every subsequent prompt balloons to 50KB+.
-        summarize_kwargs = dict(model=self.model, effort="low")
+        summarize_kwargs = dict(model=self.model, effort="low", role="summary")
         if workflow_session_id:
             try:
                 summarize_kwargs["session_id"] = workflow_session_id
