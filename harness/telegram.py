@@ -380,8 +380,223 @@ def _build_context_suffix(context: Optional[dict]) -> str:
     return f" · <i>{' · '.join(bits)}</i>"
 
 
+
+class BuildState:
+    def __init__(self, run_id: str, mode: str):
+        self.run_id = run_id
+        self.mode = mode
+        self.run_start_ts = None
+        self.finished = False
+        
+        self.step_total = None
+        self.is_graph = False
+        
+        self.cur_step_index = None
+        self.cur_step_title = ""
+        self.cur_phase = ""
+        self.cur_step_start_ts = None
+        self.cur_iter = None
+        self.cur_iter_total = None
+        
+        self.active_role = ""
+        
+        self.completed_steps = set()
+        self.step_durations = []
+        self._step_started_at = {}
+        
+        self.n_steps_done = 0
+        self.n_verified = 0
+        self.n_approved = 0
+        
+        self.last_event_ts = None
+        self.since_progress_s = 0.0
+        self.pinned_message_id = None
+        self.last_render_ts = 0.0
+        self.last_render_signature = None
+        self.last_event_line = ""
+
+    @property
+    def elapsed(self):
+        if self.run_start_ts is None:
+            return 0.0
+        return max(0.0, (self.last_event_ts or self.run_start_ts) - self.run_start_ts)
+
+    def update(self, event: dict):
+        ts = event.get("ts", 0.0)
+        if ts:
+            self.last_event_ts = ts
+
+        data = event.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        kind = event.get("kind")
+
+        if kind == "heartbeat":
+            self.since_progress_s = data.get("since_progress_s", 0)
+            return
+
+        if kind == "lifecycle":
+            ev = data.get("event")
+            if ev == "dispatch_started":
+                self.run_start_ts = ts
+            elif ev == "agent_started":
+                detail = data.get("detail", {})
+                if isinstance(detail, dict) and "role" in detail:
+                    # Do not move step geometry on compact spin-ups
+                    self.active_role = detail.get("role", "")
+            # Removed the return here to allow orchestration transitions to be processed
+
+        orch = data.get("orchestration")
+        if orch and isinstance(orch, dict):
+            phase = orch.get("phase")
+            action = orch.get("action")
+            
+            if phase:
+                self.cur_phase = phase
+
+            if phase == "plan" and action == "completed":
+                self.step_total = orch.get("step_total")
+                if orch.get("is_graph"):
+                    self.is_graph = True
+
+            elif phase == "step":
+                idx = orch.get("step_index")
+                if action == "started":
+                    if self.step_total is None:
+                        self.step_total = orch.get("step_total")
+                    if self.cur_step_index and idx and idx != self.cur_step_index + 1:
+                        self.is_graph = True
+                    if idx and idx > 1 and not self.completed_steps:
+                        for i in range(1, idx):
+                            self.completed_steps.add(i)
+                        self.n_steps_done = len(self.completed_steps)
+                    
+                    self.cur_step_index = idx
+                    self.cur_step_title = orch.get("step_title", "")
+                    self.cur_step_start_ts = ts
+                    if idx:
+                        self._step_started_at[idx] = ts
+                    self.cur_iter = None
+                    self.cur_iter_total = None
+                    
+                elif action == "completed":
+                    if idx:
+                        self.completed_steps.add(idx)
+                        self.n_steps_done = len(self.completed_steps)
+                        if idx in self._step_started_at:
+                            self.step_durations.append(max(0.0, float(ts) - float(self._step_started_at[idx])))
+                    outcome = orch.get("outcome")
+                    if outcome == "verified":
+                        self.n_verified += 1
+                    elif outcome == "approved":
+                        self.n_approved += 1
+
+            elif phase == "adversarial":
+                if action == "iteration_started":
+                    self.cur_iter = orch.get("iteration")
+                    self.cur_iter_total = orch.get("iteration_total")
+
+def _card_signature(state: BuildState) -> tuple:
+    el = round(state.elapsed / 5.0) * 5
+    return (
+        state.cur_step_index,
+        state.n_steps_done,
+        state.cur_phase,
+        state.cur_iter,
+        state.active_role,
+        el,
+        state.last_event_line
+    )
+
+def render_status_card(state: BuildState) -> str:
+    rid_short = state.run_id[-6:] if len(state.run_id) > 6 else state.run_id
+    
+    if state.step_total and state.step_total > 0:
+        pct = min(10, round(state.n_steps_done / state.step_total * 10))
+        bar = "█" * pct + "░" * (10 - pct)
+        step_ref = f"Step {state.cur_step_index or '?'}/{state.step_total}"
+    else:
+        idx = (state.cur_step_index or 0) % 10
+        cells = ["░"] * 10
+        cells[idx] = "█"
+        bar = "".join(cells)
+        if state.cur_step_index:
+            step_ref = f"Step {state.cur_step_index} (of ?)"
+        else:
+            step_ref = "Planning…"
+
+    title = state.cur_step_title or "Initializing"
+    
+    phase_glyph = "⚙️"
+    phase_label = str(state.cur_phase).title() if state.cur_phase else "Orchestrating"
+    iter_str = ""
+    if state.cur_iter:
+        iter_str = f" · <b>iter {state.cur_iter}/{state.cur_iter_total or '?'}</b>"
+    
+    if state.last_event_ts:
+        spinner_glyphs = ["◐", "◓", "◑", "◒"]
+        spinner = spinner_glyphs[int(state.last_event_ts) % 4]
+        if not iter_str:
+            phase_glyph = spinner
+
+    elapsed_str = _fmt_duration(state.elapsed)
+
+    if state.n_steps_done >= 1 and state.step_total and state.step_total > state.n_steps_done:
+        durs = state.step_durations
+        rem = state.step_total - state.n_steps_done
+        if state.is_graph:
+            rate = state.elapsed / max(1, state.n_steps_done)
+            eta_sec = rate * rem
+            in_flight = 0
+            if state.cur_step_start_ts and state.last_event_ts:
+                in_flight = min(state.last_event_ts - state.cur_step_start_ts, rate)
+            eta_sec = max(0.0, float(eta_sec - in_flight))
+            eta_str = f"~{_fmt_duration(eta_sec)} left (parallel)"
+        else:
+            if len(durs) >= 3:
+                s_durs = sorted(durs)
+                d_hat = s_durs[len(durs)//2]
+            elif len(durs) > 0:
+                d_hat = sum(durs) / len(durs)
+            else:
+                d_hat = 0
+            in_flight = 0
+            if state.cur_step_start_ts and state.last_event_ts:
+                in_flight = min(state.last_event_ts - state.cur_step_start_ts, d_hat)
+            eta_sec = max(0.0, float((d_hat * rem) - in_flight))
+            if len(durs) >= 3:
+                low = eta_sec * 0.8
+                high = eta_sec * 1.2
+            else:
+                low = eta_sec * 0.5
+                high = eta_sec * 2.0
+            eta_str = f"~{_fmt_duration(low)}–{_fmt_duration(high)} (≈{_fmt_duration(eta_sec)}) left"
+    else:
+        if state.step_total and state.n_steps_done >= state.step_total:
+            eta_str = "finishing…"
+        else:
+            eta_str = "estimating…"
+
+    stall_flag = ""
+    if state.since_progress_s > 60:
+        stall_flag = f" ⚠️ no progress {_fmt_duration(state.since_progress_s)}"
+
+    last_block = f"\n└ last: {_e(state.last_event_line)}" if state.last_event_line else ""
+
+    worker_state = _e(state.active_role or "running")
+
+    return (
+        f"⚡ <b>Building</b> · <code>{rid_short}</code>\n"
+        f"<code>{bar}</code>  <b>{step_ref}</b>\n"
+        f"<i>{_e(title)}</i>\n\n"
+        f"{phase_glyph} {phase_label} · {worker_state}{iter_str}\n"
+        f"⏱ {elapsed_str} elapsed · {eta_str}{stall_flag}"
+        f"{last_block}"
+    )
+
 # --------------------------------------------------------------------------- #
 # Pure gating + rendering
+
 # --------------------------------------------------------------------------- #
 def render_event(
     event: dict,
@@ -635,9 +850,11 @@ class TelegramNotifier:
         # harness.run_monitor.Notifier). Rendered messages are pushed onto a
         # bounded queue and sent in order; a full queue drops oldest rather than
         # block (best-effort, never back-pressures _drain).
-        self._queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=int(max_queue))
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=int(max_queue))
         self._worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
+        self._state = BuildState(run_id, mode)
+        self._pinned_card_sent = False
 
     @property
     def active(self) -> bool:
@@ -677,11 +894,34 @@ class TelegramNotifier:
 
     def _drain_queue(self) -> None:
         while True:
-            text = self._queue.get()
+            item = self._queue.get()
             try:
-                if text is None:  # poison pill -> stop the worker
+                if item is None:  # poison pill -> stop the worker
                     return
-                self._deliver(text)
+                if isinstance(item, str):
+                    self._deliver(item)
+                elif isinstance(item, tuple):
+                    action, text = item
+                    if action == "send_pinned":
+                        for chat_id in self.chat_ids:
+                            try:
+                                res = self.client.send_message(chat_id, text)
+                                if res and res.get("result"):
+                                    mid = res["result"].get("message_id")
+                                    if mid:
+                                        self._state.pinned_message_id = mid
+                                        self.client.pin_chat_message(chat_id, mid)
+                                self.sent += 1
+                            except Exception as exc:
+                                logger.debug("telegram send_pinned failed: %s", exc)
+                    elif action == "edit_pinned":
+                        mid = self._state.pinned_message_id
+                        if mid:
+                            for chat_id in self.chat_ids:
+                                try:
+                                    self.client.edit_message_text(chat_id, mid, text)
+                                except Exception as exc:
+                                    logger.debug("telegram edit_pinned failed: %s", exc)
             except Exception as exc:  # never let the worker thread die noisily
                 logger.debug("telegram worker error: %s", exc)
             finally:
@@ -696,25 +936,27 @@ class TelegramNotifier:
             except Exception as exc:  # belt-and-suspenders; client already swallows
                 logger.debug("telegram broadcast failed: %s", exc)
 
-    def _broadcast(self, text: str) -> None:
-        """Enqueue a rendered message for off-loop delivery. Never blocks."""
-        if not text:
+    def _enqueue_action(self, action: Any) -> None:
+        if not action:
             return
         self._ensure_worker()
         try:
-            self._queue.put_nowait(text)
+            self._queue.put_nowait(action)
         except queue.Full:
-            # Drop the oldest queued message to make room — progress chatter is
-            # disposable and we must never block the event loop.
             try:
                 self._queue.get_nowait()
                 self._queue.task_done()
             except Exception:
                 pass
             try:
-                self._queue.put_nowait(text)
+                self._queue.put_nowait(action)
             except Exception:
                 pass
+
+    def _broadcast(self, text: str) -> None:
+        """Enqueue a rendered message for off-loop delivery. Never blocks."""
+        if text:
+            self._enqueue_action(text)
 
     def flush(self, timeout: Optional[float] = None) -> None:
         """Block until queued messages are delivered. Best-effort; never raises.
@@ -766,6 +1008,12 @@ class TelegramNotifier:
         # Update build-context FIRST so a spin-up/round event that arrives right
         # after a step transition is annotated with that step.
         self._update_context(event)
+        
+        try:
+            self._state.update(event)
+        except Exception as exc:
+            logger.debug("BuildState update failed: %s", exc)
+
         try:
             text = render_event(
                 event,
@@ -777,15 +1025,53 @@ class TelegramNotifier:
         except Exception as exc:
             logger.debug("telegram render failed: %s", exc)
             return
+            
         if text:
+            try:
+                clean = str(text).replace("\n", " ").strip()
+                import re
+                clean = re.sub(r'<[^>]+>', '', clean)
+                self._state.last_event_line = (clean[:80] + "…") if len(clean) > 80 else clean
+            except Exception:
+                pass
             self._broadcast(text)
+
+        try:
+            kind = event.get("kind")
+            is_meaningful = kind not in ("heartbeat",) and event.get("data", {}).get("event") != "dispatch_started"
+            if is_meaningful and not self._pinned_card_sent:
+                self._pinned_card_sent = True
+                card_text = render_status_card(self._state)
+                self._state.last_render_signature = _card_signature(self._state)
+                self._state.last_render_ts = float(event.get("ts", 0.0))
+                self._enqueue_action(("send_pinned", card_text))
+            elif self._pinned_card_sent:
+                now = float(event.get("ts", 0.0))
+                sig = _card_signature(self._state)
+                orch = _orchestration(event) or {}
+                action = orch.get("action")
+                is_force = action in ("started", "completed", "iteration_completed", "generator_rotation")
+                if event.get("data", {}).get("event") == "dispatch_finished":
+                    is_force = True
+                time_since = now - self._state.last_render_ts
+                if (is_force and time_since >= 1.2) or (time_since >= 1.2 and sig != self._state.last_render_signature):
+                    self._state.last_render_signature = sig
+                    self._state.last_render_ts = now
+                    card_text = render_status_card(self._state)
+                    self._enqueue_action(("edit_pinned", card_text))
+        except Exception as exc:
+            logger.debug("Status card edit failed: %s", exc)
 
     def finished(self, meta: Optional[dict]) -> None:
         """Send the polished final-summary card, then drain. Never raises."""
         if not self.active:
             return
         try:
-            self._broadcast(self._summary_card(meta or {}))
+            card = self._summary_card(meta or {})
+            if getattr(self, '_pinned_card_sent', False):
+                self._enqueue_action(("edit_pinned", card))
+            else:
+                self._broadcast(card)
         except Exception as exc:
             logger.debug("telegram summary failed: %s", exc)
         # Drain so the card actually leaves the process before dispatch returns.

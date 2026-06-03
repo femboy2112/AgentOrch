@@ -584,7 +584,8 @@ def test_notifier_follows_live_persisted_verbosity(fake_key, capture_client):
     # quiet: a spin-up is suppressed ...
     notifier(_spinup_event())
     notifier.flush(timeout=5.0)
-    assert not [s for s in capture_client if s["method"] == "sendMessage"]
+    stream_sends = [s for s in capture_client if s["method"] == "sendMessage" and "Building" not in s["params"].get("text", "")]
+    assert not stream_sends
 
     # ... operator raises it to debug mid-build; the SAME notifier now emits it.
     _write_persisted_verbosity("debug")
@@ -606,7 +607,8 @@ def test_notifier_pinned_ignores_persisted_verbosity(fake_key, capture_client):
     notifier(_spinup_event())
     notifier.flush(timeout=5.0)
     # Stays quiet despite persisted debug — the explicit pin wins.
-    assert not [s for s in capture_client if s["method"] == "sendMessage"]
+    stream_sends = [s for s in capture_client if s["method"] == "sendMessage" and "Building" not in s["params"].get("text", "")]
+    assert not stream_sends
 
 
 def test_effective_verbosity_falls_back_when_reader_raises(fake_key):
