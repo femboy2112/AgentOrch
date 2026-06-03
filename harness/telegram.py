@@ -156,19 +156,42 @@ class TelegramClient:
         *,
         parse_mode: str = "HTML",
         disable_web_page_preview: bool = True,
+        reply_markup: Optional[dict] = None,
     ) -> Optional[dict]:
-        """Send one message. Best-effort; returns the API result or None."""
+        """Send one message. Best-effort; returns the API result or None.
+
+        ``reply_markup`` (e.g. an ``{"inline_keyboard": [...]}`` dict) is
+        JSON-serialized and passed through to the API so the message can carry
+        inline-keyboard buttons (F1). Omitted when None.
+        """
         if not self.configured or chat_id is None:
             return None
-        return self._post(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": "true" if disable_web_page_preview else "false",
-            },
-        )
+        params: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": "true" if disable_web_page_preview else "false",
+        }
+        if reply_markup is not None:
+            params["reply_markup"] = json.dumps(reply_markup)
+        return self._post("sendMessage", params)
+
+    def answer_callback_query(
+        self, callback_query_id: Any, text: str = ""
+    ) -> Optional[dict]:
+        """Answer a callback_query (clears the client's button spinner).
+
+        Best-effort; returns the API result or None. ``text``, when given,
+        surfaces as a brief toast on the client. Telegram requires every
+        callback_query to be answered within a short window — the bot's callback
+        dispatch ALWAYS calls this, even for an ignored/no-op verb (F1).
+        """
+        if not self.configured or callback_query_id is None:
+            return None
+        params: Dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text
+        return self._post("answerCallbackQuery", params)
 
     def edit_message_text(
         self,
@@ -385,6 +408,7 @@ class BuildState:
     def __init__(self, run_id: str, mode: str):
         self.run_id = run_id
         self.mode = mode
+        self.goal = ""
         self.run_start_ts = None
         self.finished = False
         
@@ -403,6 +427,15 @@ class BuildState:
         self.completed_steps = set()
         self.step_durations = []
         self._step_started_at = {}
+        # Per-step recap rows (ordered by completion) for the end-of-run card:
+        # {"index", "title", "duration", "outcome", "rounds"}.
+        self.step_records = []
+        # adversarial iterations observed for the in-flight step (reset on start).
+        self._cur_step_rounds = 0
+        # how many rounds the most-recently-completed step ran (for the step-done
+        # line, which render_event reads via the context channel).
+        self.last_step_rounds = 0
+        self.last_step_duration = None
         
         self.n_steps_done = 0
         self.n_verified = 0
@@ -478,23 +511,37 @@ class BuildState:
                         self._step_started_at[idx] = ts
                     self.cur_iter = None
                     self.cur_iter_total = None
-                    
+                    self._cur_step_rounds = 0
+
                 elif action == "completed":
+                    dur = None
                     if idx:
                         self.completed_steps.add(idx)
                         self.n_steps_done = len(self.completed_steps)
                         if idx in self._step_started_at:
-                            self.step_durations.append(max(0.0, float(ts) - float(self._step_started_at[idx])))
+                            dur = max(0.0, float(ts) - float(self._step_started_at[idx]))
+                            self.step_durations.append(dur)
                     outcome = orch.get("outcome")
                     if outcome == "verified":
                         self.n_verified += 1
                     elif outcome == "approved":
                         self.n_approved += 1
+                    rounds = self._cur_step_rounds
+                    self.last_step_rounds = rounds
+                    self.last_step_duration = dur
+                    self.step_records.append({
+                        "index": idx,
+                        "title": orch.get("step_title", "") or self.cur_step_title,
+                        "duration": dur,
+                        "outcome": outcome,
+                        "rounds": rounds,
+                    })
 
             elif phase == "adversarial":
                 if action == "iteration_started":
                     self.cur_iter = orch.get("iteration")
                     self.cur_iter_total = orch.get("iteration_total")
+                    self._cur_step_rounds += 1
 
 def _card_signature(state: BuildState) -> tuple:
     el = round(state.elapsed / 5.0) * 5
@@ -585,8 +632,12 @@ def render_status_card(state: BuildState) -> str:
 
     worker_state = _e(state.active_role or "running")
 
+    goal = str(getattr(state, "goal", "") or "").strip()
+    goal_line = f"<i>{_e(goal[:80])}</i>\n" if goal else ""
+
     return (
         f"⚡ <b>Building</b> · <code>{rid_short}</code>\n"
+        f"{goal_line}"
         f"<code>{bar}</code>  <b>{step_ref}</b>\n"
         f"<i>{_e(title)}</i>\n\n"
         f"{phase_glyph} {phase_label} · {worker_state}{iter_str}\n"
@@ -643,7 +694,11 @@ def render_event(
             gen_chain = detail.get("generator_chain") or []
             orch = " · ".join(str(w) for w in gen_chain)
             orch_line = f"\n<i>orchestrating {_e(orch)}</i>\n" if orch else ""
-            return f"🟢 <b>Build started</b>\n{orch_line}\nmode <code>{safe_mode}</code> · run <code>{rid}</code>"
+            # The goal/instruction leads the header card in bold (when known —
+            # the notifier passes it via the context channel; render stays pure).
+            goal = str((context or {}).get("goal") or "").strip() if isinstance(context, dict) else ""
+            goal_line = f"<b>{_e(goal[:80])}</b>\n" if goal else ""
+            return f"🟢 <b>Build started</b>\n{goal_line}{orch_line}\nmode <code>{safe_mode}</code> · run <code>{rid}</code>"
         if ev == "dispatch_finished":
             # The polished end-of-run card is owned by TelegramNotifier.finished()
             # (success/fail, duration, files, tokens). A bare marker here would be
@@ -718,7 +773,28 @@ def render_event(
                     ok = "✅" if outcome == "verified" else "☑️"
                 else:
                     ok = "▪"
-                return f"{ok} <b>Step {pos} done</b> · <i>{title}</i>\n   {_e(outcome)}{_run_tag(rid)}"
+                # Duration + adversarial-round count come from BuildState via the
+                # context channel (render stays pure). e.g. " · 2m14s · 2 rounds".
+                ctx = context if isinstance(context, dict) else {}
+                meta_bits: List[str] = []
+                dur = ctx.get("step_duration")
+                if dur is not None:
+                    try:
+                        meta_bits.append(_fmt_duration(dur))
+                    except Exception:
+                        pass
+                rounds = ctx.get("step_rounds")
+                if rounds:
+                    try:
+                        r = int(rounds)
+                        meta_bits.append(f"{r} round{'s' if r != 1 else ''}")
+                    except Exception:
+                        pass
+                meta_str = (" · " + " · ".join(meta_bits)) if meta_bits else ""
+                return (
+                    f"{ok} <b>Step {pos} done</b> · <i>{title}</i>"
+                    f"{meta_str} · {_e(outcome)}{_run_tag(rid)}"
+                )
 
         # ---- ADVERSARIAL ROUNDS — normal and above (operator request) ----- #
         # The operator was "not seeing adversarial rounds"; surface the draft
@@ -823,6 +899,7 @@ class TelegramNotifier:
         chat_ids: List[Any],
         max_queue: int = 1000,
         dynamic_verbosity: Optional["Callable[[], Optional[str]]"] = None,
+        instruction: Optional[str] = None,
     ):
         self.run_id = run_id
         self.mode = mode
@@ -854,6 +931,12 @@ class TelegramNotifier:
         self._worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
         self._state = BuildState(run_id, mode)
+        # The dispatch goal/instruction (truncated) — rendered as the bold lead of
+        # the header card and the <i>title</i> lead of the status/summary card.
+        goal = str(instruction or "").strip()
+        if goal:
+            self._state.goal = goal[:80]
+            self._ctx["goal"] = self._state.goal
         self._pinned_card_sent = False
 
     @property
@@ -878,6 +961,53 @@ class TelegramNotifier:
                 return normalize_verbosity(live)
         return self.verbosity
 
+    def _live_state(self) -> dict:
+        """Read the persisted bot_state.json live (same pattern as the dynamic
+        /verbosity reader) so a mid-run /mute or /quiet takes effect immediately.
+        Best-effort — returns {} on any failure, never raises."""
+        try:
+            with open(state_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _event_kind(self, event: Any) -> str:
+        """Classify an event for suppression: 'failure' (a failed/stalled step or
+        a failed dispatch_finished) is always delivered; everything else is
+        suppressible 'progress'. The end-of-run summary card is classified
+        'summary' at its own call site (finished()). Never raises."""
+        try:
+            data = event.get("data") if isinstance(event, dict) else None
+            data = data if isinstance(data, dict) else {}
+            orch = _orchestration(event) or {}
+            if str(orch.get("outcome")) in _FAILURE_OUTCOMES:
+                return "failure"
+            if data.get("event") == "dispatch_finished" and data.get("success") is False:
+                return "failure"
+            return "progress"
+        except Exception:
+            return "progress"
+
+    def _suppressed_for(self, event: Any) -> bool:
+        """True iff THIS event should be dropped for every chat per F2 prefs.
+
+        Consults :func:`_suppressed` against the live bot_state for each chat;
+        only suppresses when ALL chats agree to drop it (a shared-chat broadcast
+        is one message). Failure/summary kinds are never suppressed. Never raises."""
+        try:
+            kind = self._event_kind(event)
+            if kind in _ALWAYS_DELIVER_KINDS:
+                return False
+            state = self._live_state()
+            if not state.get("chats"):
+                return False
+            return all(
+                _suppressed(cid, kind, state) for cid in self.chat_ids
+            ) if self.chat_ids else False
+        except Exception:
+            return False
+
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             return
@@ -901,7 +1031,9 @@ class TelegramNotifier:
                 if isinstance(item, str):
                     self._deliver(item)
                 elif isinstance(item, tuple):
-                    action, text = item
+                    action = item[0]
+                    text = item[1] if len(item) > 1 else ""
+                    markup = item[2] if len(item) > 2 else None
                     if action == "send_pinned":
                         for chat_id in self.chat_ids:
                             try:
@@ -914,12 +1046,23 @@ class TelegramNotifier:
                                 self.sent += 1
                             except Exception as exc:
                                 logger.debug("telegram send_pinned failed: %s", exc)
+                    elif action == "send":
+                        # A plain (optionally button-bearing) broadcast — the
+                        # end-of-run summary card carries the inline keyboard.
+                        for chat_id in self.chat_ids:
+                            try:
+                                self.client.send_message(
+                                    chat_id, text, reply_markup=markup)
+                                self.sent += 1
+                            except Exception as exc:
+                                logger.debug("telegram send failed: %s", exc)
                     elif action == "edit_pinned":
                         mid = self._state.pinned_message_id
                         if mid:
                             for chat_id in self.chat_ids:
                                 try:
-                                    self.client.edit_message_text(chat_id, mid, text)
+                                    self.client.edit_message_text(
+                                        chat_id, mid, text, reply_markup=markup)
                                 except Exception as exc:
                                     logger.debug("telegram edit_pinned failed: %s", exc)
             except Exception as exc:  # never let the worker thread die noisily
@@ -1014,6 +1157,22 @@ class TelegramNotifier:
         except Exception as exc:
             logger.debug("BuildState update failed: %s", exc)
 
+        # After the state update, surface the just-completed step's duration +
+        # adversarial round count to render_event via the context channel, so the
+        # step-done line can read "✅ Step 3/8 done · <i>title</i> · 2m14s · 2
+        # rounds · verified". render_event stays pure. Cleared for non-completion
+        # events so a later spin-up line doesn't inherit a stale duration.
+        try:
+            orch = _orchestration(event) or {}
+            if orch.get("phase") == "step" and orch.get("action") == "completed":
+                self._ctx["step_duration"] = self._state.last_step_duration
+                self._ctx["step_rounds"] = self._state.last_step_rounds
+            else:
+                self._ctx.pop("step_duration", None)
+                self._ctx.pop("step_rounds", None)
+        except Exception as exc:
+            logger.debug("telegram step-done annotate failed: %s", exc)
+
         try:
             text = render_event(
                 event,
@@ -1026,6 +1185,10 @@ class TelegramNotifier:
             logger.debug("telegram render failed: %s", exc)
             return
             
+        # F2: drop progress chatter while muted / in quiet hours (failures + the
+        # final summary are classified non-progress and always pass through).
+        suppressed = self._suppressed_for(event)
+
         if text:
             try:
                 clean = str(text).replace("\n", " ").strip()
@@ -1034,18 +1197,21 @@ class TelegramNotifier:
                 self._state.last_event_line = (clean[:80] + "…") if len(clean) > 80 else clean
             except Exception:
                 pass
-            self._broadcast(text)
+            if not suppressed:
+                self._broadcast(text)
 
         try:
             kind = event.get("kind")
             is_meaningful = kind not in ("heartbeat",) and event.get("data", {}).get("event") != "dispatch_started"
+            if suppressed:
+                is_meaningful = False  # the live status card is progress chatter too
             if is_meaningful and not self._pinned_card_sent:
                 self._pinned_card_sent = True
                 card_text = render_status_card(self._state)
                 self._state.last_render_signature = _card_signature(self._state)
                 self._state.last_render_ts = float(event.get("ts", 0.0))
                 self._enqueue_action(("send_pinned", card_text))
-            elif self._pinned_card_sent:
+            elif self._pinned_card_sent and not suppressed:
                 now = float(event.get("ts", 0.0))
                 sig = _card_signature(self._state)
                 orch = _orchestration(event) or {}
@@ -1062,16 +1228,38 @@ class TelegramNotifier:
         except Exception as exc:
             logger.debug("Status card edit failed: %s", exc)
 
+    def _run_keyboard(self) -> Optional[dict]:
+        """Inline-keyboard reply_markup for THIS run's summary card (F1).
+
+        [📂 Files] [❓ Why] [📊 Diff]; callback_data is ``"verb:short_run_id"``
+        (the short tag keeps it under Telegram's 64-byte cap). The bot's callback
+        dispatch routes a tap back to the read-only helpers. Never raises."""
+        try:
+            rid = str(self.run_id or "").strip()
+            short = rid[-6:] if len(rid) > 6 else rid
+            if not short:
+                return None
+            return {
+                "inline_keyboard": [[
+                    {"text": "📂 Files", "callback_data": f"files:{short}"},
+                    {"text": "❓ Why", "callback_data": f"why:{short}"},
+                    {"text": "📊 Diff", "callback_data": f"diff:{short}"},
+                ]]
+            }
+        except Exception:
+            return None
+
     def finished(self, meta: Optional[dict]) -> None:
         """Send the polished final-summary card, then drain. Never raises."""
         if not self.active:
             return
         try:
             card = self._summary_card(meta or {})
+            markup = self._run_keyboard()
             if getattr(self, '_pinned_card_sent', False):
-                self._enqueue_action(("edit_pinned", card))
+                self._enqueue_action(("edit_pinned", card, markup))
             else:
-                self._broadcast(card)
+                self._enqueue_action(("send", card, markup))
         except Exception as exc:
             logger.debug("telegram summary failed: %s", exc)
         # Drain so the card actually leaves the process before dispatch returns.
@@ -1079,43 +1267,106 @@ class TelegramNotifier:
         self.flush(timeout=6.0)
 
     def _summary_card(self, meta: dict) -> str:
+        """Rich multi-line end-of-run card from BuildState + meta (spec §8).
+
+        Lines: a headline (✅ verified / ☑️ complete / 🛑 failed), the goal, a
+        "N/N steps · status · duration" line, a changed-files block (first ~8 +
+        "… +K more"), a <pre> per-step recap, then tokens + mode + run. REAL
+        newlines only.
+        """
+        state = self._state
         success = bool(meta.get("success"))
         mode = _e(meta.get("mode") or self.mode)
         dur = _fmt_duration(meta.get("duration_s"))
         rid = _e(meta.get("run_id") or self.run_id)
         changed = meta.get("changed_files")
-        n_files = len(changed) if isinstance(changed, list) else 0
+        files = [str(f) for f in changed] if isinstance(changed, list) else []
+        n_files = len(files)
+
         quality = meta.get("quality") if isinstance(meta.get("quality"), dict) else {}
         raw_conf = quality.get("confidence")
         confidence = str(raw_conf).strip() if raw_conf is not None else ""
         verified = confidence.lower() == "verified"
-        # Omit the confidence chip entirely when it's absent / "n/a" (a literal
-        # "n/a" next to a green check reads oddly).
-        conf_chip = (
-            f" · {_e(confidence)}"
-            if confidence and confidence.lower() not in ("n/a", "na", "none")
-            else ""
-        )
 
         tokens = meta.get("tokens") if isinstance(meta.get("tokens"), dict) else {}
         grand = tokens.get("grand_total") if isinstance(tokens.get("grand_total"), dict) else {}
         grand_total = grand.get("total_tokens")
-        token_str = f" · {grand_total:,} tok" if isinstance(grand_total, int) else ""
+        token_str = f"{grand_total:,} tok" if isinstance(grand_total, int) else ""
 
+        # ---- headline ---------------------------------------------------- #
         if success:
-            # Distinct headline for a verified run vs a completed-but-unverified
-            # one (the only prior difference was a bare confidence word).
-            headline = "✅ <b>Build verified</b>" if verified else "☑️ <b>Build complete</b>"
-            return (
-                f"{headline}{_e(conf_chip)} · {_e(dur)} · "
-                f"{n_files} file{'s' if n_files != 1 else ''}{_e(token_str)}\n"
-                f"<code>{mode}</code> · run <code>{rid}</code>"
-            )
-        reason = _e(meta.get("error") or meta.get("run_outcome") or "failed")
-        return (
-            f"❌ <b>Build failed</b> · {reason} · {_e(dur)}\n"
-            f"<code>{mode}</code> · run <code>{rid}</code>"
-        )
+            if verified:
+                headline = "✅ <b>Build verified</b>"
+                status_word = "verified"
+            else:
+                headline = "☑️ <b>Build complete</b>"
+                status_word = confidence if confidence and confidence.lower() not in (
+                    "n/a", "na", "none") else "complete"
+        else:
+            headline = "🛑 <b>Build failed</b>"
+            status_word = str(meta.get("error") or meta.get("run_outcome") or "failed")
+
+        lines: List[str] = [headline]
+
+        # ---- goal -------------------------------------------------------- #
+        goal = str(getattr(state, "goal", "") or "").strip()
+        if goal:
+            lines.append(f"<i>{_e(goal[:80])}</i>")
+
+        # ---- N/N steps · status · duration ------------------------------- #
+        total = state.step_total
+        done = state.n_steps_done
+        if total:
+            steps_str = f"{done}/{total} steps"
+        elif done:
+            steps_str = f"{done} steps"
+        else:
+            steps_str = ""
+        meta_bits = [b for b in (steps_str, _e(status_word), _e(dur)) if b]
+        if meta_bits:
+            lines.append(" · ".join(meta_bits))
+
+        # ---- changed-files block (first ~8 + "… +K more") ----------------- #
+        if n_files:
+            lines.append(f"\n📂 <b>{n_files} file{'s' if n_files != 1 else ''} changed</b>")
+            shown = files[:8]
+            for f in shown:
+                lines.append(f"  • <code>{_e(f)}</code>")
+            extra = n_files - len(shown)
+            if extra > 0:
+                lines.append(f"  … +{extra} more")
+
+        # ---- <pre> per-step recap ---------------------------------------- #
+        records = list(getattr(state, "step_records", []) or [])
+        if records:
+            recap_rows = []
+            for rec in records:
+                idx = rec.get("index")
+                title = str(rec.get("title") or "")
+                outcome = str(rec.get("outcome") or "")
+                if outcome == "verified":
+                    glyph = "✅"
+                elif outcome == "approved":
+                    glyph = "☑️"
+                elif outcome in _FAILURE_OUTCOMES:
+                    glyph = "❌"
+                else:
+                    glyph = "▪"
+                d = rec.get("duration")
+                dstr = _fmt_duration(d) if d is not None else ""
+                # roughly aligned columns: index, glyph, padded title, duration.
+                idx_s = str(idx if idx is not None else "?")
+                title_col = title[:22].ljust(22)
+                recap_rows.append(f"{idx_s:>2} {glyph} {title_col} {dstr}")
+            recap = "\n".join(_e(r) for r in recap_rows)
+            lines.append(f"\n<pre>{recap}</pre>")
+
+        # ---- tokens + mode + run ----------------------------------------- #
+        footer_bits = [b for b in (token_str, f"<code>{mode}</code>") if b]
+        footer = " · ".join(footer_bits)
+        lines.append(f"{footer} · run <code>{rid}</code>")
+
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -1158,3 +1409,182 @@ def load_persisted_verbosity(path: Optional[str] = None) -> Optional[str]:
         if v:
             return normalize_verbosity(v)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# F2 — per-chat /mute, /watch, quiet-hours suppression
+#
+# Per-chat preferences live under ``state["chats"][str(chat_id)]`` =
+# ``{"mute_until": <epoch|"on"|None>, "quiet_window": "HH:MM-HH:MM"|None}``.
+# The single ``_suppressed`` predicate is consulted on BOTH delivery paths:
+# the dispatch-side TelegramNotifier and the bot's tail. It reads the SAME live
+# bot_state.json (just like load_persisted_verbosity), so toggling /mute mid-run
+# takes effect immediately. Policy: while muted or inside the quiet window, drop
+# PROGRESS chatter but ALWAYS deliver "failure" + "summary" events.
+# --------------------------------------------------------------------------- #
+
+# Event classes that are NEVER suppressed (failures must always reach the
+# operator; the end-of-run summary card is the one guaranteed message). Anything
+# not in this set is treated as suppressible progress chatter.
+_ALWAYS_DELIVER_KINDS = frozenset({"failure", "summary"})
+
+
+def parse_quiet_window(spec: Optional[str]):
+    """Parse a ``HH:MM-HH:MM`` quiet-hours window into ``(start, end)`` minutes.
+
+    Returns a ``(start_minutes, end_minutes)`` tuple of ints in ``[0, 1439]`` on
+    success, or ``None`` for any garbage (empty, missing dash, out-of-range, or
+    non-numeric). NEVER raises — a bad window is rejected, not an exception.
+    An overnight window (start >= end, e.g. 23:00-07:00) is valid and wraps.
+    """
+    try:
+        s = str(spec or "").strip()
+        if "-" not in s:
+            return None
+        lo, hi = s.split("-", 1)
+        start = _parse_hhmm(lo)
+        end = _parse_hhmm(hi)
+        if start is None or end is None:
+            return None
+        return (start, end)
+    except Exception:
+        return None
+
+
+def _parse_hhmm(token: str):
+    """``HH:MM`` -> minutes-of-day int in [0,1439], or None. Never raises."""
+    try:
+        t = str(token or "").strip()
+        if ":" not in t:
+            return None
+        hh_s, mm_s = t.split(":", 1)
+        hh = int(hh_s)
+        mm = int(mm_s)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        return hh * 60 + mm
+    except Exception:
+        return None
+
+
+def _now_minute_of_day(now) -> Optional[int]:
+    """Minutes-of-day for an injected ``now`` (datetime, epoch float/int), or the
+    real local clock when ``now`` is None. Never raises; returns None on garbage."""
+    try:
+        if now is None:
+            import datetime as _dt
+            n = _dt.datetime.now()
+            return n.hour * 60 + n.minute
+        # datetime instance
+        if hasattr(now, "hour") and hasattr(now, "minute"):
+            return int(now.hour) * 60 + int(now.minute)
+        # epoch seconds (int/float)
+        import datetime as _dt
+        n = _dt.datetime.fromtimestamp(float(now))
+        return n.hour * 60 + n.minute
+    except Exception:
+        return None
+
+
+def _now_epoch(now) -> Optional[float]:
+    """An epoch-seconds float for an injected ``now`` (datetime/epoch) or the real
+    clock when None. Used to compare against ``mute_until``. Never raises."""
+    try:
+        if now is None:
+            import time as _t
+            return _t.time()
+        if hasattr(now, "timestamp"):
+            return float(now.timestamp())
+        return float(now)
+    except Exception:
+        return None
+
+
+def _in_quiet_window(window, minute: Optional[int]) -> bool:
+    """True iff ``minute`` (minutes-of-day) falls inside ``window`` (start,end).
+
+    Handles overnight wrap (start > end). Never raises."""
+    try:
+        if window is None or minute is None:
+            return False
+        start, end = window
+        if start == end:
+            return False  # zero-width window means "never quiet"
+        if start < end:
+            return start <= minute < end
+        # overnight: e.g. 23:00-07:00 -> [23:00, 24:00) U [00:00, 07:00)
+        return minute >= start or minute < end
+    except Exception:
+        return False
+
+
+def chat_prefs(state: Any, chat_id: Any) -> dict:
+    """The per-chat preference dict from ``state["chats"][str(chat_id)]``.
+
+    Returns ``{}`` for any missing/garbage state or chat id. Never raises."""
+    try:
+        if not isinstance(state, dict):
+            return {}
+        chats = state.get("chats")
+        if not isinstance(chats, dict):
+            return {}
+        prefs = chats.get(str(chat_id))
+        return prefs if isinstance(prefs, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_muted(prefs: dict, now) -> bool:
+    """True iff the chat is currently muted per ``prefs['mute_until']``.
+
+    ``"on"`` (or any non-numeric truthy string) means muted indefinitely; an
+    epoch float/int means muted until that time; absent/falsey means not muted.
+    Never raises."""
+    try:
+        mu = prefs.get("mute_until")
+        if not mu:
+            return False
+        # Indefinite mute (e.g. "on").
+        if isinstance(mu, str):
+            try:
+                mu_epoch = float(mu)
+            except Exception:
+                return True  # "on" / non-numeric string -> muted indefinitely
+        else:
+            mu_epoch = float(mu)
+        now_epoch = _now_epoch(now)
+        if now_epoch is None:
+            return True  # can't tell time -> respect the mute conservatively
+        return now_epoch < mu_epoch
+    except Exception:
+        return False
+
+
+def _suppressed(chat_id: Any, event_kind: Any, state: Any, *, now: Any = None) -> bool:
+    """Should this chat NOT receive an event of ``event_kind`` right now?
+
+    The single suppression predicate for F2, consulted on BOTH delivery paths
+    (TelegramNotifier + bot tail). ``event_kind`` is a coarse class:
+    ``"failure"`` and ``"summary"`` are ALWAYS delivered (return False); anything
+    else is suppressible progress chatter, dropped while the chat is muted or
+    inside its quiet window.
+
+    Deterministic + testable: ``now`` may be injected (a ``datetime`` or epoch
+    seconds); when None the real local clock is used (only outside assertions).
+    Fail-open + NEVER raises — on any garbage it returns False (deliver), so a
+    bad pref can never silence a failure or crash the delivery thread.
+    """
+    try:
+        if str(event_kind) in _ALWAYS_DELIVER_KINDS:
+            return False
+        prefs = chat_prefs(state, chat_id)
+        if not prefs:
+            return False
+        if _is_muted(prefs, now):
+            return True
+        window = parse_quiet_window(prefs.get("quiet_window"))
+        if window is not None and _in_quiet_window(window, _now_minute_of_day(now)):
+            return True
+        return False
+    except Exception:
+        return False  # fail-open: never suppress on an error

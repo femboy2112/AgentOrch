@@ -1246,6 +1246,7 @@ def _build_telegram_notifier(
     mode: str,
     enabled: Optional[bool],
     verbosity: Optional[str],
+    instruction: Optional[str] = None,
 ) -> Optional["TelegramNotifier"]:
     """Construct a TelegramNotifier per the tri-state enable policy, or None.
 
@@ -1293,6 +1294,7 @@ def _build_telegram_notifier(
             client=client,
             chat_ids=chat_ids,
             dynamic_verbosity=dynamic,
+            instruction=instruction,
         )
     except Exception as exc:  # best-effort: telegram never affects dispatch
         logger.debug("telegram notifier setup failed: %s", exc)
@@ -1618,6 +1620,7 @@ async def dispatch_async(
         mode=mode,
         enabled=telegram_enabled,
         verbosity=telegram_verbosity,
+        instruction=instruction,
     )
     telegram_poller = None
     if telegram_notifier is not None:

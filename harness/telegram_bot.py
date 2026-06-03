@@ -55,8 +55,10 @@ from harness.telegram import (
     _e,
     _fmt_duration,
     _run_tag,
+    _suppressed,
     load_whitelist,
     normalize_verbosity,
+    parse_quiet_window,
     render_event,
     state_path,
     whitelist_user_ids,
@@ -76,6 +78,12 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "track", "description": "follow a live run (latest | <id> | all)"},
     {"command": "untrack", "description": "stop following a live run"},
     {"command": "verbosity", "description": "show or set notification verbosity"},
+    {"command": "mute", "description": "silence progress updates (30m|2h|on)"},
+    {"command": "watch", "description": "resume updates (unmute)"},
+    {"command": "quiet", "description": "quiet hours HH:MM-HH:MM (or off)"},
+    {"command": "health", "description": "poller status, live runs, last outcome"},
+    {"command": "tail", "description": "last N rendered events (default 10)"},
+    {"command": "diff", "description": "changed-files diff summary"},
     {"command": "help", "description": "list commands"},
 ]
 
@@ -294,6 +302,62 @@ def _short_tag(run_id: str) -> str:
     return s[-6:] if len(s) > 6 else s
 
 
+# Verbs the inline-keyboard buttons (and their callback_data) carry. callback_data
+# is "verb:short_run_id" (<=64 bytes); the dispatch routes each verb to an
+# existing read-only helper. Unknown verbs are a safe no-op.
+CALLBACK_VERBS = ("files", "why", "diff")
+
+
+def build_run_keyboard(run_id: str) -> Optional[dict]:
+    """Inline-keyboard reply_markup for a run: [📂 Files] [❓ Why] [📊 Diff].
+
+    callback_data is ``"verb:short_run_id"`` (the short tag keeps it well under
+    Telegram's 64-byte cap). Returns None when there's no run id to attach to.
+    """
+    short = _short_tag(run_id)
+    if not short:
+        return None
+    return {
+        "inline_keyboard": [[
+            {"text": "📂 Files", "callback_data": f"files:{short}"},
+            {"text": "❓ Why", "callback_data": f"why:{short}"},
+            {"text": "📊 Diff", "callback_data": f"diff:{short}"},
+        ]]
+    }
+
+
+def _resolve_short_tag(tag: str) -> Optional[str]:
+    """Map a short run tag (or full id) back to a full run id, or None.
+
+    Buttons carry ``short_run_id`` (the last 6 chars). Match it against live and
+    recent run dirs by full id or by short tag; prefer the most-recent on a tie.
+    A full id that exists also resolves to itself. Never raises.
+    """
+    try:
+        tag = str(tag or "").strip()
+        if not tag:
+            return None
+        # Exact full-id hit first.
+        if _run_dir_by_id(tag) is not None:
+            return tag
+        for d in _run_dirs():  # most-recent first
+            if _short_tag(d.name) == tag:
+                return d.name
+    except Exception:
+        return None
+    return None
+
+
+def _handle_diff(run_id: str) -> str:
+    """Lightweight diff summary for the [📊 Diff] button.
+
+    F1 only needs a routable, length-bounded reply here; the full /diff command
+    is F3. Reuse the run summary as a stand-in so the button always answers with
+    real content for an existing run.
+    """
+    return summarize_run(run_id)
+
+
 def _tracking_state(state: dict) -> dict:
     """The per-chat tracking map: ``{chat_id_str: {run_id: byte_cursor}}``."""
     tracking = state.get("tracking")
@@ -311,6 +375,114 @@ def _chat_tracking(state: dict, chat_id: Any) -> dict:
         entry = {}
         tracking[key] = entry
     return entry
+
+
+def _event_class(ev: Any) -> str:
+    """Coarse class of a raw event for F2 suppression: 'failure' for a failed /
+    stalled step or a failed dispatch_finished (always delivered), else
+    'progress'. Mirrors TelegramNotifier._event_kind. Never raises."""
+    try:
+        from harness.telegram import _orchestration, _FAILURE_OUTCOMES
+        data = ev.get("data") if isinstance(ev, dict) else None
+        data = data if isinstance(data, dict) else {}
+        orch = _orchestration(ev) or {}
+        if str(orch.get("outcome")) in _FAILURE_OUTCOMES:
+            return "failure"
+        if data.get("event") == "dispatch_finished" and data.get("success") is False:
+            return "failure"
+        return "progress"
+    except Exception:
+        return "progress"
+
+
+def _chat_prefs(state: dict, chat_id: Any) -> dict:
+    """The MUTABLE per-chat preference dict ``state["chats"][str(chat_id)]``.
+
+    Creates the ``chats`` map / per-chat entry as needed (F2: ``mute_until`` +
+    ``quiet_window`` live here). The dispatch-side reader uses
+    :func:`harness.telegram.chat_prefs` (read-only) against the same shape."""
+    chats = state.get("chats")
+    if not isinstance(chats, dict):
+        chats = {}
+        state["chats"] = chats
+    key = str(chat_id)
+    prefs = chats.get(key)
+    if not isinstance(prefs, dict):
+        prefs = {}
+        chats[key] = prefs
+    return prefs
+
+
+def _parse_mute_duration(spec: str) -> Optional[object]:
+    """Map a /mute argument to a ``mute_until`` value, or None on garbage.
+
+    ``on`` / ``""`` → indefinite mute (the literal string ``"on"``). A duration
+    like ``30m`` / ``2h`` / ``90s`` / ``45`` (bare = minutes) → an absolute epoch
+    ``now + duration``. Never raises."""
+    try:
+        import time as _t
+        s = str(spec or "").strip().lower()
+        if s in ("", "on"):
+            return "on"
+        unit = s[-1]
+        if unit in ("s", "m", "h"):
+            num = float(s[:-1])
+            secs = num * {"s": 1, "m": 60, "h": 3600}[unit]
+        else:
+            num = float(s)  # bare number = minutes
+            secs = num * 60
+        if secs <= 0:
+            return None
+        return _t.time() + secs
+    except Exception:
+        return None
+
+
+def _handle_mute(args: List[str], *, state: dict, chat_id: Any,
+                 state_file: Optional[str]) -> str:
+    """/mute [30m|2h|on] — silence progress chatter (failures + summary still go)."""
+    spec = args[0] if args else "on"
+    mute_until = _parse_mute_duration(spec)
+    if mute_until is None:
+        return ("⚠️ Bad duration. Use <code>/mute 30m</code>, <code>/mute 2h</code>, "
+                "or <code>/mute on</code> (indefinite).")
+    prefs = _chat_prefs(state, chat_id)
+    prefs["mute_until"] = mute_until
+    save_state(state, state_file)
+    if mute_until == "on":
+        when = "until you <code>/watch</code>"
+    else:
+        when = f"for {_e(str(spec).strip())}"
+    return f"🔕 Muted {when}. Failures + the final summary still come through."
+
+
+def _handle_watch(args: List[str], *, state: dict, chat_id: Any,
+                  state_file: Optional[str]) -> str:
+    """/watch — clear any mute (resume progress updates)."""
+    prefs = _chat_prefs(state, chat_id)
+    had = bool(prefs.get("mute_until"))
+    prefs.pop("mute_until", None)
+    save_state(state, state_file)
+    return "🔔 Updates resumed." if had else "🔔 Not muted — updates already on."
+
+
+def _handle_quiet(args: List[str], *, state: dict, chat_id: Any,
+                  state_file: Optional[str]) -> str:
+    """/quiet HH:MM-HH:MM (DND window) | /quiet off."""
+    arg = (args[0].strip() if args else "")
+    prefs = _chat_prefs(state, chat_id)
+    if arg.lower() in ("off", ""):
+        had = bool(prefs.get("quiet_window"))
+        prefs.pop("quiet_window", None)
+        save_state(state, state_file)
+        return "🔔 Quiet hours cleared." if had else "🔔 No quiet hours set."
+    if parse_quiet_window(arg) is None:
+        return ("⚠️ Bad window. Use <code>/quiet 23:00-07:00</code> "
+                "or <code>/quiet off</code>.")
+    prefs["quiet_window"] = arg
+    save_state(state, state_file)
+    return (f"🌙 Quiet hours <b>{_e(arg)}</b>. Progress is held during this window; "
+            "failures + the final summary still come through.")
 
 
 def _read_new_events(events_file: Path, cursor: int) -> tuple:
@@ -481,15 +653,19 @@ def _handle_why(run_id: str) -> str:
     
     recon = meta.get("reconciliation") or {}
     findings = recon.get("findings") or []
-    
+    verdict = recon.get("verdict")
+
     out = [f"🤔 <b>Why?</b> · <code>{_e(d.name)}</code>", ""]
     if note:
         out.append(f"<i>{_e(note)}</i>\n")
-    
+
     v_str = "✅ verified" if verified else "❌ not verified"
     c_str = "✅ critic approved" if critic else "❌ critic rejected"
     s_str = "⚠️ stalled" if stalled else ""
     out.append(f"<b>Status</b>: {v_str} · {c_str} {s_str}")
+
+    if verdict:
+        out.append(f"<b>Reconcile</b>: {_e(verdict)}")
     
     if findings:
         out.append("\n<b>Findings:</b>")
@@ -557,6 +733,12 @@ HELP_TEXT = (
     + ")\n"
     "/track [latest|&lt;run_id&gt;|all] — follow a live run (default: latest)\n"
     "/untrack [&lt;run_id&gt;|all] — stop following (default: all)\n"
+    "/mute [30m|2h|on] — silence progress (failures + summary still come)\n"
+    "/watch — resume updates (unmute)\n"
+    "/quiet HH:MM-HH:MM — quiet hours (DND); /quiet off to clear\n"
+    "/health — poller status, live runs, last outcome, recent signals\n"
+    "/tail [N] [run] — last N rendered events (default 10, latest run)\n"
+    "/diff [run] — changed-files diff summary + first lines\n"
     "/help — this message"
 )
 
@@ -630,6 +812,260 @@ def _handle_untrack(args: List[str], *, state: dict, chat_id: Any,
     return f"⏹ Stopped tracking <code>{_e(_short_tag(match))}</code>."
 
 
+# --------------------------------------------------------------------------- #
+# F3 read-only commands: /health, /tail, /diff
+# --------------------------------------------------------------------------- #
+TELEGRAM_MSG_CAP = 4096  # Telegram's hard per-message limit.
+
+
+def _poller_alive(state_file: Optional[str] = None) -> Optional[bool]:
+    """NON-DESTRUCTIVE liveness probe for the singleton getUpdates poller.
+
+    Tries to take the flock NON-BLOCKING: if the lock is FREE we grab it,
+    immediately RELEASE it, and report the poller as NOT running (False). If the
+    lock is already HELD by a daemon / embedded poller the acquire fails with
+    EWOULDBLOCK and we report it ALIVE (True) — without ever stealing or holding
+    the lock ourselves. Returns None when fcntl is unavailable (can't tell).
+    Never raises.
+    """
+    if fcntl is None:
+        return None
+    path = poller_lock_path(state_file)
+    fd = None
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True  # held by someone else -> a poller is alive
+        # We acquired it -> nobody else held it -> no poller running. Release
+        # IMMEDIATELY so we never hold (steal) the singleton lock.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def _scan_recent_signals(limit_runs: int = 5) -> List[str]:
+    """Scrape the newest events.jsonl tails for reroute / usage-wall signals.
+
+    Bounded: only the most-recent ``limit_runs`` run dirs, only the tail of each
+    file. Returns a short de-duplicated list of human notes (possibly empty).
+    Never raises."""
+    notes: List[str] = []
+    seen: set = set()
+    try:
+        for d in _run_dirs()[:limit_runs]:
+            ev = _events_path(d)
+            if not ev.exists():
+                continue
+            try:
+                size = ev.stat().st_size
+                with ev.open("r", encoding="utf-8", errors="replace") as fh:
+                    if size > 16384:
+                        fh.seek(size - 16384)
+                        fh.readline()  # drop a partial line
+                    tail = fh.read()
+            except Exception:
+                continue
+            for line in tail.splitlines():
+                low = line.lower()
+                tag = None
+                if "usage_wall" in low or "usage wall" in low:
+                    tag = "usage-wall"
+                elif "reroute" in low or "fallback" in low or "rotation" in low:
+                    tag = "reroute/fallback"
+                if tag and (d.name, tag) not in seen:
+                    seen.add((d.name, tag))
+                    notes.append(f"{tag} · <code>{_e(_short_tag(d.name))}</code>")
+    except Exception:
+        return notes
+    return notes
+
+
+def _handle_health(state_file: Optional[str] = None) -> str:
+    """/health — poller liveness (non-destructive), live-run count, last outcome,
+    recent reroute/usage-wall signals. Best-effort; never raises a crash out."""
+    lines: List[str] = ["🩺 <b>Health</b>"]
+    alive = _poller_alive(state_file)
+    if alive is True:
+        lines.append("Poller: ✅ running")
+    elif alive is False:
+        lines.append("Poller: ⚠️ not running")
+    else:
+        lines.append("Poller: ❔ unknown")
+
+    try:
+        live = live_run_dirs()
+    except Exception:
+        live = []
+    n_live = len(live)
+    lines.append(f"Live runs: <b>{n_live}</b>")
+
+    # Last finished outcome (most-recent run that has a terminal meta.json).
+    last_line = "Last outcome: <i>none yet</i>"
+    try:
+        for d in _run_dirs():
+            m = _read_meta(d)
+            if m is None:
+                continue
+            ok = bool(m.get("success"))
+            icon = "✅" if ok else "❌"
+            mode = _e(m.get("mode") or "")
+            last_line = (f"Last outcome: {icon} {'OK' if ok else 'FAIL'} · "
+                         f"<code>{_e(_short_tag(d.name))}</code> · {mode}")
+            break
+    except Exception:
+        pass
+    lines.append(last_line)
+
+    signals = _scan_recent_signals()
+    if signals:
+        lines.append("Recent: " + ", ".join(signals[:6]))
+
+    out = "\n".join(lines)
+    return out[:TELEGRAM_MSG_CAP]
+
+
+def _tail_events(run_dir: Path, n: int) -> List[dict]:
+    """Last ``n`` events from a run's events.jsonl (bounded tail read). Never raises."""
+    ev = _events_path(run_dir)
+    if not ev.exists():
+        return []
+    try:
+        size = ev.stat().st_size
+        with ev.open("r", encoding="utf-8", errors="replace") as fh:
+            # Read only a bounded tail (generous: ~64 KiB covers many events).
+            if size > 65536:
+                fh.seek(size - 65536)
+                fh.readline()  # drop the partial first line
+            chunk = fh.read()
+    except Exception:
+        return []
+    out: List[dict] = []
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out[-n:] if n > 0 else out
+
+
+def _handle_tail(args: List[str], *, state: dict) -> str:
+    """/tail [n=10] [run] — last N rendered events via render_event (bounded)."""
+    n = 10
+    target = "latest"
+    rest = list(args)
+    # First numeric arg = N; first non-numeric = run id.
+    consumed_n = False
+    leftover: List[str] = []
+    for a in rest:
+        s = a.strip()
+        if not consumed_n and s.isdigit():
+            try:
+                n = max(1, min(int(s), 30))
+            except Exception:
+                n = 10
+            consumed_n = True
+        else:
+            leftover.append(s)
+    if leftover:
+        target = leftover[0]
+
+    if target.lower() == "latest":
+        d = latest_live_run() or (_run_dirs()[0] if _run_dirs() else None)
+    else:
+        d = _run_dir_by_id(target)
+    if d is None:
+        return "📭 <b>No runs to tail</b>"
+
+    events = _tail_events(d, n)
+    if not events:
+        return f"📭 <b>No events yet</b> · <code>{_e(_short_tag(d.name))}</code>"
+
+    verbosity = get_verbosity(state)
+    out: List[str] = [f"📰 <b>Last {len(events)} events</b> · <code>{_e(_short_tag(d.name))}</code>"]
+    for ev in events:
+        try:
+            msg = render_event(
+                ev, verbosity=verbosity,
+                mode=str(ev.get("data", {}).get("mode") or "")
+                if isinstance(ev.get("data"), dict) else "",
+                run_id=d.name,
+            )
+        except Exception:
+            continue
+        if msg:
+            out.append(msg)
+    if len(out) == 1:
+        # Nothing rendered at this verbosity — still answer with a stub line.
+        out.append("<i>(no events render at the current verbosity)</i>")
+    text = "\n".join(out)
+    if len(text) > TELEGRAM_MSG_CAP:
+        text = text[:TELEGRAM_MSG_CAP - 1] + "…"
+    return text
+
+
+def _handle_diff_command(run_id: str, *, max_lines: int = 60) -> str:
+    """/diff [run] — --stat-style summary + first ~60 lines of changed-files.diff
+    in a <pre> block, HTML-escaped, hard-capped at 4096 chars. Never raises."""
+    rid = (run_id or "latest").strip()
+    if rid.lower() == "latest":
+        d = latest_live_run() or (_run_dirs()[0] if _run_dirs() else None)
+    else:
+        d = _run_dir_by_id(rid)
+    if d is None:
+        return "📭 <b>Run not found</b>"
+
+    diff_path = d / "changed-files.diff"
+    if not diff_path.exists():
+        return f"📭 <b>No diff</b> · <code>{_e(_short_tag(d.name))}</code>"
+
+    try:
+        text = diff_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return f"⚠️ <b>Could not read diff</b> · <code>{_e(_short_tag(d.name))}</code>"
+
+    lines = text.splitlines()
+    total = len(lines)
+    # Lightweight --stat: count added/removed/changed-file markers.
+    files = sum(1 for ln in lines if ln.startswith("diff --git") or ln.startswith("+++ "))
+    added = sum(1 for ln in lines if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in lines if ln.startswith("-") and not ln.startswith("---"))
+
+    head = (f"📊 <b>Diff</b> · <code>{_e(_short_tag(d.name))}</code>\n"
+            f"~{files} file(s) · +{added}/-{removed} · {total} lines")
+    body_lines = lines[:max_lines]
+    truncated = total > max_lines
+    body = "\n".join(_e(ln) for ln in body_lines)
+    if truncated:
+        body += f"\n… +{total - max_lines} more lines"
+
+    out = f"{head}\n<pre>{body}</pre>"
+    if len(out) > TELEGRAM_MSG_CAP:
+        # Trim the <pre> body to fit, keeping the closing tag.
+        budget = TELEGRAM_MSG_CAP - len(head) - len("\n<pre>") - len("</pre>") - 1
+        if budget < 0:
+            return head[:TELEGRAM_MSG_CAP]
+        out = f"{head}\n<pre>{body[:budget]}…</pre>"
+    return out
+
+
 def handle_command(
     text: str,
     *,
@@ -684,6 +1120,18 @@ def handle_command(
         return _handle_track(["all"], state=state, chat_id=chat_id, state_file=state_file)
     if cmd == "/untrack":
         return _handle_untrack(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/mute":
+        return _handle_mute(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/watch":
+        return _handle_watch(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/quiet":
+        return _handle_quiet(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/health":
+        return _handle_health(state_file)
+    if cmd == "/tail":
+        return _handle_tail(args, state=state)
+    if cmd == "/diff":
+        return _handle_diff_command(args[0] if args else "latest")
     return None
 
 
@@ -716,9 +1164,70 @@ class BotDaemon:
         except Exception as exc:
             logger.debug("telegram setMyCommands failed: %s", exc)
 
+    def _handle_callback_query(self, cbq: dict) -> None:
+        """Dispatch one inline-button callback_query (F1); never raises.
+
+        Whitelist-gate by ``from.id`` (a non-whitelisted tap is silently dropped
+        — no reply, no answer). Parse ``data`` = ``"verb:short_run_id"`` (>64
+        bytes or an unknown verb => safe no-op). Route files/why/diff to the
+        existing read-only helpers, reply to the chat, then ALWAYS
+        ``answer_callback_query`` so the client's button spinner clears.
+        """
+        try:
+            sender = cbq.get("from") or {}
+            user_id = sender.get("id")
+            if user_id is None:
+                return
+            try:
+                user_id = int(user_id)
+            except Exception:
+                return
+            if user_id not in self.allowed_user_ids():
+                logger.debug("ignoring callback from non-whitelisted user %s", user_id)
+                return  # not whitelisted -> no reply AND no answer
+
+            query_id = cbq.get("id")
+            message = cbq.get("message") or {}
+            chat = message.get("chat") or {}
+            chat_id = chat.get("id")
+            data = cbq.get("data")
+
+            reply: Optional[str] = None
+            # Parse + route only well-formed, in-bounds, known-verb callbacks; any
+            # deviation is a safe no-op (still answered below).
+            if isinstance(data, str) and len(data.encode("utf-8")) <= 64:
+                verb, _, tag = data.partition(":")
+                verb = verb.strip().lower()
+                if verb in CALLBACK_VERBS and tag:
+                    run_id = _resolve_short_tag(tag.strip())
+                    if run_id:
+                        if verb == "files":
+                            reply = _handle_files(run_id)
+                        elif verb == "why":
+                            reply = _handle_why(run_id)
+                        elif verb == "diff":
+                            reply = _handle_diff(run_id)
+
+            if reply and chat_id is not None:
+                try:
+                    self.client.send_message(chat_id, reply)
+                except Exception as exc:
+                    logger.debug("telegram callback reply failed: %s", exc)
+            # ALWAYS answer (whitelisted) so the client spinner clears, even on a no-op.
+            try:
+                self.client.answer_callback_query(query_id)
+            except Exception as exc:
+                logger.debug("telegram answerCallbackQuery failed: %s", exc)
+        except Exception as exc:
+            logger.debug("telegram callback processing failed: %s", exc)
+
     def _process_update(self, update: dict) -> None:
         """Handle one update; never raises."""
         try:
+            cbq = update.get("callback_query")
+            if isinstance(cbq, dict):
+                self._handle_callback_query(cbq)
+                return
             message = update.get("message") or update.get("edited_message")
             if not isinstance(message, dict):
                 return
@@ -735,14 +1244,26 @@ class BotDaemon:
             if user_id not in self.allowed_user_ids():
                 logger.debug("ignoring non-whitelisted user %s", user_id)
                 return
+            text = message.get("text") or ""
             reply = handle_command(
-                message.get("text") or "",
+                text,
                 state=load_state(self.state_file),
                 state_file=self.state_file,
                 chat_id=chat_id,
             )
             if reply:
-                self.client.send_message(chat_id, reply)
+                # Attach the [📂 Files] [❓ Why] [📊 Diff] inline keyboard to
+                # /status so the most-recent run is one tap away (F1).
+                markup = None
+                try:
+                    cmd = text.strip().split()[0].split("@", 1)[0].lower() if text.strip() else ""
+                    if cmd == "/status":
+                        dirs = _run_dirs()
+                        if dirs:
+                            markup = build_run_keyboard(dirs[0].name)
+                except Exception:
+                    markup = None
+                self.client.send_message(chat_id, reply, reply_markup=markup)
         except Exception as exc:
             logger.debug("telegram update processing failed: %s", exc)
 
@@ -770,9 +1291,10 @@ class BotDaemon:
             logger.debug("telegram live-run tail failed: %s", exc)
         return processed
 
-    def _send_tail(self, chat_id: Any, text: str) -> None:
+    def _send_tail(self, chat_id: Any, text: str,
+                   reply_markup: Optional[dict] = None) -> None:
         try:
-            self.client.send_message(chat_id, text)
+            self.client.send_message(chat_id, text, reply_markup=reply_markup)
         except Exception as exc:  # client already swallows; belt-and-suspenders
             logger.debug("telegram tail send failed: %s", exc)
 
@@ -849,6 +1371,12 @@ class BotDaemon:
                             continue
                         if not msg:
                             continue
+                        # F2: drop progress chatter for a muted / quiet-hours chat.
+                        # Failures (a failed step / failed dispatch) are classified
+                        # non-progress and always pass through; the run's final
+                        # summary card below is sent unconditionally.
+                        if _suppressed(chat_key, _event_class(ev), state):
+                            continue
                         # Label every message with a leading short run tag so
                         # concurrent tracked runs are distinguishable in a shared
                         # chat. render_event already appends its own ' · <code>'
@@ -860,7 +1388,10 @@ class BotDaemon:
                     meta = _read_meta(run_dir)
                     if meta is not None:
                         card = self._final_summary_card(run_id, meta)
-                        self._send_tail(chat_key, f"<code>{_e(short)}</code> {card}")
+                        self._send_tail(
+                            chat_key, f"<code>{_e(short)}</code> {card}",
+                            reply_markup=build_run_keyboard(run_id),
+                        )
                         sent += 1
                         runs.pop(run_id, None)
                         dirty = True

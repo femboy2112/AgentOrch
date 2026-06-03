@@ -83,6 +83,12 @@ or a failed send never crashes the loop.
 | `/verbosity [level]` | Show or set the persisted default verbosity |
 | `/track [latest\|<run_id>\|all]` | Follow a live run's progress (default `latest`; `all` aliased as `/showliveall`) |
 | `/untrack [<run_id>\|all]` | Stop following one run (bare `/untrack` = all) |
+| `/mute [30m\|2h\|on]` | Silence progress chatter for this chat (failures + final summary still delivered) |
+| `/watch` | Resume updates (clear any mute) |
+| `/quiet HH:MM-HH:MM` | Quiet hours / DND window; `/quiet off` clears it |
+| `/health` | Poller liveness (non-destructive), live-run count, last outcome, recent reroute/usage-wall signals |
+| `/tail [N=10] [run]` | Last N rendered events of a run via `render_event` (bounded read) |
+| `/diff [run]` | Changed-files diff `--stat` summary + first ~60 lines in a `<pre>` block (HTML-escaped, 4096-char cap) |
 
 ### Live-run tracking (TEMPORARY, cross-process)
 
@@ -108,14 +114,77 @@ cursor so history is never re-sent.
 > orchestrator resident in memory, any caller can subscribe to a live run
 > directly and `/track` becomes obsolete.
 
+## Inline-keyboard buttons + callback dispatch (F1)
+
+The end-of-run summary card and `/status` carry an inline keyboard —
+**[📂 Files] [❓ Why] [📊 Diff]**. Tapping a button fires a `callback_query`
+the bot dispatches:
+
+- `TelegramClient.answer_callback_query(id, text="")` and `reply_markup`
+  passthrough on `send_message` are thin best-effort `_post` wrappers.
+- `callback_data` is `"verb:short_run_id"` (`verb` ∈ `files|why|diff`), kept
+  ≤64 bytes by using the run's short tag; the bot resolves it back to the full
+  run dir.
+- `BotDaemon._process_update` routes a `callback_query` through
+  `_handle_callback_query`: it whitelist-gates by `callback_query.from.id`
+  (a non-whitelisted tap is silently dropped — no reply, no answer), routes
+  files/why/diff to the existing read-only helpers, replies to the chat, then
+  **always** answers the callback so the client's button spinner clears.
+- An unknown verb, oversized `data` (>64 bytes), or an unresolvable run id is a
+  safe no-op (still answered when the user is whitelisted).
+
+## Mute, watch & quiet hours (F2)
+
+Per-chat "stop buzzing me" controls. Preferences live under
+`state["chats"][str(chat_id)]` = `{mute_until, quiet_window}` in the bot state
+file (outside the repo), so they are per-chat and persist across restarts.
+
+- `/mute [30m|2h|on]` — `on` (or bare `/mute`) mutes indefinitely; a duration
+  (`30m`, `2h`, `90s`, or a bare number = minutes) mutes until `now + duration`.
+- `/watch` — clears the mute.
+- `/quiet HH:MM-HH:MM` — a daily quiet-hours window (overnight windows like
+  `23:00-07:00` wrap correctly). `/quiet off` clears it. A malformed window is
+  rejected with an error reply (never raises, never persists).
+
+**Policy:** while a chat is muted or inside its quiet window, **progress
+chatter is dropped but failures and the end-of-run summary card are ALWAYS
+delivered.** The single predicate `harness.telegram._suppressed(chat_id,
+event_kind, state, *, now=None)` enforces this and is consulted on **both**
+delivery paths — the dispatch-side `TelegramNotifier` (live-reads the bot state
+each event, same pattern as the dynamic `/verbosity` reader) and the bot's
+`/track` tail. The helper accepts an injected `now` (datetime or epoch) so the
+time-of-day logic is deterministically testable, fails open (delivers) on any
+garbage, and never raises.
+
+## Read-only workflow commands (F3)
+
+Three diagnostic, read-only commands. All are length-guarded under Telegram's
+4096-char per-message cap, HTML-escape any run-derived content, and never raise.
+
+- `/health` — answers four things from the filesystem + the poller lock:
+  - **Poller liveness** via a **non-destructive** flock probe
+    (`_poller_alive`): it tries the lock *non-blocking*; if it's already held a
+    poller is alive; if it's free the probe takes it and **immediately releases
+    it** — it never steals or holds the singleton `getUpdates` lock.
+  - **Live-run count** (`live_run_dirs`), the **last finished outcome**
+    (most-recent run with a terminal `meta.json`), and any **recent
+    reroute/fallback or usage-wall** signals scraped from the *tails* of the
+    newest few `events.jsonl` files (bounded read).
+- `/tail [N=10] [run]` — the last `N` events of a run (default the latest live
+  or most-recent run) rendered through the same `render_event` formatter at the
+  chat's current verbosity, from a bounded tail read of `events.jsonl`.
+- `/diff [run]` — a lightweight `--stat`-style header (file count, +added/-removed,
+  total lines) plus the first ~60 lines of `changed-files.diff` in a `<pre>`
+  block, HTML-escaped and hard-capped at 4096 chars.
+
 ## Upcoming & Planned Features (Fast-Follow)
 
-The following UI components and integrations are planned but not yet implemented in the current build:
+The following are planned but not yet implemented in the current build:
 
-- **Pinned Live Status Card**: A single, in-place edited status card pinned at the top of the chat, tracking the active worker, real-time elapsed duration, ETA, and progress bar for the active build.
-- **Inline Keyboards**: Inline-keyboard buttons and `callback_query` dispatch for interactive bot menus.
-- **Notification Management**: `/mute`, `/watch`, quiet-hours, notification digest/batching.
-- **Workflow Tools**: `/health`, `/tail`, `/diff`, per-event filters, multi-run labels, `/retry`/`/open-issue` handoff.
+- **Notification digest/batching**: still deferred (hot-path delivery risk).
+- **Deferred again**: per-event filters, multi-run labels, and
+  `/retry`/`/open-issue` handoff (the latter owned by the Phase-3 singleton's
+  auto-dispatch).
 
 ## Security notes
 
