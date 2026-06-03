@@ -263,6 +263,36 @@ def _decide_reconcile_status(
     return "run"
 
 
+def _resolve_reconcile_disposition(
+    reconcile_disposition: Optional[str],
+    mission_critical: bool,
+) -> str:
+    """Resolve the effective reconcile disposition (#71).
+
+    ``reconcile_disposition`` is None when the operator did NOT pass
+    --reconcile-disposition (argparse default), else the literal flag value.
+    --mission-critical semantically means "this must actually work", so an
+    UNSPECIFIED disposition under --mission-critical now defaults to "fail"
+    (a confirmed dead-wiring finding blocks the run) instead of "warn".
+
+    Cases:
+      1. None + mission_critical=True  -> "fail"
+      2. None + mission_critical=False -> "warn" (unchanged)
+      3. explicit "warn" + mission_critical=True -> honor "warn", but warn loudly
+         that reconcile findings will NOT gate the run.
+      4. explicit "fail"/"open-task" (any mission_critical) -> use unchanged.
+    """
+    if reconcile_disposition is None:
+        return "fail" if mission_critical else "warn"
+    if reconcile_disposition == "warn" and mission_critical:
+        logger.warning(
+            "--reconcile-disposition warn under --mission-critical: reconcile "
+            "findings (including CONFIRMED dead wiring) will NOT gate the run or "
+            "flip the exit code. Pass --reconcile-disposition fail to hard-gate."
+        )
+    return reconcile_disposition
+
+
 def plan_file_sha256(path: Union[str, Path]) -> str:
     """Return the sha256 (hex) of a plan file's raw bytes (#56).
 
@@ -1440,16 +1470,18 @@ async def dispatch_async(
 
     # Reconciliation / Integration-Skeptic station (#43). Opt-in via --reconcile
     # or AGY_RECONCILE=1; default-ON for --mission-critical (the runs where dead
-    # wiring is most expensive to discover late). Disposition defaults to "warn"
-    # (report loudly as a distinct status + durable artifact, never fail the run)
-    # — including under --mission-critical, per the operator's chosen default; an
-    # operator who wants a hard gate passes --reconcile-disposition fail.
+    # wiring is most expensive to discover late). Disposition default depends on
+    # mission-critical (#71): when --reconcile-disposition is UNSPECIFIED it is
+    # "warn" normally, but "fail" under --mission-critical (a confirmed dead-wiring
+    # finding must block a run the operator declared must-actually-work). An
+    # explicit --reconcile-disposition is always honored; explicit "warn" under
+    # --mission-critical is honored too but logs a loud non-gating warning.
     reconcile_enabled = bool(
         reconcile
         or mission_critical
         or os.environ.get("AGY_RECONCILE", "").lower() in ("1", "true", "on")
     )
-    recon_disposition = reconcile_disposition or "warn"
+    recon_disposition = _resolve_reconcile_disposition(reconcile_disposition, mission_critical)
 
     # Where the worker actually writes files. Default = AgentOrch repo root,
     # which preserves the prior behaviour exactly.
