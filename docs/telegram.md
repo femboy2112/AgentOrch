@@ -44,9 +44,16 @@ Each level is a strict superset of the previous one:
 | Level | Adds |
 | --- | --- |
 | `quiet` | dispatch start + dispatch finish only |
-| `normal` | + step started/completed, + failures/stalls (verifier-fail / oom / stalled) |
-| `verbose` | + adversarial iteration outcomes, fallback reroutes, plan/reconcile transitions |
+| `normal` | + step started/completed, + failures/stalls (verifier-fail / oom / stalled), + worker spin-ups, + adversarial rounds (draft/verdict/rotation), + plan/reconcile/fallback transitions |
+| `verbose` | + ToT branch activity + finer per-iteration detail |
 | `debug` | + heartbeats + per-call token usage |
+
+### Rich Stream Output
+The output uses a distinct visual language with glyphs for quick scanning:
+- **Run Header Card**: At `dispatch_started`, showing mode and run ID.
+- **Plan Tree**: At `plan.completed`, rendering the steps structure.
+- **Step Cards**: Every step outputs `▸ Step 3/8` and `✅ Step 3/8 done` with exact verifier vs critic outcomes (`✅` vs `☑️`).
+- **Adversarial Rounds**: Emits the `✍️ Draft`, `♻️ Verdict`, and `↪️ Rotation` vertical story so it is visible at the `normal` verbosity level.
 
 A polished final-summary card (success/fail, confidence, duration, changed-file
 count, token grand total) is always sent at the end. Raw stderr lines are never
@@ -68,8 +75,11 @@ or a failed send never crashes the loop.
 | --- | --- |
 | `/start` | Greet and confirm this chat will receive build updates |
 | `/help` | List commands |
-| `/status` | Summarize the most recent run (`runs/<id>/meta.json`), or "in progress" if it has no meta yet |
-| `/runs [N=5]` | Compact list of the N most recent runs |
+| `/status` | Summarize the most recent run (`runs/<id>/meta.json`), or "in progress" |
+| `/summary [latest\|<run_id>]` | Rich recap card from `meta.json` with outcome, mode, duration, confidence, and reconcile findings |
+| `/files [latest\|<run_id>]` | Changed-file list with added/modified/deleted glyphs |
+| `/why [latest\|<run_id>]` | Explain the verdict: verified/critic/stalled status and any full reconcile findings |
+| `/runs [N=5]` | Compact list of the N most recent runs, showing confidence chips and relative age |
 | `/verbosity [level]` | Show or set the persisted default verbosity |
 | `/track [latest\|<run_id>\|all]` | Follow a live run's progress (default `latest`; `all` aliased as `/showliveall`) |
 | `/untrack [<run_id>\|all]` | Stop following one run (bare `/untrack` = all) |
@@ -97,6 +107,15 @@ cursor so history is never re-sent.
 > This command is **explicitly temporary**: once the Phase 3 singleton makes the
 > orchestrator resident in memory, any caller can subscribe to a live run
 > directly and `/track` becomes obsolete.
+
+## Upcoming & Planned Features (Fast-Follow)
+
+The following UI components and integrations are planned but not yet implemented in the current build:
+
+- **Pinned Live Status Card**: A single, in-place edited status card pinned at the top of the chat, tracking the active worker, real-time elapsed duration, ETA, and progress bar for the active build.
+- **Inline Keyboards**: Inline-keyboard buttons and `callback_query` dispatch for interactive bot menus.
+- **Notification Management**: `/mute`, `/watch`, quiet-hours, notification digest/batching.
+- **Workflow Tools**: `/health`, `/tail`, `/diff`, per-event filters, multi-run labels, `/retry`/`/open-issue` handoff.
 
 ## Security notes
 

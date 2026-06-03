@@ -170,6 +170,40 @@ class TelegramClient:
             },
         )
 
+    def edit_message_text(
+        self,
+        chat_id: Any,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Edit an existing message. Best-effort; returns the API result or None."""
+        if not self.configured or chat_id is None:
+            return None
+        params: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+        if reply_markup is not None:
+            params["reply_markup"] = json.dumps(reply_markup)
+        return self._post("editMessageText", params)
+
+    def pin_chat_message(self, chat_id: Any, message_id: int) -> Optional[dict]:
+        """Pin a message. Best-effort; returns the API result or None."""
+        if not self.configured or chat_id is None:
+            return None
+        return self._post("pinChatMessage", {"chat_id": chat_id, "message_id": message_id})
+
+    def unpin_chat_message(self, chat_id: Any, message_id: int) -> Optional[dict]:
+        """Unpin a message. Best-effort; returns the API result or None."""
+        if not self.configured or chat_id is None:
+            return None
+        return self._post("unpinChatMessage", {"chat_id": chat_id, "message_id": message_id})
+
     def set_my_commands(self, commands: List[Dict[str, str]]) -> Optional[dict]:
         """Register the bot's command list with Telegram (setMyCommands).
 
@@ -390,7 +424,11 @@ def render_event(
     if kind == "lifecycle":
         ev = data.get("event")
         if ev == "dispatch_started":
-            return f"🟢 <b>Build started</b> · <code>{safe_mode}</code> · run <code>{rid}</code>"
+            detail = data.get("detail") or {}
+            gen_chain = detail.get("generator_chain") or []
+            orch = " · ".join(str(w) for w in gen_chain)
+            orch_line = f"\n<i>orchestrating {_e(orch)}</i>\n" if orch else ""
+            return f"🟢 <b>Build started</b>\n{orch_line}\nmode <code>{safe_mode}</code> · run <code>{rid}</code>"
         if ev == "dispatch_finished":
             # The polished end-of-run card is owned by TelegramNotifier.finished()
             # (success/fail, duration, files, tokens). A bare marker here would be
@@ -462,10 +500,10 @@ def render_event(
                 if str(outcome) in _FAILURE_OUTCOMES:
                     ok = "❌"
                 elif outcome in ("verified", "approved"):
-                    ok = "✅"
+                    ok = "✅" if outcome == "verified" else "☑️"
                 else:
                     ok = "▪"
-                return f"{ok} <b>Step {pos} done</b> · <i>{title}</i>{_run_tag(rid)}"
+                return f"{ok} <b>Step {pos} done</b> · <i>{title}</i>\n   {_e(outcome)}{_run_tag(rid)}"
 
         # ---- ADVERSARIAL ROUNDS — normal and above (operator request) ----- #
         # The operator was "not seeing adversarial rounds"; surface the draft
@@ -507,6 +545,17 @@ def render_event(
         if level >= 1:
             if phase == "fallback":
                 return f"↪️ <b>Reroute</b> · <i>{_e(orch.get('action') or 'fallback')}</i>{_run_tag(rid)}"
+            if phase == "plan" and action == "completed":
+                total = orch.get("step_total") or 0
+                titles = orch.get("step_titles") or []
+                lines = [f"📋 <b>Plan ready</b> · <b>{total} steps</b>{_run_tag(rid)}"]
+                for i, t in enumerate(titles, 1):
+                    prefix = "└" if i == len(titles) else "├"
+                    lines.append(f"{prefix} {i} · {_e(t)}")
+                    if i >= 12 and len(titles) > 13:
+                        lines.append(f"└ … +{len(titles) - 12} more")
+                        break
+                return "\n".join(lines)
             if phase in ("plan", "reconcile"):
                 act = _e(action or phase)
                 return f"🗂 <b>{_e(str(phase).title())}</b> · <i>{act}</i>{_run_tag(rid)}"

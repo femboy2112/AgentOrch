@@ -69,6 +69,9 @@ logger = logging.getLogger(__name__)
 # in sync with handle_command + HELP_TEXT.
 BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "status", "description": "most recent run (or in-progress)"},
+    {"command": "summary", "description": "rich recap card for a run"},
+    {"command": "files", "description": "list files changed by a run"},
+    {"command": "why", "description": "explain the verdict/reconciliation"},
     {"command": "runs", "description": "recent runs (default 5)"},
     {"command": "track", "description": "follow a live run (latest | <id> | all)"},
     {"command": "untrack", "description": "stop following a live run"},
@@ -115,6 +118,20 @@ def save_state(state: dict, path: Optional[str] = None) -> None:
 
 def get_verbosity(state: dict) -> str:
     return normalize_verbosity(state.get("verbosity") or DEFAULT_VERBOSITY)
+
+
+def _fmt_age(timestamp: float) -> str:
+    import time
+    diff = time.time() - timestamp
+    if diff < 60:
+        return f"{int(diff)}s ago"
+    m = int(diff / 60)
+    if m < 60:
+        return f"{m}m ago"
+    h = int(m / 60)
+    if h < 24:
+        return f"{h}h ago"
+    return f"{int(h / 24)}d ago"
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +389,119 @@ def summarize_latest() -> str:
     return "\n".join(lines)
 
 
+def summarize_run(run_id: str) -> str:
+    if run_id.lower() == "latest":
+        d = latest_live_run() or (_run_dirs()[0] if _run_dirs() else None)
+    else:
+        d = _run_dir_by_id(run_id)
+    if not d:
+        return "📭 <b>Run not found</b>"
+    meta = _read_meta(d)
+    if not meta:
+        return "⏳ <b>Run in progress</b> (no summary yet)"
+    
+    success = bool(meta.get("success"))
+    mode = _e(meta.get("mode") or "")
+    dur = _fmt_duration(meta.get("duration_s"))
+    changed = meta.get("changed_files")
+    n_files = len(changed) if isinstance(changed, list) else 0
+    added = len(meta.get("added") or [])
+    modified = len(meta.get("modified") or [])
+    deleted = len(meta.get("deleted") or [])
+    
+    quality = meta.get("quality") or {}
+    conf = _e(quality.get("confidence") or "n/a")
+    verified = quality.get("verified")
+    critic = quality.get("critic_approved")
+    iters = quality.get("iterations_used")
+    
+    tokens = meta.get("tokens") or {}
+    grand = tokens.get("grand_total") or {}
+    total_tokens = grand.get("total_tokens") or 0
+    
+    recon = meta.get("reconciliation") or {}
+    verdict = recon.get("verdict")
+    
+    icon = "✅" if success else "❌"
+    
+    lines = [
+        f"{icon} <b>Run Summary</b> · <code>{_e(d.name)}</code>",
+        f"mode <code>{mode}</code> · {conf} · {_e(dur)}",
+        f"<b>Files</b>: {n_files} (+{added}/~{modified}/-{deleted})",
+        f"<b>Quality</b>: verifier {'✅' if verified else '❌'} · critic {'✓' if critic else '✗'} · iters: {iters}",
+    ]
+    if verdict:
+        lines.append(f"<b>Reconcile</b>: {_e(verdict)}")
+    lines.append(f"<b>Tokens</b>: {total_tokens:,}")
+    return "\n".join(lines)
+
+
+def _handle_files(run_id: str) -> str:
+    if run_id.lower() == "latest":
+        d = latest_live_run() or (_run_dirs()[0] if _run_dirs() else None)
+    else:
+        d = _run_dir_by_id(run_id)
+    if not d:
+        return "📭 <b>Run not found</b>"
+    meta = _read_meta(d)
+    if not meta:
+        return "⏳ <b>Run in progress</b> (no files yet)"
+    changed = meta.get("changed_files") or []
+    if not changed:
+        return "No files changed."
+    added = set(meta.get("added") or [])
+    deleted = set(meta.get("deleted") or [])
+    
+    out = [f"📁 <b>Changed files</b> ({len(changed)})"]
+    for i, f in enumerate(changed):
+        if i >= 30:
+            out.append(f"… +{len(changed) - 30} more")
+            break
+        glyph = "➕" if f in added else ("➖" if f in deleted else "📝")
+        out.append(f"{glyph} <code>{_e(f)}</code>")
+    return "\n".join(out)
+
+
+def _handle_why(run_id: str) -> str:
+    if run_id.lower() == "latest":
+        d = latest_live_run() or (_run_dirs()[0] if _run_dirs() else None)
+    else:
+        d = _run_dir_by_id(run_id)
+    if not d:
+        return "📭 <b>Run not found</b>"
+    meta = _read_meta(d)
+    if not meta:
+        return "⏳ <b>Run in progress</b>"
+    
+    quality = meta.get("quality") or {}
+    note = quality.get("note") or ""
+    verified = quality.get("verified")
+    critic = quality.get("critic_approved")
+    stalled = quality.get("stalled")
+    
+    recon = meta.get("reconciliation") or {}
+    findings = recon.get("findings") or []
+    
+    out = [f"🤔 <b>Why?</b> · <code>{_e(d.name)}</code>", ""]
+    if note:
+        out.append(f"<i>{_e(note)}</i>\n")
+    
+    v_str = "✅ verified" if verified else "❌ not verified"
+    c_str = "✅ critic approved" if critic else "❌ critic rejected"
+    s_str = "⚠️ stalled" if stalled else ""
+    out.append(f"<b>Status</b>: {v_str} · {c_str} {s_str}")
+    
+    if findings:
+        out.append("\n<b>Findings:</b>")
+        for f in findings:
+            name = f.get("name")
+            cls = f.get("classification")
+            sk = f.get("sub_kind")
+            out.append(f"• {_e(name)} · {_e(cls)} · {_e(sk)}")
+            
+    return "\n".join(out)
+
+
 def summarize_runs(n: int = 5) -> str:
     dirs = _run_dirs()
     if not dirs:
@@ -390,14 +520,25 @@ def summarize_runs(n: int = 5) -> str:
             # a terminal meta is shown as aborted, so it stops inflating the
             # open-run count forever.
             if is_live_run(d):
-                out.append(f"• <code>{_e(d.name)}</code> · in progress")
+                try:
+                    age = _fmt_age(d.stat().st_mtime)
+                except Exception:
+                    age = ""
+                out.append(f"• <code>{_e(d.name)}</code> · in progress · {age}")
             else:
                 out.append(f"⚠️ <code>{_e(d.name)}</code> · aborted (no result)")
             continue
         icon = "✅" if meta.get("success") else "❌"
         mode = _e(meta.get("mode") or "")
         dur = _fmt_duration(meta.get("duration_s"))
-        out.append(f"{icon} <code>{_e(d.name)}</code> · {mode} · {_e(dur)}")
+        quality = meta.get("quality") or {}
+        raw_conf = quality.get("confidence")
+        conf_str = f" · {_e(str(raw_conf).strip())}" if raw_conf else ""
+        try:
+            age = _fmt_age(d.stat().st_mtime)
+        except Exception:
+            age = ""
+        out.append(f"{icon} <code>{_e(d.name)}</code> · {mode} · {_e(dur)}{conf_str} · {age}")
     return "\n".join(out)
 
 
@@ -407,6 +548,9 @@ def summarize_runs(n: int = 5) -> str:
 HELP_TEXT = (
     "🤖 <b>AgentOrch build bot</b>\n"
     "/status — most recent run\n"
+    "/summary [latest|<run_id>] — rich recap card\n"
+    "/files [latest|<run_id>] — list changed files\n"
+    "/why [latest|<run_id>] — explain the verdict\n"
     "/runs [N] — recent runs (default 5)\n"
     "/verbosity [level] — show or set default ("
     + " / ".join(VERBOSITY_ORDER)
@@ -514,6 +658,12 @@ def handle_command(
         return HELP_TEXT
     if cmd == "/status":
         return summarize_latest()
+    if cmd == "/summary":
+        return summarize_run(args[0] if args else "latest")
+    if cmd == "/files":
+        return _handle_files(args[0] if args else "latest")
+    if cmd == "/why":
+        return _handle_why(args[0] if args else "latest")
     if cmd == "/runs":
         return summarize_runs(args[0] if args else 5)
     if cmd == "/verbosity":
