@@ -100,6 +100,22 @@ def _transport_backoff_seconds(attempt: int) -> float:
     return base * attempt
 
 
+# Backoff applied between re-attempts when a provider returns a usage/quota wall
+# (issue: usage-wall cascade). The cycles>1 design exists precisely so a walled
+# provider's quota can RECOVER before the cycle comes back around to it — but
+# that premise is only meaningful if the loop actually waits between attempts
+# instead of spinning the whole cycles*providers budget in the seconds it takes
+# the CLIs to emit their quota errors. The wait is per-attempt (so the elapsed
+# time accumulates toward a real rate-limit window) and overridable; tests pin
+# it to 0 to stay sub-second. Default kept modest so a non-pathological run with
+# a single transient wall pays only a small price.
+def _usage_wall_backoff_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("AGY_USAGE_WALL_BACKOFF", "5") or "5"))
+    except ValueError:
+        return 5.0
+
+
 def make_fallback_agent(
     chain: List[Type[AgentInstance]],
     cycles: int = 3,
@@ -247,8 +263,18 @@ def make_fallback_agent(
             attempts = 0
             # Per-provider count of bounded same-provider transport retries already
             # spent, so a flapping link can't loop a single provider forever (#57).
+            # This budget is SCOPED PER CYCLE (reset whenever a fresh cycle of the
+            # base chain begins) so a link that flaps once per cycle still earns its
+            # bounded retries in every later cycle instead of spending the whole
+            # budget in cycle 1 and getting none afterward. ``base_len`` lets us
+            # detect cycle boundaries by counting how many base-chain slots the
+            # *normal sequence* has consumed (re-spliced same-provider retries and
+            # rule re-routes don't advance the cycle).
+            base_len = len(base) if base else 1
+            base_consumed = 0  # normal-sequence chain slots drained so far
             transport_retries_used: Dict[Type[AgentInstance], int] = {}
             max_transport_retries = _transport_retries()
+            usage_wall_backoff = _usage_wall_backoff_seconds()
             # Global budget on watchdog-rule re-route splices. Without a cap a self-
             # or mutually-referencing rules table (e.g. A trips 'verbose'->[B],
             # B trips 'stalled'->[A]) re-splices a fresh target every failure, so
@@ -261,8 +287,23 @@ def make_fallback_agent(
             reroute_budget = total + sum(
                 len(targets) for targets in self._watchdog_rules.values()
             ) * self._cycles
+            # Count of items spliced to the FRONT of pending that are NOT normal-
+            # sequence advances (same-provider transport retries + rule re-routes).
+            # Popping one of these does not advance the cycle, so the per-cycle
+            # transport budget must not reset on it.
+            respliced = 0
             while pending:
                 agent_cls = pending.pop(0)
+                # A normal-sequence advance (not a re-spliced retry/reroute) drains
+                # one base-chain slot; crossing a base_len boundary starts a fresh
+                # cycle, at which point the per-provider transport-retry budget is
+                # reset so a once-per-cycle flap earns bounded retries again.
+                if respliced > 0:
+                    respliced -= 1
+                else:
+                    if base_consumed and base_consumed % base_len == 0:
+                        transport_retries_used.clear()
+                    base_consumed += 1
                 attempts += 1
                 label = agent_cls.__name__
                 try:
@@ -291,10 +332,26 @@ def make_fallback_agent(
                     looked_like_transport = (
                         reason == WATCHDOG_TRANSPORT_STALL or is_transport_error(stderr)
                     )
+                    # A watchdog TRANSPORT-STALL means the provider emitted noise but
+                    # made NO forward progress for the entire stall window
+                    # (AGY_TRANSPORT_MAX_SECONDS, ~300s) — it is wedged at the
+                    # transport layer, not a momentary blip. Retrying it on the SAME
+                    # provider re-incurs the full stall window every time with no
+                    # aggregate wall-clock cap (up to ~3x300s = 15min stuck on one
+                    # dead link). So treat a transport-stall like a wedged session:
+                    # do NOT take the bounded same-provider retry path; cycle straight
+                    # to the next provider. A plain transient transport error (a real
+                    # connection reset that fails FAST) still earns its bounded
+                    # same-provider backoff-retries (#57) below.
+                    looked_like_transport_stall = (reason == WATCHDOG_TRANSPORT_STALL)
                     # A wedged session is futile to retry on the same provider (#62):
                     # never take the same-provider transport-retry path for it, even
                     # if earlier transport noise also landed in the accumulated stderr.
+                    # A transport-STALL is excluded for the same "futile, and each
+                    # retry burns a full stall window" reason (cap the cumulative
+                    # same-provider transport time by never stacking stall windows).
                     if (looked_like_transport and not looked_like_wedged
+                            and not looked_like_transport_stall
                             and transport_retries_used.get(agent_cls, 0) < max_transport_retries):
                         n = transport_retries_used.get(agent_cls, 0) + 1
                         transport_retries_used[agent_cls] = n
@@ -316,7 +373,10 @@ def make_fallback_agent(
                         )
                         # Retry the SAME provider next; it does not consume a chain
                         # slot conceptually, but counts toward total attempts above.
+                        # Mark it as re-spliced so the next pop doesn't advance the
+                        # cycle (and thus doesn't reset the per-cycle transport budget).
                         pending.insert(0, agent_cls)
+                        respliced += 1
                         if backoff > 0:
                             await asyncio.sleep(backoff)
                         last_error = exc
@@ -378,6 +438,16 @@ def make_fallback_agent(
                             attempt=attempts,
                             attempt_total=len(self._chain),
                         )
+                    # A usage/quota wall means this provider is rate-limited NOW. The
+                    # cycles>1 design exists so its quota can RECOVER before the cycle
+                    # returns to it — but that premise only holds if the loop actually
+                    # WAITS between attempts instead of spinning the whole
+                    # cycles*providers budget in the seconds it takes the CLIs to emit
+                    # their quota errors. Back off before the next attempt (when one
+                    # remains) so a real rate-limit window has a chance to clear
+                    # (usage-wall cascade). Opt-out with AGY_USAGE_WALL_BACKOFF=0.
+                    if looked_like_usage and usage_wall_backoff > 0 and pending:
+                        await asyncio.sleep(usage_wall_backoff)
                     last_error = exc
                     continue
 

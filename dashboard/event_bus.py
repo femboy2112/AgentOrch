@@ -2,9 +2,43 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import AsyncIterator, Callable, Dict, List, Optional
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read a positive int env knob. 0/unset/garbage -> default; clamp to minimum.
+
+    Follows the repo's AGY_* convention: a healthy default with an env override.
+    """
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except Exception:
+        return default
+    if val <= 0:
+        return default
+    return max(val, minimum)
+
+
+# Per-run in-memory replay buffer cap (drop-oldest ring). A long/chatty master
+# run can emit tens of thousands of token events; without a cap self.queues
+# grows O(total events) and OOMs the broker. Default keeps enough history for
+# late SSE replay on any realistic single run while staying bounded. Older rows
+# are DROPPED from the head — subscribe() keys off _event_id so a resuming
+# subscriber still advances correctly past dropped ids.
+_REPLAY_MAX_DEFAULT = 10_000
+
+# Number of finished+closed runs whose state is retained after close(). A
+# long-lived broker (broker.py runs dispatch_async per job) services many runs;
+# without eviction every run's full history + closed-set entry leaks forever.
+# We keep a small recent window so late SSE replay of the just-finished run
+# still works, then evict the oldest.
+_RETAIN_DEFAULT = 8
 
 _WORKER_EVENT_KINDS = {
     "lifecycle",
@@ -80,6 +114,13 @@ class EventBus:
         self.closed: set[str] = set()
         self._wake: Dict[str, asyncio.Event] = {}
         self._next_ids: Dict[str, int] = {}
+        # FIFO of closed run_ids retained for late replay; oldest evicted first.
+        self._closed_order: List[str] = []
+        # Per-run replay ring cap (drop-oldest) + retained-closed-run window.
+        self._replay_max = _env_int(
+            "AGY_EVENTBUS_REPLAY_MAX", _REPLAY_MAX_DEFAULT, minimum=1
+        )
+        self._retain = _env_int("AGY_EVENTBUS_RETAIN", _RETAIN_DEFAULT, minimum=1)
 
     def reset(self) -> None:
         """Clear all per-run state.
@@ -92,6 +133,7 @@ class EventBus:
         self.closed.clear()
         self._wake.clear()
         self._next_ids.clear()
+        self._closed_order.clear()
 
     def _ensure(self, run_id: str) -> None:
         if run_id not in self.queues:
@@ -132,7 +174,16 @@ class EventBus:
             internal_event["_event_id"] = event_id
 
             self._next_ids[run_id] = max(self._next_ids[run_id], event_id + 1)
-            self.queues[run_id].append(internal_event)
+            q = self.queues[run_id]
+            q.append(internal_event)
+            # Drop-oldest ring buffer: bound in-memory replay history so a
+            # chatty long run can't OOM. subscribe() resumes by _event_id, so
+            # dropping the head is safe for a subscriber that has already
+            # advanced past it; a late subscriber simply starts at the oldest
+            # retained id (the dropped prefix is unrecoverable from memory, as
+            # documented by AGY_EVENTBUS_REPLAY_MAX).
+            if len(q) > self._replay_max:
+                del q[: len(q) - self._replay_max]
 
             for sink in list(self.sinks.get(run_id, [])):
                 try:
@@ -161,24 +212,21 @@ class EventBus:
             except Exception:
                 floor = -1
 
-        events = self.queues[run_id]
-        idx = 0
-        if floor >= 0:
-            while idx < len(events):
-                event_id = events[idx].get("_event_id")
-                if isinstance(event_id, int) and event_id <= floor:
-                    idx += 1
-                    continue
-                break
+        # Track progress by last-delivered _event_id (NOT by list index): the
+        # replay ring may drop the head between wakeups, which would shift list
+        # indices. Keying off the monotonic _event_id keeps a resuming
+        # subscriber correct even when older rows have been dropped.
+        last_delivered = floor
 
         while True:
             events = self.queues[run_id]
-            while idx < len(events):
-                event = events[idx]
-                idx += 1
+            for event in events:
                 event_id = event.get("_event_id")
-                if isinstance(event_id, int) and event_id <= floor:
+                if not isinstance(event_id, int):
                     continue
+                if event_id <= last_delivered:
+                    continue
+                last_delivered = event_id
                 clean = {k: v for k, v in event.items() if k != "_event_id"}
                 yield clean
 
@@ -192,6 +240,14 @@ class EventBus:
         self._ensure(run_id)
         self.sinks[run_id].append(sink)
 
+    def _evict_run(self, run_id: str) -> None:
+        """Fully release every per-run structure for a closed run."""
+        self.queues.pop(run_id, None)
+        self.sinks.pop(run_id, None)
+        self._wake.pop(run_id, None)
+        self._next_ids.pop(run_id, None)
+        self.closed.discard(run_id)
+
     def close(self, run_id: str) -> None:
         self._ensure(run_id)
         if run_id in self.closed:
@@ -201,6 +257,14 @@ class EventBus:
             self._wake[run_id].set()
         except Exception:
             pass
+        # Bound retained finished-run state. Keep the most recent _retain closed
+        # runs (so late SSE replay of a just-finished run still works) and fully
+        # evict everything older — otherwise a long-lived broker accumulates
+        # every run's queue/wake/next-id/closed entry until OOM.
+        self._closed_order.append(run_id)
+        while len(self._closed_order) > self._retain:
+            stale = self._closed_order.pop(0)
+            self._evict_run(stale)
 
     @staticmethod
     def replay_jsonl(path: Path, *, last_event_id: Optional[str] = None) -> List[dict]:

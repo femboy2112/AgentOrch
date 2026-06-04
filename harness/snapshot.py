@@ -22,6 +22,9 @@ IGNORE_DIRS = {
 }
 # Files larger than this aren't diffed line-by-line (content not retained).
 MAX_DIFF_BYTES = 1_000_000
+# Block size for streamed hashing — keeps per-file memory O(block), not O(filesize)
+# so a multi-GB out-dir artifact can't OOM the snapshot. Knob: AGY_SNAPSHOT_BLOCK_BYTES.
+_HASH_BLOCK_BYTES = max(4096, int(os.environ.get("AGY_SNAPSHOT_BLOCK_BYTES", "") or 1024 * 1024))
 
 
 @dataclass
@@ -30,6 +33,10 @@ class FileEntry:
     size: int
     is_text: bool
     content: str | None  # retained only for text files <= MAX_DIFF_BYTES
+    # True when the file is present on disk but could not be read (permission
+    # denied / transient lock). Such an entry is kept in the snapshot — it must
+    # NOT read as a deletion in the diff — but its hash is unknown.
+    unreadable: bool = False
 
 
 @dataclass
@@ -60,22 +67,59 @@ def take_snapshot(root: str | Path) -> Snapshot:
         ]
         for name in filenames:
             fpath = Path(dirpath) / name
-            try:
-                blob = fpath.read_bytes()
-            except OSError:
-                continue
             rel = str(fpath.relative_to(root))
-            is_text = _looks_text(blob)
-            content = None
-            if is_text and len(blob) <= MAX_DIFF_BYTES:
-                content = blob.decode("utf-8")
-            snap.files[rel] = FileEntry(
-                sha256=hashlib.sha256(blob).hexdigest(),
-                size=len(blob),
-                is_text=is_text,
-                content=content,
-            )
+            try:
+                snap.files[rel] = _hash_file(fpath)
+            except OSError:
+                # Present-but-unreadable (chmod 000 / transient lock): keep the
+                # path in the snapshot with an explicit marker rather than dropping
+                # it. Dropping it would make the before/after diff report a still-
+                # present file as DELETED (false delete) and mislead --protect-paths.
+                if fpath.exists():
+                    snap.files[rel] = FileEntry(
+                        sha256="", size=-1, is_text=False, content=None, unreadable=True
+                    )
+                # Truly gone between os.walk and open: leave it out (a real absence).
     return snap
+
+
+def _hash_file(fpath: Path) -> FileEntry:
+    """Hash one file in bounded chunks so memory stays O(block), not O(filesize).
+
+    Only files small enough to be diffable (<= MAX_DIFF_BYTES) ever retain their
+    decoded text content; large artifacts are streamed through the hash and never
+    fully materialized in RAM. Raises OSError if the file can't be read.
+    """
+    hasher = hashlib.sha256()
+    size = 0
+    head = b""  # first block, used for text-sniff + (small files) content retention
+    with open(fpath, "rb") as fh:
+        while True:
+            block = fh.read(_HASH_BLOCK_BYTES)
+            if not block:
+                break
+            if size == 0:
+                head = block
+            hasher.update(block)
+            size += len(block)
+
+    # Text detection only needs the head; a NUL or bad utf-8 in the first block is
+    # decisive, matching the old whole-blob heuristic for any normal file.
+    is_text = _looks_text(head)
+    content = None
+    if is_text and size <= MAX_DIFF_BYTES:
+        # Small + text: safe to read the (already-bounded) bytes for line diffing.
+        # size <= MAX_DIFF_BYTES so this re-read is bounded, not an OOM vector.
+        try:
+            content = fpath.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            content = None
+    return FileEntry(
+        sha256=hasher.hexdigest(),
+        size=size,
+        is_text=is_text,
+        content=content,
+    )
 
 
 @dataclass
@@ -102,6 +146,11 @@ def diff_snapshots(before: Snapshot, after: Snapshot) -> DiffResult:
     for rel in sorted(after_files):
         if rel not in before_files:
             res.added.append(rel)
+        elif after_files[rel].unreadable or before_files[rel].unreadable:
+            # A present-but-unreadable file on either side: we don't know its real
+            # hash, so we can't honestly call it modified. It is still PRESENT, so
+            # it is also not deleted — leave it out of the change lists entirely.
+            continue
         elif after_files[rel].sha256 != before_files[rel].sha256:
             res.modified.append(rel)
     for rel in sorted(before_files):

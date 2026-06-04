@@ -41,6 +41,30 @@ _STEP_HEADER_RE = re.compile(r"^---\s*Step\s+(\d+)\s+Summary\s*---\s*$", re.MULT
 # detail is fine to digest. Bump via MasterWorkflow(recent_steps_verbatim=K).
 DEFAULT_RECENT_STEPS_VERBATIM = 2
 
+# Sentinel summary for a node seeded by a COUNT-based (pre-M5) graph resume,
+# where the real per-node summary was never persisted. _compose_context /
+# _rebuild_linear_context render this as an explicit "context not preserved"
+# note rather than fabricating a "Completed: <task>" stub that would masquerade
+# as the genuine implementation detail a downstream step relies on.
+_MISSING_SUMMARY_SENTINEL = "\x00__AGY_MISSING_SUMMARY__\x00"
+
+
+def _render_step_summary(summary: str, task: str) -> str:
+    """Render a node's persisted summary for downstream context.
+
+    For a real summary, returns it verbatim. For the count-resume sentinel,
+    returns an honest missing-context note keyed off the node's task text — so a
+    downstream step KNOWS the prior step ran in an earlier life but its detailed
+    summary wasn't preserved, instead of being fed an invented "Completed: ..."
+    line it would mistake for real file/symbol detail.
+    """
+    if summary == _MISSING_SUMMARY_SENTINEL:
+        return (
+            f"(prior step completed in an earlier run; its detailed summary was "
+            f"not preserved across resume — task was: {task[:300]})"
+        )
+    return summary
+
 
 def _truncate_orch_title(value: object) -> str:
     return str(value)[:120]
@@ -297,6 +321,10 @@ class MasterWorkflow:
         self.approved = False
         self.stalled = False
         self.iterations_used = 0
+        # Set True if a checkpoint write ever failed (e.g. disk-full / quota): a
+        # multi-hour run is then NOT resumable and the operator must be told, not
+        # left believing progress is being persisted. See _save_checkpoint.
+        self.checkpoint_write_failed = False
 
     def _emit_orchestration(self, **fields) -> None:
         cb = self.event_callback
@@ -458,6 +486,45 @@ class MasterWorkflow:
         status_hash = hashlib.sha256(status.stdout.encode("utf-8")).hexdigest()[:16]
         return f"{head_ref}:{status_hash}"
 
+    def _is_benign_fingerprint_advance(
+        self, stored_fp: Optional[str], current_fp: Optional[str]
+    ) -> bool:
+        """True iff a fingerprint mismatch is just FORWARD progress, not a reset.
+
+        The #37 fingerprint folds HEAD into itself, so the orchestrator's OWN
+        intermediate progress-commit (or an operator/CI snapshot of completed
+        work between crash and resume) flips it — even though no completed work was
+        lost. That would make ``resume_policy=auto`` discard a still-valid
+        checkpoint and re-run finished steps on top of applied work.
+
+        A mismatch is BENIGN when the checkpoint's HEAD is an ANCESTOR of the
+        current HEAD: the tree only moved FORWARD (a commit was added), so every
+        completed step's work is still reachable. A non-benign mismatch — current
+        HEAD is the same or an ancestor of, or unrelated to, the stored HEAD (a
+        ``git reset --hard`` / branch swap that drops completed work) — must still
+        discard the checkpoint. Returns False (conservative: discard) when either
+        fingerprint is missing or git can't answer.
+        """
+        if not stored_fp or not current_fp or stored_fp == current_fp:
+            return False
+        stored_head = stored_fp.rsplit(":", 1)[0]
+        current_head = current_fp.rsplit(":", 1)[0]
+        if not stored_head or stored_head == current_head:
+            # Same commit, only working-tree status differs: that IS the
+            # reset-uncommitted-edits case #37 guards — NOT a benign advance.
+            return False
+        wd = self.working_directory or "."
+        try:
+            # Exit 0 iff stored_head is an ancestor of current_head (forward move).
+            res = subprocess.run(
+                ["git", "-C", str(wd), "merge-base", "--is-ancestor",
+                 stored_head, current_head],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        return res.returncode == 0
+
     def _load_checkpoint(
         self, initial_prompt: str
     ) -> Optional[Tuple[List[str], int, str, Optional[str]]]:
@@ -537,6 +604,17 @@ class MasterWorkflow:
                 "checkpoint); resuming on trust. Pass --fresh to start clean if the "
                 "tree was reset since the checkpoint was written.",
                 completed + 1, len(tasks),
+            )
+        elif self._is_benign_fingerprint_advance(stored_fp, current_fp):
+            # The fingerprint flipped only because the tree moved FORWARD (the
+            # orchestrator's own progress-commit, or an operator/CI snapshot of
+            # completed work) — the checkpoint's HEAD is an ancestor of the current
+            # HEAD, so every finished step's work is still reachable. Resume rather
+            # than forcing a full re-run of completed steps on top of applied work.
+            logger.info(
+                "Master checkpoint base advanced (was %s, now %s) via a forward "
+                "commit; completed work is still present — resuming at step %d/%d.",
+                stored_fp, current_fp, completed + 1, len(tasks),
             )
         elif stored_fp != current_fp:
             if self.resume_policy == "force":
@@ -638,8 +716,31 @@ class MasterWorkflow:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
             os.replace(tmp, self.checkpoint_path)  # atomic: crash mid-write can't corrupt
+            # A previously-failed checkpoint that now succeeds clears the flag.
+            self.checkpoint_write_failed = False
         except Exception as exc:
-            logger.warning("Could not write checkpoint %s: %s", self.checkpoint_path, exc)
+            # A swallowed write failure silently makes a long run NON-resumable: the
+            # operator believes the multi-hour build is checkpointed when nothing
+            # landed on disk. Always log LOUDLY at error level and set a visible
+            # degraded flag so the run's unresumability is surfaced.
+            #
+            # For an UNRECOVERABLE storage failure — disk-full (ENOSPC) or over
+            # quota (EDQUOT) — re-raise so the run aborts loudly rather than
+            # grinding on for hours with no salvage point: every subsequent
+            # checkpoint would fail the same way. For any OTHER write error (e.g. a
+            # transiently bad/misconfigured path) keep the legacy non-fatal swallow
+            # so a single glitchy write doesn't kill an otherwise-healthy run.
+            self.checkpoint_write_failed = True
+            errno = getattr(exc, "errno", None)
+            _UNRECOVERABLE = {28, 122}  # ENOSPC, EDQUOT
+            logger.error(
+                "Could not write checkpoint %s: %s — this run is NOT resumable "
+                "(no checkpoint persisted).%s",
+                self.checkpoint_path, exc,
+                " Free disk space / quota and re-dispatch." if errno in _UNRECOVERABLE else "",
+            )
+            if errno in _UNRECOVERABLE:
+                raise
 
     async def _run_planner(self, initial_prompt: str) -> Tuple[List[str], Optional[str]]:
         """Planner phase: decompose the project into a JSON list of step prompts.
@@ -774,7 +875,15 @@ class MasterWorkflow:
                 workflow_session_id, start_completed_ids,
             )
 
-        steps_since_compaction = 0
+        # Seed the compaction cadence from the steps ALREADY completed before this
+        # resume, not 0. A repeatedly-crashing run that resumes mid-flight every few
+        # steps would otherwise never reach compaction_interval in any single life,
+        # so interval compaction would silently never fire and the run would lean
+        # entirely on the char-cap backstop, carrying an ever-growing session. The
+        # carried project_context already holds the prior steps' summaries, so
+        # accounting for them here is the honest cumulative count. (A fresh run has
+        # start_index=0 and is byte-identical to before.)
+        steps_since_compaction = start_index
         for i in range(start_index, len(tasks)):
             task = tasks[i]
             result = await self._execute_step(
@@ -1050,8 +1159,13 @@ class MasterWorkflow:
         # Step numbers mirror the linear loop's "Step N" so a linear graph's
         # composed context is byte-identical to the flat path's.
         step_no = {nid: idx + 1 for idx, nid in enumerate(order)}
+        by_id = {n.id: n for n in graph.nodes}
         for anc in graph.ancestors(node.id):
-            context += f"\n--- Step {step_no[anc]} Summary ---\n{done[anc].step_summary}\n"
+            rendered = _render_step_summary(
+                done[anc].step_summary,
+                by_id[anc].task if anc in by_id else "",
+            )
+            context += f"\n--- Step {step_no[anc]} Summary ---\n{rendered}\n"
         return context
 
     async def _execute_graph(
@@ -1105,8 +1219,19 @@ class MasterWorkflow:
                     done[nid] = res
         else:
             for nid in order[:start_index]:
+                # Pre-M5 / count-fallback resume: the real per-node summary was
+                # never persisted, only a "first K done" count. We must NOT fabricate
+                # a "Completed: <task text>" stub here — _compose_context would leak
+                # it into a pending downstream node's context AS IF it were the real
+                # implementation detail (file paths / symbols) the original step
+                # produced, silently degrading the downstream prompt. Instead seed an
+                # HONEST sentinel that marks the summary as unavailable; downstream
+                # context composition surfaces it as a missing-context note rather
+                # than inventing content. (The richer M5 done-frontier path above
+                # carries real summaries and is unaffected.)
                 done[nid] = StepResult(
-                    final_output="", step_summary=f"Completed: {by_id[nid].task[:300]}",
+                    final_output="",
+                    step_summary=_MISSING_SUMMARY_SENTINEL,
                     verified=False, approved=False, stalled=False,
                     iterations_used=0, session_id=None,
                 )
@@ -1168,7 +1293,15 @@ class MasterWorkflow:
                     last_done = max(
                         (n for n in order if n in done), key=lambda n: order.index(n)
                     )
-                    self.verified = done[last_done].verified
+                    # Run-level verified is gated on BOTH the converged leaf AND the
+                    # absence of any FAILED node: an intermediate node that failed its
+                    # own verify (whose possibly-broken bytes were already merged into
+                    # the live tree) must drop the whole run to unverified — otherwise
+                    # a leaf that happens to pass false-greens a run carrying broken
+                    # upstream work (fuzz-longrun graph_concurrency).
+                    self.verified = done[last_done].verified and not any(
+                        s == "failed" for s in self.node_status.values()
+                    )
                     self.approved = done[last_done].approved
                     self.stalled = done[last_done].stalled
                     self.iterations_used = done[last_done].iterations_used
@@ -1294,10 +1427,21 @@ class MasterWorkflow:
                         reverify = await verifier.verify(working_directory=str(base_work_dir))
                         result.verified = bool(getattr(reverify, "ok", result.verified))
                     except Exception as exc:
+                        # An errored post-merge re-verify could NOT confirm the merged
+                        # tree is good; keeping the pre-merge GREEN would ship a bad
+                        # reconcile blind. The reconcile rewrote the node's bytes, so
+                        # the pre-merge critic APPROVAL no longer applies to what is in
+                        # the live tree either — the re-verify was the only authority on
+                        # the merged bytes, and it could not run. Drop BOTH signals so
+                        # the node reads as failed, not stale-green (fuzz-longrun
+                        # graph_concurrency).
                         logger.warning(
-                            "Post-merge re-verify failed for node '%s' (%s); "
-                            "keeping the pre-merge verdict.", node.id, exc,
+                            "Post-merge re-verify errored for node '%s' (%s); "
+                            "dropping to unverified (not keeping the pre-merge green).",
+                            node.id, exc,
                         )
+                        result.verified = False
+                        result.approved = False
                 return result
             finally:
                 await ws.close()
@@ -1342,7 +1486,11 @@ class MasterWorkflow:
         context = f"Original Goal: {initial_prompt}\n\n=== Accumulated Implementation ===\n"
         for idx, nid in enumerate(order, 1):
             if nid in done:
-                context += f"\n--- Step {idx} Summary ---\n{done[nid].step_summary}\n"
+                rendered = _render_step_summary(
+                    done[nid].step_summary,
+                    by_id[nid].task if nid in by_id else "",
+                )
+                context += f"\n--- Step {idx} Summary ---\n{rendered}\n"
         return context
 
     @staticmethod

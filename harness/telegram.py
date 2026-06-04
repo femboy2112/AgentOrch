@@ -930,6 +930,14 @@ class TelegramNotifier:
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=int(max_queue))
         self._worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
+        # TTL/mtime cache for the persisted bot_state.json read on the publish
+        # hot path (see _live_state) — avoids per-event blocking file I/O.
+        self._state_cache: dict = {}
+        self._state_cache_ts: Optional[float] = None
+        self._state_cache_mtime: Optional[float] = None
+        # Set once stop()/close() has poison-pilled the worker so a late event
+        # doesn't silently re-spin a daemon thread after teardown.
+        self._stopped = False
         self._state = BuildState(run_id, mode)
         # The dispatch goal/instruction (truncated) — rendered as the bold lead of
         # the header card and the <i>title</i> lead of the status/summary card.
@@ -964,13 +972,55 @@ class TelegramNotifier:
     def _live_state(self) -> dict:
         """Read the persisted bot_state.json live (same pattern as the dynamic
         /verbosity reader) so a mid-run /mute or /quiet takes effect immediately.
-        Best-effort — returns {} on any failure, never raises."""
+        Best-effort — returns {} on any failure, never raises.
+
+        Cached with a short TTL (and an mtime short-circuit) so an event flood
+        does NOT pay a blocking open()+json.load() per event on the synchronous
+        publish path — that serialized disk I/O starved the producing coroutine
+        on a slow/contended/NFS mount. Live /mute//quiet still take effect, just
+        bounded by the TTL (a sub-second lag is harmless). The TTL is tunable via
+        AGY_TELEGRAM_STATE_TTL (seconds; <=0 disables caching = always re-read).
+        """
+        import time as _time
+
         try:
-            with open(state_path(), "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data if isinstance(data, dict) else {}
+            ttl = float(os.environ.get("AGY_TELEGRAM_STATE_TTL", "1.0"))
         except Exception:
-            return {}
+            ttl = 1.0
+        now = _time.monotonic()
+        # Within the TTL window, reuse the cached parse — no syscall at all.
+        if ttl > 0 and self._state_cache_ts is not None and (now - self._state_cache_ts) < ttl:
+            return self._state_cache
+        try:
+            p = state_path()
+            # An mtime short-circuit keeps a refresh cheap (one stat, no parse)
+            # when the file is unchanged across TTL windows; we still re-stat at
+            # most once per TTL so a fresh /mute lands within the window.
+            try:
+                mtime = os.path.getmtime(p)
+            except Exception:
+                mtime = None
+            if (
+                ttl > 0
+                and mtime is not None
+                and self._state_cache_mtime is not None
+                and mtime == self._state_cache_mtime
+            ):
+                self._state_cache_ts = now
+                return self._state_cache
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self._state_cache = data if isinstance(data, dict) else {}
+            self._state_cache_mtime = mtime
+            self._state_cache_ts = now
+            return self._state_cache
+        except Exception:
+            # Cache the empty result too so a missing/garbage file isn't reopened
+            # on every event during the flood.
+            self._state_cache = {}
+            self._state_cache_mtime = None
+            self._state_cache_ts = now
+            return self._state_cache
 
     def _event_kind(self, event: Any) -> str:
         """Classify an event for suppression: 'failure' (a failed/stalled step or
@@ -1009,6 +1059,10 @@ class TelegramNotifier:
             return False
 
     def _ensure_worker(self) -> None:
+        # Don't re-spin a daemon after the notifier was stopped/closed — a stray
+        # late event must not leak a fresh thread post-teardown.
+        if self._stopped:
+            return
         if self._worker is not None and self._worker.is_alive():
             return
         with self._worker_lock:
@@ -1265,6 +1319,56 @@ class TelegramNotifier:
         # Drain so the card actually leaves the process before dispatch returns.
         # Bounded so a hung endpoint can't stall teardown.
         self.flush(timeout=6.0)
+        # Reap the daemon delivery thread now that the guaranteed final-summary
+        # card has been flushed — otherwise the worker blocks on queue.get()
+        # forever and a long-lived broker leaks one live thread (+ its
+        # BuildState/queue closure) per dispatch. Idempotent.
+        self.stop()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Poison-pill the delivery worker and join it (bounded). Idempotent.
+
+        The worker thread blocks on ``queue.get()`` forever waiting for work; a
+        long-lived broker that builds one notifier per dispatch would leak a
+        live thread each time. ``stop()`` enqueues the ``None`` poison pill (which
+        :meth:`_drain_queue` treats as "return") and joins the worker with a
+        bounded timeout so teardown can never hang. Safe to call more than once
+        and safe to call when no worker was ever started. Never raises.
+
+        ``close()``/``shutdown()`` are aliases. :meth:`finished` calls this after
+        the final-summary flush so the guaranteed end-of-run card still goes out
+        before the thread exits.
+        """
+        self._stopped = True
+        worker = self._worker
+        try:
+            # Only enqueue a pill (and pay a join) if a worker actually exists;
+            # otherwise there's nothing to reap.
+            if worker is not None:
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:
+                    # Make room for the pill so the worker is guaranteed to see
+                    # it and exit rather than block forever on a full queue.
+                    try:
+                        self._queue.get_nowait()
+                        self._queue.task_done()
+                    except Exception:
+                        pass
+                    try:
+                        self._queue.put_nowait(None)
+                    except Exception:
+                        pass
+                worker.join(timeout=max(0.0, float(timeout)))
+        except Exception as exc:  # best-effort teardown — never raise
+            logger.debug("telegram notifier stop failed: %s", exc)
+
+    # Aliases so a caller (or a broker) can reap the worker via any common name.
+    def close(self, timeout: float = 2.0) -> None:
+        self.stop(timeout=timeout)
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        self.stop(timeout=timeout)
 
     def _summary_card(self, meta: dict) -> str:
         """Rich multi-line end-of-run card from BuildState + meta (spec §8).

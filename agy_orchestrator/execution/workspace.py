@@ -133,6 +133,28 @@ async def _remove_git_worktree(base: Path, target: Path) -> None:
         logger.debug("worktree remove failed (will rmtree anyway): %s", exc)
 
 
+def _prune_git_worktrees(base: Path) -> None:
+    """Best-effort reconcile of the base repo's ``.git/worktrees`` registry.
+
+    ``git worktree remove`` is the clean path, but when it is skipped or fails
+    (process killed mid-teardown, a locked worktree, or a worktree whose dir we
+    rmtree'd directly), the base repo keeps a stale ``.git/worktrees/<name>``
+    admin entry. On a long, many-node DAG build these accumulate unboundedly and
+    eventually slow / clutter the repo. ``git worktree prune`` drops every admin
+    entry whose working tree no longer exists on disk — which, since we always
+    rmtree the tmp-root in the cleanup ``finally`` first, is exactly the entry we
+    just tore down. Synchronous (not awaited) so it still runs inside a
+    cancellation-shielded teardown, and swallows every error (cleanup must never
+    raise / mask the original failure or block on a missing git)."""
+    try:
+        subprocess.run(
+            ["git", "-C", str(base), "worktree", "prune"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as exc:  # FileNotFoundError, TimeoutExpired, OSError, …
+        logger.debug("worktree prune failed (non-fatal): %s", exc)
+
+
 async def _copy_workspace(base: Path, target: Path) -> None:
     """``shutil.copytree`` with heavy-dir filtering. Runs in a thread so it
     doesn't block the event loop on multi-GB repos."""
@@ -196,12 +218,29 @@ async def candidate_workspace(
             await _copy_workspace(base, workspace)
         yield workspace, backend
     finally:
-        if worktree_active:
-            await _remove_git_worktree(base, workspace)
-        # Belt-and-braces: even if worktree remove "succeeded", nuke the
-        # tmp root so we never leak. ignore_errors so a half-removed
-        # worktree (git dropped some files but not all) can't crash us.
-        shutil.rmtree(tmp_root, ignore_errors=True)
+        # Shield the rmtree from a teardown interruption: if the worktree
+        # remove await re-raises (a CancelledError because the run was killed
+        # mid-cleanup, or any other error), an unguarded ``finally`` would
+        # propagate BEFORE the belt-and-braces rmtree, leaking the tmp-root on
+        # disk. Nesting the rmtree in its own ``finally`` guarantees it always
+        # runs; we re-raise the original interruption afterward so the caller
+        # still sees the cancellation.
+        try:
+            if worktree_active:
+                await _remove_git_worktree(base, workspace)
+        finally:
+            # Belt-and-braces: even if worktree remove "succeeded", nuke the
+            # tmp root so we never leak. ignore_errors so a half-removed
+            # worktree (git dropped some files but not all) can't crash us.
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            # Reconcile the base repo's worktree registry: if the per-node
+            # ``git worktree remove`` was skipped/failed (killed mid-teardown,
+            # locked worktree) we just rmtree'd the working tree out from under a
+            # surviving ``.git/worktrees/<name>`` admin entry. Prune drops every
+            # such orphaned entry so they don't accumulate across a long DAG run.
+            # Synchronous + error-swallowing, so it runs even under cancellation.
+            if worktree_active:
+                _prune_git_worktrees(base)
 
 
 def diff_workspace_against_base(

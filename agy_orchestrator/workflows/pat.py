@@ -78,6 +78,12 @@ class PatWorkflow:
         self.iterations_used = 0      # at least 1 for the direct attempt
         self.stalled = False
         self.approved = False         # carries through from the inner workflow when used
+        # #50/#58 mirror: a stage-1 verifier failure that is INFRA-class (host
+        # timeout / OOM kill) is NOT a code defect, so escalating to the full
+        # MasterWorkflow would burn the expensive plan tax on a host flap.
+        # These signals let the ledger surface the infra cause instead.
+        self.verifier_infra_failed = False
+        self.infra_reason: Optional[str] = None
 
     async def execute(self, initial_prompt: str) -> str:
         # Stage 1: direct generator, no critic.
@@ -93,6 +99,30 @@ class PatWorkflow:
             logger.info("PaT Stage 1 passed verifier — skipping master mode.")
             self.verified = True
             self.approved = True
+            self.stage_used = 0
+            return direct_output
+
+        # #50/#58: an INFRA-class stage-1 failure (the host verifier timed out or
+        # was OOM-killed) is NOT a code defect — regenerating via the full master
+        # plan can't fix a host flap, and escalating would pay the expensive plan
+        # tax for nothing. Mirror the adversarial loop's bail: do NOT invoke
+        # master; surface a distinct infra signal for the run ledger and return
+        # the direct attempt's output unchanged.
+        if stage1_result.timeout or stage1_result.resource_exceeded:
+            self.verifier_infra_failed = True
+            self.infra_reason = (
+                "verifier_timeout" if stage1_result.timeout
+                else "verifier_resource_exceeded"
+            )
+            logger.warning(
+                "PaT Stage 1 verifier failed INFRA-class (%s) — NOT escalating to "
+                "master (a host timeout/OOM is not a code defect): %s",
+                self.infra_reason, stage1_result.message,
+            )
+            self.verified = False
+            self.approved = False
+            self.stalled = True
+            # stage_used stays at the Stage-1 marker; master was never charged.
             self.stage_used = 0
             return direct_output
 

@@ -320,6 +320,34 @@ class AgentInstance(ABC):
         self.transport_max_seconds = float(os.environ.get("AGY_TRANSPORT_MAX_SECONDS", "300") or 0)
         self.transport_recovery_window = float(
             os.environ.get("AGY_TRANSPORT_RECOVERY_WINDOW", "60") or 0)
+        # CUMULATIVE transport-degradation signal (long-run fuzz-harden). The
+        # per-SPELL bounds above measure only the CURRENT contiguous spell and are
+        # HARD-RESET to zero on every recovery window of clean output. Two chronic
+        # wedge cadences dodge that reset forever and stay invisible to the spell:
+        #   (a) a provider that flaps ONE transport error then a clean gap just OVER
+        #       recovery_window, repeated indefinitely — each gap closes the spell and
+        #       zeroes the count, so the count never accumulates and never trips; and
+        #   (b) a provider that degrades for nearly max_seconds, recovers for one
+        #       window, then re-degrades, for hours — no single contiguous spell ever
+        #       exceeds either per-spell bound while it is operationally broken.
+        # The cumulative signal SURVIVES single recovery windows: it counts genuine
+        # transport errors AND degraded wall-clock across the WHOLE call and DECAYS
+        # SLOWLY (not a hard reset) during sustained clean output, so a chronic
+        # flapper net-accumulates and eventually trips WATCHDOG_TRANSPORT_STALL while
+        # a genuine one-off blip followed by SUSTAINED clean output decays back toward
+        # zero and never trips. Decay begins only AFTER a full recovery window of
+        # clean output (so a brief interleaved gap can't erase the accumulation) and
+        # then removes `transport_decay_per_window` of accumulated weight per FURTHER
+        # recovery window of clean time. A flapper whose clean gaps barely exceed one
+        # window therefore decays far less than the +1 each error adds (net positive);
+        # a blip that truly recovers sees many clean windows and decays to nothing.
+        # The cumulative bounds REUSE transport_max_errors / transport_max_seconds, so
+        # there is no new bound to tune; the decay rate is the only addition. A HEALTHY
+        # call emits ZERO transport errors, so this can never arm or trip on it.
+        # Tunable via AGY_TRANSPORT_DECAY_PER_WINDOW (0 disables decay = pure
+        # cumulative, never forgiving — not recommended).
+        self.transport_decay_per_window = float(
+            os.environ.get("AGY_TRANSPORT_DECAY_PER_WINDOW", "1.0") or 0)
         # Set by the watchdog when it trips so callers (and FallbackAgent) can
         # distinguish a runaway from a normal failure. Cleared at each run start.
         self._watchdog_reason: Optional[str] = None
@@ -547,6 +575,18 @@ class AgentInstance(ABC):
         transport_spell_start = [0.0]
         last_transport_err = [0.0]
         transport_spell_active = [False]
+        # CUMULATIVE transport state — survives single recovery windows (the spell
+        # state above does NOT, by design). Decoupled from the spell so a chronic
+        # flapper that keeps closing+reopening spells still accumulates here, and
+        # decays slowly (never hard-resets) during sustained clean output.
+        #   transport_cum_errors:   weighted cumulative transport-error count.
+        #   transport_cum_degraded: cumulative degraded wall-clock seconds.
+        #   last_cum_event:         monotonic time the cumulative state last moved
+        #                           (an error counted, or decay applied) — so clean
+        #                           time since then can be measured at each tick.
+        transport_cum_errors = [0.0]
+        transport_cum_degraded = [0.0]
+        last_cum_event = [0.0]
         # Reset the shared last-progress clock at the start of this attempt so a
         # stale value from a prior attempt can't make the liveness wait think the
         # child is already idle.
@@ -582,6 +622,20 @@ class AgentInstance(ABC):
                     transport_err_count[0] = 1
                 else:
                     transport_err_count[0] += 1
+                # CUMULATIVE accrual (survives recovery windows). Each genuine
+                # transport error adds 1 to the cumulative error weight, and the
+                # wall-clock GAP since the previous transport error is credited to
+                # cumulative degraded time when that gap is short (still inside the
+                # recovery window) — i.e. the provider stayed degraded through it.
+                # A gap LONGER than the recovery window is treated as genuine clean
+                # time, not degraded, so it doesn't inflate the degraded total.
+                if last_transport_err[0] > 0:
+                    gap = now_te - last_transport_err[0]
+                    if (self.transport_recovery_window <= 0
+                            or gap <= self.transport_recovery_window):
+                        transport_cum_degraded[0] += gap
+                transport_cum_errors[0] += 1.0
+                last_cum_event[0] = now_te
                 last_transport_err[0] = now_te
             if stream == "stdout":
                 _mark_progress()
@@ -726,6 +780,54 @@ class AgentInstance(ABC):
                         logger.warning(
                             "watchdog: TRANSPORT DEGRADATION trip — %s of sustained "
                             "transport errors (chatty-but-wedged provider); killing", which)
+                        self._killpg_tree(process)
+                        return
+                # CUMULATIVE transport-degradation trip (long-run fuzz-harden).
+                # INDEPENDENT of the spell above: the spell hard-resets on every
+                # recovery window, so two chronic cadences dodge it forever — a
+                # slow flapper (one error then a clean gap just OVER the recovery
+                # window, repeated) and a degrade/recover/re-degrade provider broken
+                # for hours with no single contiguous spell exceeding a bound. The
+                # cumulative weight survives single recovery windows and only DECAYS
+                # SLOWLY during SUSTAINED clean output, so a chronic flapper net-
+                # accumulates and trips while a genuine one-off blip that truly
+                # recovers (many clean windows) decays back to zero and never trips.
+                if transport_armed and (transport_cum_errors[0] > 0
+                                        or transport_cum_degraded[0] > 0):
+                    now_cum = time.monotonic()
+                    # Apply decay for clean time accrued since the last cumulative
+                    # event, but ONLY for clean time BEYOND the first recovery window
+                    # (a brief interleaved gap must not erase the accumulation — that
+                    # is precisely the interleaving that defeats the spell). Beyond
+                    # that grace window we remove transport_decay_per_window of weight
+                    # per recovery window of sustained clean time. Default-on; with
+                    # the decay knob 0 the cumulative weight never forgives.
+                    rw = transport_recovery_window
+                    decay = self.transport_decay_per_window
+                    if rw > 0 and decay > 0:
+                        clean = now_cum - (last_cum_event[0] or now_cum)
+                        if clean > rw:
+                            windows = (clean - rw) / rw
+                            shed = windows * decay
+                            transport_cum_errors[0] = max(0.0, transport_cum_errors[0] - shed)
+                            transport_cum_degraded[0] = max(
+                                0.0, transport_cum_degraded[0] - shed * rw)
+                            last_cum_event[0] = now_cum
+                    if ((transport_max_errors > 0
+                         and transport_cum_errors[0] >= transport_max_errors)
+                            or (transport_max_seconds > 0
+                                and transport_cum_degraded[0] > transport_max_seconds)):
+                        self._watchdog_reason = WATCHDOG_TRANSPORT_STALL
+                        which = (
+                            "cumulative-errors %.0f>=%d" % (
+                                transport_cum_errors[0], transport_max_errors)
+                            if (transport_max_errors > 0
+                                and transport_cum_errors[0] >= transport_max_errors)
+                            else "cumulative-degraded %.0fs>%.0fs" % (
+                                transport_cum_degraded[0], transport_max_seconds))
+                        logger.warning(
+                            "watchdog: TRANSPORT DEGRADATION trip — %s across recovery "
+                            "windows (chronic flapping provider); killing", which)
                         self._killpg_tree(process)
                         return
                 if stall_seconds > 0 and (time.monotonic() - self._last_progress) > stall_seconds:

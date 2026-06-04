@@ -86,6 +86,36 @@ def _master_checkpoint_path(prompt: str) -> str:
     key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     return str(CHECKPOINT_DIR / f"{key}.json")
 
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Encoding-safe, atomic artifact write (long-run resilience).
+
+    Two defects this guards against on a long / mission-critical run whose only
+    durable record is the per-run artifact set:
+
+    * Surrogate / non-encodable chars in worker output (assembled from
+      surrogateescape bytes, or a model emitting a stray codepoint) would make a
+      plain ``write_text(..., encoding="utf-8")`` raise ``UnicodeEncodeError``.
+      The final artifact-write tail is OUTSIDE the dispatch try/except, so one bad
+      byte aborts the whole tail and a SUCCESSFUL multi-hour run ends with NO
+      meta.json/diff at all. We open with ``errors="backslashreplace"`` so a bad
+      char degrades gracefully (round-trippable escape) and the write always
+      completes.
+    * A plain ``write_text`` is a single open(truncate)+write; a mid-write kill
+      (SIGKILL/OOM/scope exit-144/ENOSPC) leaves a truncated, unparseable file in
+      place. We write to a sibling temp file (same dir, so ``os.replace`` is a
+      same-filesystem atomic rename) and publish with ``os.replace`` — the reader
+      sees the target valid-or-old, never half-written. Mirrors the
+      tmp+os.replace pattern master.py already uses for its checkpoint.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    # errors="backslashreplace": never raise on a non-encodable char; round-trippable.
+    with open(tmp, "w", encoding=encoding, errors="backslashreplace") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())  # durably on disk before the atomic publish
+    os.replace(tmp, path)  # atomic same-dir rename: a mid-write kill can't corrupt
+
+
 def _glob_to_regex(glob: str) -> "re.Pattern[str]":
     """Compile a path glob to an anchored regex (issue #38).
 
@@ -2054,8 +2084,12 @@ async def dispatch_async(
     reconciliation: Optional[Dict[str, Any]] = None
     if reconciliation_result is not None:
         reconciliation = reconciliation_result.to_dict()
-        (run_dir / "reconcile.json").write_text(
-            json.dumps(reconciliation, indent=2, ensure_ascii=False), encoding="utf-8"
+        # Encoding-safe + atomic: a surrogate from a reconcile finding (ensure_ascii
+        # =False keeps raw non-ASCII) must not crash the artifact tail. See
+        # _atomic_write_text.
+        _atomic_write_text(
+            run_dir / "reconcile.json",
+            json.dumps(reconciliation, indent=2, ensure_ascii=False),
         )
         dead = reconciliation_result.findings()
         if reconciliation_result.should_fail_run:
@@ -2104,9 +2138,13 @@ async def dispatch_async(
         )
     notifier.fire("finish", monitor.payload(extra={"success": success, "outcome": run_outcome}))
 
-    (run_dir / "stdout.log").write_text(output, encoding="utf-8")
-    (run_dir / "changed-files.diff").write_text(
-        diff.unified or "(no file changes detected)\n", encoding="utf-8"
+    # Encoding-safe + atomic (long-run resilience): a surrogate in worker output
+    # must not crash the unguarded artifact tail, and a mid-write kill must not
+    # leave a truncated file. See _atomic_write_text.
+    _atomic_write_text(run_dir / "stdout.log", output)
+    _atomic_write_text(
+        run_dir / "changed-files.diff",
+        diff.unified or "(no file changes detected)\n",
     )
 
     # Plan-only / dry-run (#41): persist the decomposed plan as a structured
@@ -2124,17 +2162,19 @@ async def dispatch_async(
             from agy_orchestrator.execution.graph_plan import to_json as _plan_to_json
             graph_obj = _plan_to_json(plan_graph_out)
             graph_obj["instruction"] = instruction
-            (run_dir / "plan.json").write_text(
+            # Encoding-safe + atomic; the bytes are re-hashed below for provenance,
+            # which _atomic_write_text preserves verbatim. See _atomic_write_text.
+            _atomic_write_text(
+                run_dir / "plan.json",
                 json.dumps(graph_obj, indent=2, ensure_ascii=False),
-                encoding="utf-8",
             )
         else:
-            (run_dir / "plan.json").write_text(
+            _atomic_write_text(
+                run_dir / "plan.json",
                 json.dumps(
                     {"instruction": instruction, "n_steps": len(plan_steps), "steps": plan_steps},
                     indent=2, ensure_ascii=False,
                 ),
-                encoding="utf-8",
             )
         # Plan provenance (#56): hash the freshly emitted plan.json so the
         # operator can pin it with --plan-expect-sha when feeding it back, and so
@@ -2259,9 +2299,12 @@ async def dispatch_async(
     # meta.json byte-identical to the pre-#56 shape.
     if meta_dict.get("plan_provenance") is None:
         meta_dict.pop("plan_provenance", None)
-    (run_dir / "meta.json").write_text(
-        json.dumps(meta_dict, indent=2), encoding="utf-8"
-    )
+    # Atomic + encoding-safe: meta.json is the run's authoritative record (success
+    # /diff/tokens/reconcile). A mid-write kill must leave it valid-or-absent, and a
+    # surrogate that reached a string field must not abort the write. ensure_ascii is
+    # left at its default (True) here, so json.dumps already escapes non-ASCII; the
+    # backslashreplace in _atomic_write_text is a belt-and-suspenders backstop.
+    _atomic_write_text(run_dir / "meta.json", json.dumps(meta_dict, indent=2))
 
     # Telegram final-summary card (best-effort; never affects dispatch result).
     if telegram_notifier is not None:
