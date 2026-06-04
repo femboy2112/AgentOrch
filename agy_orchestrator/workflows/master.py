@@ -325,6 +325,15 @@ class MasterWorkflow:
         # multi-hour run is then NOT resumable and the operator must be told, not
         # left believing progress is being persisted. See _save_checkpoint.
         self.checkpoint_write_failed = False
+        # Planner-decomposition health (#76). When the planner's reply is not a
+        # parseable JSON list of step prompts — even after the JSON-only re-prompt —
+        # the workflow does NOT crash but silently runs the whole project as ONE
+        # mega-step (losing per-step verify + adversarial refinement). That collapse
+        # must be VISIBLE: set ``plan_degraded`` + ``plan_parse_error`` so meta.json /
+        # the ledger can report the decomposition failed. A genuinely valid
+        # single-element plan (the planner returned ["one step"]) is NOT degraded.
+        self.plan_degraded = False
+        self.plan_parse_error: Optional[str] = None
 
     def _emit_orchestration(self, **fields) -> None:
         cb = self.event_callback
@@ -764,18 +773,81 @@ class MasterWorkflow:
         if workflow_session_id:
             logger.info("Workflow session established: %s", workflow_session_id)
 
-        # Extract JSON list from plan_output
+        def _extract_tasks(text: str) -> List[str]:
+            start = text.find('[')
+            end = text.rfind(']') + 1
+            if start == -1 or end == 0:
+                raise ValueError("No JSON array found.")
+            parsed = json.loads(text[start:end])
+            # #76: a syntactically-valid but EMPTY (or non-list) decomposition is a
+            # degenerate plan — running it would do NOTHING, yet "[]" parses cleanly
+            # so it would otherwise slip past the parse-failure branch with
+            # plan_degraded False and silently execute zero steps. Treat it as
+            # unparseable so it routes through the SAME re-prompt-then-surface path
+            # as malformed output (re-ask once; a persistently-empty plan is
+            # surfaced as degraded, never run silently).
+            if not isinstance(parsed, list):
+                raise ValueError("Planner output is not a JSON list.")
+            if not parsed:
+                raise ValueError("Planner produced an EMPTY plan (zero steps).")
+            return parsed
+
+        # Extract JSON list from plan_output.
         tasks: List[str] = []
         try:
-            start = plan_output.find('[')
-            end = plan_output.rfind(']') + 1
-            if start != -1 and end != 0:
-                tasks = json.loads(plan_output[start:end])
-            else:
-                raise ValueError("No JSON array found.")
+            tasks = _extract_tasks(plan_output)
         except Exception as e:
-            logger.warning(f"Failed to parse Planner output as JSON: {e}. Defaulting to a single step.")
-            tasks = [initial_prompt]
+            # #76: a first unparseable reply does NOT mean the project is
+            # un-plannable — the planner often emits a perfectly good plan wrapped
+            # in prose/markdown, and silently collapsing to ONE mega-step here loses
+            # every step's verify + adversarial refinement on a multi-deliverable
+            # --spec. Re-ask ONCE with a strict JSON-only contract (mirrors the #68
+            # reconcile re-prompt), reusing the planner session if one was
+            # established, before accepting the collapse.
+            logger.warning(
+                "Failed to parse Planner output as JSON: %s; re-prompting for "
+                "JSON-only output before defaulting to a single step (#76).", e,
+            )
+            self._emit_orchestration(
+                phase="plan", action="reprompt_json", reason=str(e),
+            )
+            reprompt = (
+                "Your previous reply was NOT a valid JSON list and could not be "
+                "parsed. Reply with ONLY a JSON array of step-prompt strings — no "
+                "prose, no explanation, no markdown fences, no thinking. The first "
+                "character of your reply must be '[' and the last must be ']'.\n\n"
+                "Each array element is a detailed prompt for a single implementation "
+                f"step.\n\nProject Request:\n{initial_prompt}"
+            )
+            reprompt_kwargs = dict(model=self.model, effort="high", role="plan")
+            if workflow_session_id:
+                reprompt_kwargs["session_id"] = workflow_session_id
+            try:
+                planner2 = self.agent_class(prompt=reprompt, **reprompt_kwargs)
+                plan_output2 = await planner2.run_async()
+                if not workflow_session_id:
+                    workflow_session_id = getattr(planner2, "session_id", None)
+                tasks = _extract_tasks(plan_output2)
+            except Exception as e2:
+                # STILL unparseable after the re-prompt. Do NOT silently collapse:
+                # surface the decomposition failure LOUDLY (ERROR + a distinct
+                # orchestration event) and set visible flags so meta.json / the
+                # ledger can report the plan degraded — then proceed as a single
+                # step (don't crash). Surfaced via event/attr only, NEVER a file
+                # write, preserving _run_planner's "writes NOTHING to the out-dir"
+                # contract (#41).
+                self.plan_degraded = True
+                self.plan_parse_error = str(e2)
+                logger.error(
+                    "Planner output STILL unparseable after a JSON-only re-prompt "
+                    "(%s) — decomposition FAILED; running the whole project as a "
+                    "SINGLE step (losing per-step verify + adversarial refinement). "
+                    "This run's plan is DEGRADED (#76).", e2,
+                )
+                self._emit_orchestration(
+                    phase="plan", action="plan_parse_failed", reason=str(e2),
+                )
+                tasks = [initial_prompt]
 
         logger.info(f"Project broken down into {len(tasks)} steps.")
         return tasks, workflow_session_id
