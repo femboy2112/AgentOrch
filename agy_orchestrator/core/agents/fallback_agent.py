@@ -201,6 +201,22 @@ def make_fallback_agent(
                 if agent_cls is ClaudeAgent and getattr(self, "fork_session", False):
                     kwargs["fork_session"] = True
             sub = agent_cls(**kwargs)  # type: ignore[arg-type]
+            # Belt-and-suspenders (issue #75): propagate the wrapper's watchdog
+            # budgets to the sub when the wrapper has them set higher than the
+            # sub's own value, so an explicitly-configured wrapper's protection
+            # reaches the actual worker even if the post-construct arm hook is
+            # absent or raises. The hook (below) may still override afterward. We
+            # deliberately do NOT propagate timeout/absolute_timeout — those are
+            # intentionally per-call.
+            for _budget in ("stall_seconds", "max_output_bytes", "silence_max_seconds"):
+                try:
+                    wrapper_val = getattr(self, _budget, None)
+                    sub_val = getattr(sub, _budget, None)
+                    if (wrapper_val is not None and sub_val is not None
+                            and wrapper_val > sub_val):
+                        setattr(sub, _budget, wrapper_val)
+                except Exception:  # never let budget propagation block a real call
+                    pass
             cb_factory = getattr(self, "event_callback_factory", None)
             if callable(cb_factory):
                 try:

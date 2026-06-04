@@ -293,6 +293,15 @@ class AgentInstance(ABC):
         # Last time the child emitted output on either stream (monotonic). Shared
         # between the stream drain, the watchdog, and the liveness-aware wait.
         self._last_progress: float = 0.0
+        # Whether THIS attempt has ever produced real forward-progress output
+        # (stdout, or non-transport-noise stderr). Set by _mark_progress, reset at
+        # each attempt start. Read by the idle-timeout handler so a SILENT
+        # (zero-output) wedge that hits the idle ceiling — with both the silence
+        # ceiling and stall_seconds disabled (the #75 OLD gap) — is classified as
+        # a distinct WATCHDOG_STALLED rather than folded into a generic idle
+        # timeout, so the fallback layer can route it on the stall rule and
+        # telemetry can tell it apart from an emit-then-hang call.
+        self._any_output: bool = False
 
         # Streaming watchdog budgets (opt-in; 0/unset disables that signal).
         # max_output_bytes: kill if the child has emitted more than this on stdout.
@@ -348,6 +357,23 @@ class AgentInstance(ABC):
         # cumulative, never forgiving — not recommended).
         self.transport_decay_per_window = float(
             os.environ.get("AGY_TRANSPORT_DECAY_PER_WINDOW", "1.0") or 0)
+        # SILENCE ceiling (issue #75). The watchdog's STALLED trip (no output at
+        # all) is gated on stall_seconds>0, so a SILENTLY wedged worker (emitted
+        # NOTHING — no stdout, no transport errors) with stall_seconds unarmed
+        # (env unset, calibration miss, or a FallbackAgent sub the post-construct
+        # arm hook never reached) trips NOTHING and runs to the idle ceiling /
+        # absolute cap / the run-level backstop, discarding healthy completed
+        # steps. This DEFAULT-ON ceiling trips WATCHDOG_STALLED when a call has
+        # emitted NOTHING for this many seconds, INDEPENDENT of stall_seconds. The
+        # watchdog already loops by default via the transport bound, and the sub
+        # reads this env default in __init__, so it protects the fallback path
+        # with no propagation. It fires ONLY when no output was EVER produced — an
+        # emit-then-quiet call (reasoning between bursts) is governed by
+        # stall_seconds / the idle timeout, not this. Default 600s = codex's
+        # calibration default, far above any healthy first-output latency. 0
+        # disables.
+        self.silence_max_seconds = float(
+            os.environ.get("AGY_SILENCE_MAX_SECONDS", "600") or 0)
         # Set by the watchdog when it trips so callers (and FallbackAgent) can
         # distinguish a runaway from a normal failure. Cleared at each run start.
         self._watchdog_reason: Optional[str] = None
@@ -595,6 +621,7 @@ class AgentInstance(ABC):
         def _mark_progress() -> None:
             self._last_progress = time.monotonic()
             any_output[0] = True
+            self._any_output = True
             transport_noise_only[0] = False
 
         def _emit_line(line: bytes, echo: bool, stream: str) -> None:
@@ -729,12 +756,17 @@ class AgentInstance(ABC):
         transport_max_seconds = self.transport_max_seconds
         transport_recovery_window = self.transport_recovery_window
         transport_armed = transport_max_errors > 0 or transport_max_seconds > 0
+        # SILENCE ceiling (issue #75): default-on, fires INDEPENDENT of
+        # stall_seconds when the call has emitted NOTHING at all.
+        silence_max_seconds = self.silence_max_seconds
+        silence_armed = silence_max_seconds > 0
 
         async def _watchdog() -> None:
             # Wake on child-exit OR every 2s, whichever comes first; 2s is cheap
             # relative to subprocess scheduling, fine-grained enough that a runaway
             # emitting 10KB/s trips within one tick of budget.
-            if max_output_bytes <= 0 and stall_seconds <= 0 and not transport_armed:
+            if (max_output_bytes <= 0 and stall_seconds <= 0
+                    and not transport_armed and not silence_armed):
                 return
             while process.returncode is None:
                 try:
@@ -852,12 +884,27 @@ class AgentInstance(ABC):
                             stall_seconds)
                         self._killpg_tree(process)
                         return
-                    if not any_output[0]:
-                        self._watchdog_reason = WATCHDOG_STALLED
-                        logger.warning("watchdog: STALLED trip — no output for %.0fs; killing",
-                                       stall_seconds)
-                        self._killpg_tree(process)
-                        return
+                    # NOTE: the plain "no output at all" STALLED case is handled by
+                    # the silence guard below (silence_bound == stall_seconds when
+                    # stall_seconds>0), so it is not duplicated here.
+                # SILENCE ceiling (issue #75): a call that has emitted NOTHING at
+                # all for the silence bound trips WATCHDOG_STALLED, INDEPENDENT of
+                # whether stall_seconds was armed. When stall_seconds>0 it acts as
+                # the bound (subsuming the old plain-STALL branch); otherwise the
+                # default-on silence_max_seconds bounds an unarmed silent wedge
+                # (the #75 root condition: stall_seconds==0 and no transport
+                # errors). It fires ONLY when no output was EVER produced — an
+                # emit-then-quiet call (reasoning between bursts) keeps any_output
+                # True and is left to stall_seconds / the idle timeout.
+                silence_bound = stall_seconds if stall_seconds > 0 else silence_max_seconds
+                if (silence_bound > 0 and not any_output[0]
+                        and (time.monotonic() - self._last_progress) > silence_bound):
+                    self._watchdog_reason = WATCHDOG_STALLED
+                    logger.warning(
+                        "watchdog: SILENCE STALL trip — no output at all for "
+                        "%.0fs; killing", silence_bound)
+                    self._killpg_tree(process)
+                    return
 
         out_chunks: List[bytes] = []
         err_chunks: List[bytes] = []
@@ -1090,8 +1137,12 @@ class AgentInstance(ABC):
         # emits ZERO transport errors, so the tracker can never trip on it and the
         # only added cost is the (already cheap) line-by-line drain path.
         transport_bound_armed = self.transport_max_errors > 0 or self.transport_max_seconds > 0
+        # Silence ceiling (issue #75) is default-on; arming it makes a silent call
+        # stream so the watchdog loops even if the transport bound were disabled.
+        silence_armed = self.silence_max_seconds > 0
         watchdog_armed = (
-            self.max_output_bytes > 0 or self.stall_seconds > 0 or transport_bound_armed)
+            self.max_output_bytes > 0 or self.stall_seconds > 0
+            or transport_bound_armed or silence_armed)
         stream_mode = bool(os.environ.get("AGY_STREAM")) or watchdog_armed or self.event_callback is not None
 
         # Stamp the agent's ROLE (set by the orchestrator at construction, e.g.
@@ -1111,6 +1162,7 @@ class AgentInstance(ABC):
             for attempt in range(1, self.max_retries + 1):
                 self._watchdog_reason = None
                 self._timeout_kind = None
+                self._any_output = False
                 attempt_start = time.monotonic()
                 self._last_progress = attempt_start
                 try:
@@ -1171,6 +1223,27 @@ class AgentInstance(ABC):
                                      self._absolute_cap())
                         await self._kill_current()
                         self.stderr = f"timed out after {waited:.0f}s"
+                        # #75 residual gap: a timeout on a call that emitted NOTHING
+                        # the whole attempt is a SILENT wedge — the same condition the
+                        # silence ceiling catches, reached here only when both the
+                        # silence ceiling and stall_seconds are disabled (the OLD gap),
+                        # whether the call streamed (kind=="idle") or not (non-streaming
+                        # flat ceiling, kind is None). Classify it distinctly as
+                        # WATCHDOG_STALLED so the fallback layer routes it on the stall
+                        # rule and telemetry doesn't fold it into a generic idle
+                        # timeout. A wall-clock-cap timeout (kind=="wallclock") is an
+                        # actively-emitting overrun, NOT a silent wedge, so it is left
+                        # unclassified; likewise an emit-then-hang call (_any_output
+                        # True) stays an unclassified idle timeout.
+                        if kind != "wallclock" and not self._any_output:
+                            self._watchdog_reason = WATCHDOG_STALLED
+                            marker = f"{WATCHDOG_MARKER}{WATCHDOG_STALLED}]"
+                            self._emit_event({
+                                "kind": "watchdog",
+                                "text": marker,
+                                "data": {"reason": WATCHDOG_STALLED},
+                            })
+                            self.stderr = f"{marker} {self.stderr}".strip()
                         self._emit_usage_event("", self.stderr, attempt=attempt, success=False)
                         raise RuntimeError(self.stderr)  # fail fast, no retry
 
