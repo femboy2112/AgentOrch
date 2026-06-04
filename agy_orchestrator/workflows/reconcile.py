@@ -354,6 +354,36 @@ def _extract_json_blob(text: str) -> Optional[str]:
     return None
 
 
+# Control characters that even ``strict=False`` cannot tolerate — ones that land
+# OUTSIDE a JSON string (between tokens). \t \n \r and any control char INSIDE a
+# string value are accepted by ``strict=False``; everything else in 0x00-0x1F is
+# stray noise we strip only as a last resort. (#74)
+_STRAY_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _loads_repaired(blob: str) -> Optional[Any]:
+    """Best-effort repair of near-valid reconcile JSON (#74).
+
+    Returns the parsed object, or None when the blob is GENUINELY malformed
+    (structural error) — so real corruption still reads as a parse_error.
+
+    A reconcile agent occasionally emits a literal control character (an unescaped
+    newline/tab) inside a JSON string value, which strict ``json.loads`` rejects
+    with "Invalid control character at ...". That is a cosmetic formatting glitch,
+    not a semantic defect. Two repair passes, most-faithful first:
+      1. ``json.loads(strict=False)`` — permits control characters inside string
+         values, preserving the value verbatim;
+      2. strip stray non-whitespace control chars (those outside any string, which
+         even ``strict=False`` rejects) and retry leniently.
+    """
+    for attempt in (blob, _STRAY_CONTROL_RE.sub("", blob)):
+        try:
+            return json.loads(attempt, strict=False)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+    return None
+
+
 def _finite_or_dead(value: float) -> float:
     """Map a non-finite witness magnitude (NaN/±Inf) to 0.0 (dead).
 
@@ -638,11 +668,26 @@ class ReconciliationReview:
         if blob is None:
             parse_error = "no JSON object found in reply"
         else:
+            data = {}
             try:
                 data = json.loads(blob)
             except json.JSONDecodeError as exc:
-                parse_error = f"invalid JSON: {exc}"
-                data = {}
+                # A reconcile reply sometimes embeds a RAW control character (an
+                # unescaped newline/tab) inside a JSON string value, which strict
+                # json.loads rejects with "Invalid control character at ...". That
+                # is a cosmetic formatting glitch, not a semantic defect — failing
+                # on it disabled the anti-hollow-win gate on a mission-critical run
+                # (#74). Repair before giving up; only GENUINELY malformed structure
+                # stays a parse_error (so a real corruption still reads as hollow).
+                repaired = _loads_repaired(blob)
+                if repaired is None:
+                    parse_error = f"invalid JSON: {exc}"
+                    data = {}
+                else:
+                    data = repaired
+                    logger.info(
+                        "reconcile: repaired near-valid JSON (%s) — verdict "
+                        "recovered instead of bailing hollow (#74).", exc.msg)
             except RecursionError as exc:
                 # A pathologically deep ``{...}``/``[...]`` blob blows Python's
                 # parser recursion limit. That is a malformed reply, not a station
