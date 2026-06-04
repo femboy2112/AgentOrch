@@ -2047,11 +2047,14 @@ async def dispatch_async(
         **verifier_telemetry,
     }
 
-    # Quality-cost ledger (task #9): how much to trust this run.
+    # Quality-cost ledger (task #9): how much to trust this run. A run aborted by
+    # the run-level watchdog (#77, run_outcome == "stalled") must NOT report
+    # "verified"/high — its in-loop verification only covers the steps that ran.
     quality = build_ledger(
         workflow, mode=mode, had_verifier=verifier is not None,
         produced_output=bool(output and output.strip()),
         telemetry=telemetry,
+        run_aborted=(run_outcome == "stalled"),
     )
     logger.info("Dispatch %s | confidence=%s (%s)", run_id, quality["confidence"], quality["note"])
 

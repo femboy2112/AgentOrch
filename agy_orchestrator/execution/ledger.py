@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 def build_ledger(workflow: Any, *, mode: str, had_verifier: bool,
                  produced_output: bool,
                  telemetry: Optional[Dict[str, Any]] = None,
+                 run_aborted: bool = False,
                  ) -> Dict[str, Optional[object]]:
     """Read whatever signals a workflow exposes and derive a confidence label.
 
@@ -34,13 +35,24 @@ def build_ledger(workflow: Any, *, mode: str, had_verifier: bool,
     next calibration cycle can re-fit per-config baselines (see
     core/calibration.py). None values are dropped from the output to keep ledger
     rows small for workflows that don't surface telemetry.
+
+    ``run_aborted`` (#77): the RUN was killed mid-build by the run-level watchdog
+    (a stall/abort). Any in-loop ``verified``/``approved`` signal then covers only
+    the steps that ran, NOT the whole build, so the confidence MUST NOT read
+    "verified"/"approved" — it is downgraded to the honest terminal label
+    "stalled". Defaults False, so every existing call is byte-identical.
     """
     verified = bool(getattr(workflow, "verified", False))
     approved = bool(getattr(workflow, "approved", False))
     stalled = bool(getattr(workflow, "stalled", False))
     iterations = getattr(workflow, "iterations_used", None)
 
-    if verified:
+    if run_aborted:
+        # #77: a watchdog-aborted run is terminal-stalled regardless of any
+        # per-step verified/approved signal (which only covers the steps that
+        # ran). "failed" still wins when nothing was produced.
+        confidence = "stalled" if produced_output else "failed"
+    elif verified:
         confidence = "verified"
     elif approved:
         confidence = "approved"
@@ -84,6 +96,9 @@ _NOTE = {
                 "add a --test-cmd to harden.",
     "unverified": "Nothing confirmed this output (no verifier, loop stalled or "
                   "hit its cap). Treat as suspect; review or re-run with --test-cmd.",
+    "stalled": "The run was ABORTED (watchdog / run-level stall) before completing "
+               "— any in-loop verification covers only the steps that ran, not the "
+               "whole build. Treat as failed; review or re-run.",
     "failed": "The run produced no output.",
 }
 
