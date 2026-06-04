@@ -18,6 +18,20 @@ if root_str not in sys.path:
     sys.path.insert(0, root_str)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_telegram_state(tmp_path, monkeypatch):
+    """Hermetic isolation: never let a test read or write the OPERATOR's real
+    Telegram state/whitelist files (DEFAULT_STATE_PATH / DEFAULT_USERS_PATH under
+    ~/tgbot/data/). Without this, TelegramNotifier._live_state() reads the LIVE
+    bot_state.json, so a real mute/quiet-window entry for the test FAKE_CHAT_ID
+    (444555666) suppresses delivery — making the notifier tests fail depending on
+    the wall-clock (in/out of the quiet window) and pytest collection order. Point
+    both paths at an empty per-test tmp dir; a test may still override either.
+    """
+    monkeypatch.setenv("AGY_TELEGRAM_STATE", str(tmp_path / "bot_state.json"))
+    monkeypatch.setenv("AGY_TELEGRAM_USERS", str(tmp_path / "users.json"))
+
+
 def _has_xvfb() -> bool:
     return shutil.which("Xvfb") is not None
 
