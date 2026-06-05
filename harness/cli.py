@@ -19,6 +19,7 @@ import os
 import sys
 from pathlib import Path
 
+from agy_orchestrator.version import version_string
 from harness import roles
 from harness.dispatch import RUNS_DIR, dispatch
 
@@ -733,6 +734,10 @@ def main(argv=None) -> int:
         prog="harness", description="Workflow harness: drive agy/codex via the orchestrator."
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+    parser.add_argument(
+        "--version", action="version", version=version_string("harness"),
+        help="Print the running build (version + git commit) and exit",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     do = sub.add_parser("do", help="Dispatch one coding instruction to a worker")

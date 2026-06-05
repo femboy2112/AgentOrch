@@ -7,6 +7,7 @@ from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
 from agy_orchestrator.core.profile import UserProfile
+from agy_orchestrator.version import version_string
 from agy_orchestrator.execution.pipeline import LinearPipeline
 from agy_orchestrator.execution.verifier import QualityVerifier
 from agy_orchestrator.workflows.adversarial import AdversarialReview
@@ -133,6 +134,10 @@ async def run_chain(args, profile):
 
 def main():
     parser = argparse.ArgumentParser(description="Agy Orchestrator - Advanced Multi-Agent Wrapper")
+    parser.add_argument(
+        "--version", action="version", version=version_string("agy-orchestrator"),
+        help="Print the running build (version + git commit) and exit",
+    )
     parser.add_argument("--claude-plan", type=str, default="free", help="Claude subscription plan (e.g. '20x max')")
     parser.add_argument("--codex-plan", type=str, default="free", help="Codex subscription plan (e.g. '$100')")
     parser.add_argument("--agy-plan", type=str, default="free", help="Agy subscription plan")
