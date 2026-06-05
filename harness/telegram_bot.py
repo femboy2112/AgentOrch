@@ -60,6 +60,9 @@ from harness.telegram import (
     load_whitelist,
     normalize_verbosity,
     parse_quiet_window,
+    purge_clear_log,
+    read_clear_targets,
+    record_sent_message,
     render_event,
     state_path,
     whitelist_user_ids,
@@ -81,6 +84,7 @@ BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "track", "description": "follow a live run (latest | <id> | all)"},
     {"command": "health", "description": "poller status, live runs, last outcome"},
     {"command": "tail", "description": "last N rendered events (default 10)"},
+    {"command": "clear", "description": "delete this chat's bot messages (<48h)"},
     {"command": "help", "description": "list commands"},
 ]
 
@@ -785,6 +789,7 @@ HELP_TEXT = (
     "/untrack [&lt;run_id&gt;|all] — stop following (default: all)\n"
     "/health — poller status, live runs, last outcome\n"
     "/tail [N] [run] — last N rendered events (default 10)\n"
+    "/clear — delete this chat's bot messages I've seen (&lt;48h old)\n"
     "<b>Notifications</b>\n"
     "/notify [show | mute 30m|2h|on | watch | quiet HH:MM-HH:MM|off | "
     "verbosity &lt;lvl&gt;] — one place for "
@@ -1688,7 +1693,8 @@ class BotDaemon:
 
             if reply and chat_id is not None:
                 try:
-                    self.client.send_message(chat_id, reply)
+                    res = self.client.send_message(chat_id, reply)
+                    record_sent_message(chat_id, res, state_file=self.state_file)
                 except Exception as exc:
                     logger.debug("telegram callback reply failed: %s", exc)
             # ALWAYS answer (whitelisted) so the client spinner clears, even on a no-op.
@@ -1698,6 +1704,63 @@ class BotDaemon:
                 logger.debug("telegram answerCallbackQuery failed: %s", exc)
         except Exception as exc:
             logger.debug("telegram callback processing failed: %s", exc)
+
+    def _handle_clear(self, chat_id: Any) -> None:
+        """/clear — delete this chat's bot-known messages. Never raises.
+
+        Telegram has no wipe-history API: a bot can only delete individual
+        messages < 48h old whose ids it tracked while running (incoming +
+        outgoing, in a private chat). Read the shared id-log, bulk-delete (with a
+        per-message fallback so one un-deletable message can't block the rest),
+        purge the log, then send a brief, honest confirmation (which is itself
+        re-tracked so the next /clear removes it).
+        """
+        try:
+            ids = read_clear_targets(chat_id, state_file=self.state_file)
+        except Exception as exc:
+            logger.debug("telegram /clear read failed: %s", exc)
+            ids = []
+        deleted = 0
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            res = None
+            try:
+                res = self.client.delete_messages(chat_id, chunk)
+            except Exception as exc:
+                logger.debug("telegram deleteMessages failed: %s", exc)
+            if isinstance(res, dict) and res.get("ok"):
+                deleted += len(chunk)
+                continue
+            # Batch rejected (an id is >48h / already gone) -> per-message so the
+            # rest still get removed, and the count stays accurate.
+            for mid in chunk:
+                r = None
+                try:
+                    r = self.client.delete_message(chat_id, mid)
+                except Exception as exc:
+                    logger.debug("telegram deleteMessage failed: %s", exc)
+                if isinstance(r, dict) and r.get("ok"):
+                    deleted += 1
+        try:
+            purge_clear_log(chat_id, state_file=self.state_file)
+        except Exception as exc:
+            logger.debug("telegram /clear purge failed: %s", exc)
+        if not ids:
+            note = "🧹 Nothing to clear — no messages tracked for this chat yet."
+        else:
+            plural = "s" if deleted != 1 else ""
+            note = f"🧹 Cleared {deleted} message{plural}."
+            missed = len(ids) - deleted
+            if missed > 0:
+                note += (f" {missed} couldn't be removed "
+                         "(older than 48h or already gone).")
+        note += ("\n<i>Only messages I saw while running and &lt;48h old can be "
+                 "cleared — Telegram has no wipe-history API.</i>")
+        try:
+            res = self.client.send_message(chat_id, note)
+            record_sent_message(chat_id, res, state_file=self.state_file)
+        except Exception as exc:
+            logger.debug("telegram /clear confirmation failed: %s", exc)
 
     def _process_update(self, update: dict) -> None:
         """Handle one update; never raises."""
@@ -1723,6 +1786,18 @@ class BotDaemon:
                 logger.debug("ignoring non-whitelisted user %s", user_id)
                 return
             text = message.get("text") or ""
+            # Track the user's OWN message id so /clear can delete it later (a
+            # private-chat bot may delete incoming messages < 48h old). This also
+            # captures the /clear command message itself, so it gets cleared too.
+            record_sent_message(chat_id, message.get("message_id"),
+                                 state_file=self.state_file)
+            cmd = (text.strip().split()[0].split("@", 1)[0].lower()
+                   if text.strip() else "")
+            # /clear is an ACTION (it deletes messages via the API), so it can't be
+            # a pure handle_command string reply — route it to the daemon directly.
+            if cmd == "/clear":
+                self._handle_clear(chat_id)
+                return
             reply = handle_command(
                 text,
                 state=load_state(self.state_file),
@@ -1734,14 +1809,14 @@ class BotDaemon:
                 # /status so the most-recent run is one tap away (F1).
                 markup = None
                 try:
-                    cmd = text.strip().split()[0].split("@", 1)[0].lower() if text.strip() else ""
                     if cmd == "/status":
                         dirs = _run_dirs()
                         if dirs:
                             markup = build_run_keyboard(dirs[0].name)
                 except Exception:
                     markup = None
-                self.client.send_message(chat_id, reply, reply_markup=markup)
+                res = self.client.send_message(chat_id, reply, reply_markup=markup)
+                record_sent_message(chat_id, res, state_file=self.state_file)
         except Exception as exc:
             logger.debug("telegram update processing failed: %s", exc)
 
@@ -1772,7 +1847,8 @@ class BotDaemon:
     def _send_tail(self, chat_id: Any, text: str,
                    reply_markup: Optional[dict] = None) -> None:
         try:
-            self.client.send_message(chat_id, text, reply_markup=reply_markup)
+            res = self.client.send_message(chat_id, text, reply_markup=reply_markup)
+            record_sent_message(chat_id, res, state_file=self.state_file)
         except Exception as exc:  # client already swallows; belt-and-suspenders
             logger.debug("telegram tail send failed: %s", exc)
 

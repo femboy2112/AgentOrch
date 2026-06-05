@@ -227,6 +227,36 @@ class TelegramClient:
             return None
         return self._post("unpinChatMessage", {"chat_id": chat_id, "message_id": message_id})
 
+    def delete_message(self, chat_id: Any, message_id: Any) -> Optional[dict]:
+        """Delete one message. Best-effort; returns the API result or None.
+
+        Telegram only allows this for messages < 48h old; in a PRIVATE chat a bot
+        may delete both its own outgoing and the user's incoming messages. An
+        un-deletable/already-gone message returns a non-ok result (the caller
+        treats that as "couldn't remove" rather than an error).
+        """
+        if not self.configured or chat_id is None or message_id is None:
+            return None
+        return self._post(
+            "deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+    def delete_messages(self, chat_id: Any, message_ids: List[Any]) -> Optional[dict]:
+        """Bulk-delete up to 100 messages at once (Bot API 7.0 ``deleteMessages``).
+
+        Best-effort; returns the API result or None. ``message_ids`` is sent as a
+        JSON array. The whole batch fails if ANY id is un-deletable, so the caller
+        falls back to per-message :meth:`delete_message` on a non-ok result.
+        """
+        if not self.configured or chat_id is None:
+            return None
+        ids = [m for m in (message_ids or []) if m is not None]
+        if not ids:
+            return None
+        return self._post(
+            "deleteMessages",
+            {"chat_id": chat_id, "message_ids": json.dumps(ids)},
+        )
+
     def set_my_commands(self, commands: List[Dict[str, str]]) -> Optional[dict]:
         """Register the bot's command list with Telegram (setMyCommands).
 
@@ -1092,6 +1122,7 @@ class TelegramNotifier:
                         for chat_id in self.chat_ids:
                             try:
                                 res = self.client.send_message(chat_id, text)
+                                record_sent_message(chat_id, res)
                                 if res and res.get("result"):
                                     mid = res["result"].get("message_id")
                                     if mid:
@@ -1105,8 +1136,9 @@ class TelegramNotifier:
                         # end-of-run summary card carries the inline keyboard.
                         for chat_id in self.chat_ids:
                             try:
-                                self.client.send_message(
+                                res = self.client.send_message(
                                     chat_id, text, reply_markup=markup)
+                                record_sent_message(chat_id, res)
                                 self.sent += 1
                             except Exception as exc:
                                 logger.debug("telegram send failed: %s", exc)
@@ -1128,7 +1160,8 @@ class TelegramNotifier:
         """Synchronous send to every chat. Runs ONLY on the worker thread."""
         for chat_id in self.chat_ids:
             try:
-                self.client.send_message(chat_id, text)
+                res = self.client.send_message(chat_id, text)
+                record_sent_message(chat_id, res)
                 self.sent += 1
             except Exception as exc:  # belt-and-suspenders; client already swallows
                 logger.debug("telegram broadcast failed: %s", exc)
@@ -1491,6 +1524,174 @@ def state_path(path: Optional[str] = None) -> str:
     and the bot daemon agree on one file.
     """
     return path or os.environ.get("AGY_TELEGRAM_STATE") or DEFAULT_STATE_PATH
+
+
+# --------------------------------------------------------------------------- #
+# /clear — shared sent-message-id log
+#
+# Telegram has no "wipe chat history" API. A bot CAN delete individual messages
+# (< 48h old; in a private chat, both its own and the user's), but only if it
+# knows their message_ids. The daemon sees incoming ids and its own sends, while
+# the DISPATCH process sends most of the build chatter via TelegramNotifier — a
+# different process. So both append (chat_id, message_id, ts) to ONE shared JSONL
+# log next to the state file; /clear reads it, deletes everything in-window, then
+# purges the chat's entries. Best-effort throughout: a missing/garbage/unwritable
+# log degrades to "clear what we can" and never raises into a send path.
+# --------------------------------------------------------------------------- #
+# Telegram only deletes messages < 48h old; stay safely under the boundary.
+CLEAR_MAX_AGE_SECONDS = 47 * 3600
+# Compact stale lines when the log grows past this (keeps it bounded between
+# /clear calls without reading the whole file on every append).
+_CLEARLOG_COMPACT_BYTES = 1_000_000
+
+
+def _clock() -> float:
+    """Wall-clock seam so tests can drive the /clear age window deterministically."""
+    import time as _t
+    return _t.time()
+
+
+def clearlog_path(state_file: Optional[str] = None) -> str:
+    """Path to the shared sent-message-id log (``sent_messages.jsonl``).
+
+    Lives next to the bot state file (outside the repo) so the dispatch notifier
+    and the bot daemon append to the same log.
+    """
+    base = state_path(state_file)
+    return os.path.join(os.path.dirname(base) or ".", "sent_messages.jsonl")
+
+
+def _extract_message_id(message_id: Any) -> Optional[int]:
+    """Coerce an int message_id, or pull result.message_id from a sendMessage dict."""
+    mid = message_id
+    if isinstance(mid, dict):
+        result = mid.get("result")
+        mid = result.get("message_id") if isinstance(result, dict) else None
+    if mid is None or isinstance(mid, bool):
+        return None
+    try:
+        return int(mid)
+    except (TypeError, ValueError):
+        return None
+
+
+def record_sent_message(
+    chat_id: Any, message_id: Any, *,
+    state_file: Optional[str] = None, now: Optional[float] = None,
+) -> None:
+    """Append a (chat_id, message_id) to the shared id-log so /clear can delete it.
+
+    ``message_id`` may be an int OR a sendMessage API result dict (its
+    ``result.message_id`` is used; a None/non-ok result is silently ignored).
+    Best-effort: any failure (falsy id, unwritable dir) is swallowed.
+    """
+    if chat_id is None:
+        return
+    mid = _extract_message_id(message_id)
+    if mid is None:
+        return
+    ts = float(now) if now is not None else _clock()
+    path = clearlog_path(state_file)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"c": str(chat_id), "m": mid, "t": ts}) + "\n")
+    except Exception as exc:
+        logger.debug("clearlog append failed: %s", exc)
+        return
+    try:
+        if os.path.getsize(path) > _CLEARLOG_COMPACT_BYTES:
+            _rewrite_clearlog(path, drop_chat=None, now=ts)
+    except Exception:
+        pass
+
+
+def read_clear_targets(
+    chat_id: Any, *, state_file: Optional[str] = None,
+    now: Optional[float] = None, max_age: float = CLEAR_MAX_AGE_SECONDS,
+) -> List[int]:
+    """De-duped, within-window message ids logged for a chat (insertion order)."""
+    path = clearlog_path(state_file)
+    cutoff = (float(now) if now is not None else _clock()) - float(max_age)
+    target = str(chat_id)
+    seen: set = set()
+    ids: List[int] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if str(obj.get("c")) != target:
+                    continue
+                try:
+                    ts = float(obj.get("t"))
+                    mid = int(obj.get("m"))
+                except (TypeError, ValueError):
+                    continue
+                if ts < cutoff or mid in seen:
+                    continue
+                seen.add(mid)
+                ids.append(mid)
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        logger.debug("clearlog read failed: %s", exc)
+        return []
+    return ids
+
+
+def _rewrite_clearlog(
+    path: str, *, drop_chat: Optional[str],
+    now: Optional[float] = None, max_age: float = CLEAR_MAX_AGE_SECONDS,
+) -> None:
+    """Atomically rewrite the log, dropping ``drop_chat``'s lines + all stale lines."""
+    cutoff = (float(now) if now is not None else _clock()) - float(max_age)
+    kept: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                if drop_chat is not None and str(obj.get("c")) == drop_chat:
+                    continue
+                try:
+                    if float(obj.get("t")) < cutoff:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                kept.append(s)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.debug("clearlog rewrite read failed: %s", exc)
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            if kept:
+                fh.write("\n".join(kept) + "\n")
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.debug("clearlog rewrite write failed: %s", exc)
+
+
+def purge_clear_log(
+    chat_id: Any, *, state_file: Optional[str] = None,
+    now: Optional[float] = None, max_age: float = CLEAR_MAX_AGE_SECONDS,
+) -> None:
+    """Drop a chat's entries (and any globally-stale entries) from the id-log."""
+    _rewrite_clearlog(
+        clearlog_path(state_file), drop_chat=str(chat_id), now=now, max_age=max_age)
 
 
 def load_persisted_verbosity(path: Optional[str] = None) -> Optional[str]:
