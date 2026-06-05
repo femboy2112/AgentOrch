@@ -880,6 +880,57 @@ class ReconciliationReview:
         )
         return result
 
+    async def _cycle_providers_for_verdict(self) -> Optional[ReconciliationResult]:
+        """#79: rotate the fallback chain's LEAD through every remaining provider,
+        re-asking (JSON-only) until one returns a parseable verdict.
+
+        A reconcile ``parse_error`` is a successful produce of prose-not-JSON, so the
+        ``FallbackAgent`` (which only cycles on a produce-FAILURE) never advances —
+        the lead provider's formatting flakiness alone would false-fail an otherwise
+        fully-verified run under ``disposition=fail``. We drive the rotation here with
+        the same ``rotate_offset`` lever the adversarial loop uses (#65). Returns the
+        first parseable result, or the last parse_error result if none parse, or
+        ``None`` when the agent is not a multi-provider chain (nothing to cycle).
+        Best-effort: never raises into the caller; restores ``rotate_offset``."""
+        chain = list(getattr(self.agent, "_chain", []) or [])
+        if len(chain) <= 1:
+            return None  # single provider: no sibling to try
+        prior_offset = int(getattr(self.agent, "rotate_offset", 0) or 0)
+        last: Optional[ReconciliationResult] = None
+        try:
+            # Try each OTHER provider as lead exactly once (offsets 1..N-1).
+            for rot in range(1, len(chain)):
+                provider_name = chain[rot % len(chain)].__name__
+                try:
+                    self.agent.rotate_offset = rot
+                    self._emit_orchestration(
+                        phase="reconcile", action="provider_cycle",
+                        to_worker=provider_name, reason="parse_error", attempt=rot,
+                    )
+                    self.agent.prompt = self._json_only_reprompt()
+                    reply = await self.agent.run_async()
+                    candidate = self.parse(reply)
+                except Exception as exc:  # a walled/failed provider -> try the next
+                    logger.warning(
+                        "Reconciliation provider-cycle to %s failed: %s",
+                        provider_name, exc,
+                    )
+                    continue
+                last = candidate
+                if candidate.parse_error is None:
+                    logger.warning(
+                        "Reconciliation recovered a parseable verdict from %s after "
+                        "the lead provider emitted unparseable JSON twice (#79).",
+                        provider_name,
+                    )
+                    return candidate
+        finally:
+            try:
+                self.agent.rotate_offset = prior_offset
+            except Exception:
+                pass
+        return last
+
     async def execute(self) -> ReconciliationResult:
         """Run the single trace pass and return the distinct verdict object."""
         logger.info(
@@ -922,12 +973,25 @@ class ReconciliationReview:
                 if result2.parse_error is None:
                     result = result2
                 else:
-                    logger.error(
-                        "Reconciliation STILL unparseable after a JSON-only "
-                        "re-prompt (%s) — the anti-hollow-win check did NOT verify "
-                        "this run; treating as hollow (disposition=%s).",
-                        result2.parse_error, self.disposition,
-                    )
+                    # #79: the #68 re-prompt re-asks the SAME lead provider. A
+                    # parse_error is a SUCCESSFUL produce (prose, not JSON), so the
+                    # fallback chain never cycled on its own — one provider's JSON-
+                    # formatting flakiness would false-fail an otherwise-verified run
+                    # under disposition=fail without ever asking the OTHER providers.
+                    # Cycle the lead through the remaining providers (mirroring the
+                    # produce-failure path + the adversarial #65 rotation) until one
+                    # yields a parseable verdict, or all are exhausted.
+                    cycled = await self._cycle_providers_for_verdict()
+                    if cycled is not None and cycled.parse_error is None:
+                        result = cycled
+                    else:
+                        logger.error(
+                            "Reconciliation STILL unparseable after a JSON-only "
+                            "re-prompt AND cycling every provider in the chain — the "
+                            "anti-hollow-win check did NOT verify this run; treating "
+                            "as hollow (disposition=%s).",
+                            self.disposition,
+                        )
             except Exception as exc:  # best-effort: keep the original parse_error
                 logger.warning("Reconciliation JSON-only re-prompt failed: %s", exc)
 
