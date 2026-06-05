@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import time
 from typing import Callable, Dict, List, Optional, Type
 
 from agy_orchestrator.core.agent import (
@@ -60,6 +62,65 @@ def is_model_known_inaccessible(provider: str, model: Optional[str]) -> bool:
 def reset_inaccessible_models() -> None:
     """Clear the dynamic model-availability cache (test/diagnostic hook)."""
     _INACCESSIBLE_MODELS.clear()
+
+
+# Process-level TIME-BOUNDED rate-limit cache (issue #82). When a provider's model
+# returns a usage/quota wall that ALSO reports a reset time (codex stashes the
+# rollout-JSONL reset epoch on the sub as ``usage_wall_resets_at``; folded in by
+# CodexAgent._augment_failure_stderr), we record (provider_class_name, model) ->
+# resets_at here. The NEXT call skips that exact (provider, model) until ``resets_at``
+# passes, instead of re-probing + re-walling it on every call for the whole window.
+# Unlike _INACCESSIBLE_MODELS (permanent for the process), this AUTO-EXPIRES: once
+# wall-clock reaches resets_at the entry is popped on lookup and the model re-enabled.
+# A wall with NO resets_at is NOT cached -> it is still re-probed exactly as before.
+_RATE_LIMITED_UNTIL: Dict[tuple, float] = {}
+
+
+def _now() -> float:
+    # SEAM so tests can monkeypatch fallback_agent._now to drive time deterministically.
+    return time.time()
+
+
+def record_rate_limited(provider: str, model: Optional[str], resets_at) -> None:
+    """Cache a (provider, model) as rate-limited until ``resets_at`` (unix epoch).
+
+    Stores ONLY if resets_at is a finite number > 0 (math.isfinite). Silently
+    ignores None / NaN / +-inf / <= 0 / non-numeric. No-op if model is falsy.
+    """
+    if not model:
+        return
+    try:
+        ra = float(resets_at)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(ra) or ra <= 0:
+        return
+    _RATE_LIMITED_UNTIL[(provider, str(model))] = ra
+
+
+def is_rate_limited(provider: str, model: Optional[str], now: Optional[float] = None) -> bool:
+    """True if (provider, model) is cached rate-limited and the window hasn't elapsed.
+
+    Auto-expires: once ``now`` reaches the cached resets_at, the entry is popped
+    (model re-enabled) and False is returned. A falsy model is never rate-limited.
+    """
+    if not model:
+        return False
+    key = (provider, str(model))
+    resets_at = _RATE_LIMITED_UNTIL.get(key)
+    if resets_at is None:
+        return False
+    now = now if now is not None else _now()
+    if now < resets_at:
+        return True
+    # Window elapsed -> auto re-enable.
+    _RATE_LIMITED_UNTIL.pop(key, None)
+    return False
+
+
+def clear_rate_limited() -> None:
+    """Clear the time-bounded rate-limit cache (test/diagnostic hook)."""
+    _RATE_LIMITED_UNTIL.clear()
 
 
 def _watchdog_reason_in(stderr: str) -> Optional[str]:
@@ -327,6 +388,10 @@ def make_fallback_agent(
             # initial configured model counts as already-used via the empty-seed).
             model_fallback_tried: Dict[Type[AgentInstance], set] = {}
             attempts = 0
+            # Whether ANY sub has actually been invoked this call. Guards the #82
+            # rate-limit skip from exhausting to zero attempts: if every candidate is
+            # cache-walled and nothing has run, we attempt anyway instead of skipping.
+            ran_any = False
             # Per-provider count of bounded same-provider transport retries already
             # spent, so a flapping link can't loop a single provider forever (#57).
             # This budget is SCOPED PER CYCLE (reset whenever a fresh cycle of the
@@ -370,6 +435,87 @@ def make_fallback_agent(
                     if base_consumed and base_consumed % base_len == 0:
                         transport_retries_used.clear()
                     base_consumed += 1
+                # Issue #82: skip a (provider, model) we already know is rate-limited
+                # until its cached reset window passes — don't re-probe + re-wall it on
+                # every call. Resolve the model exactly like the usage-wall path below
+                # (model_override or the provider's configured model). SAFETY: never
+                # skip down to ZERO attempts — if every remaining candidate is cached-
+                # walled AND nothing has actually run this call, attempt anyway (a run
+                # that probes nothing is a worse regression than re-probing).
+                skip_provider_key = agent_cls.__name__
+                skip_resolved_model = model_override or self._configs.get(
+                    agent_cls, {}).get("model", self.model)
+                if is_rate_limited(skip_provider_key, skip_resolved_model):
+                    # Before abandoning the WHOLE provider, preserve #78's "try the
+                    # provider's OTHER models before switching providers": if a
+                    # same-provider alternate model is configured and is itself
+                    # neither cache-walled nor inaccessible nor already tried this
+                    # call, splice it to the front PROACTIVELY (without re-probing
+                    # the walled lead). Otherwise the cross-call #82 skip would jump
+                    # straight to the next provider even though e.g. codex@gpt-5.5
+                    # has headroom while only @spark is walled.
+                    alt_models = self._model_fallbacks.get(agent_cls) or []
+                    tried = model_fallback_tried.setdefault(agent_cls, set())
+                    if skip_resolved_model:
+                        tried.add(skip_resolved_model)
+                    next_model = next(
+                        (m for m in alt_models
+                         if m not in tried
+                         and not is_rate_limited(skip_provider_key, m)
+                         and not is_model_known_inaccessible(skip_provider_key, m)),
+                        None,
+                    )
+                    if next_model is not None:
+                        tried.add(next_model)
+                        logger.warning(
+                            "[Fallback] %s lead model rate-limited (cached) — trying "
+                            "same-provider model '%s' before switching providers",
+                            skip_provider_key, next_model,
+                        )
+                        self._emit_orchestration(
+                            phase="fallback",
+                            action="model_fallback",
+                            from_worker=skip_provider_key,
+                            to_worker=f"{skip_provider_key}({next_model})",
+                            reason="usage",
+                            reason_category="usage",
+                            attempt=attempts,
+                            attempt_total=len(self._chain),
+                        )
+                        pending.insert(0, (agent_cls, next_model))
+                        respliced += 1
+                        continue
+                    # No viable same-provider alternate — skip the whole provider.
+                    # SAFETY: never skip down to ZERO attempts; if every remaining
+                    # candidate is cache-walled AND nothing has run this call, attempt
+                    # anyway (a run that probes nothing is a worse regression).
+                    any_viable_left = any(
+                        not is_rate_limited(
+                            c.__name__,
+                            (m or self._configs.get(c, {}).get("model", self.model)),
+                        )
+                        for (c, m) in pending
+                    )
+                    if any_viable_left or ran_any:
+                        skip_label = skip_provider_key
+                        if model_override:
+                            skip_label = f"{skip_label}({model_override})"
+                        logger.warning(
+                            "[Fallback] %s rate-limited until reset — skipping "
+                            "(cached resets_at)", skip_label,
+                        )
+                        self._emit_orchestration(
+                            phase="fallback",
+                            action="rate_limit_skip",
+                            from_worker=skip_label,
+                            reason="usage",
+                            reason_category="usage",
+                            attempt=attempts,
+                            attempt_total=len(self._chain),
+                        )
+                        continue
+                    # else: nothing viable left AND nothing ran -> fall through and
+                    # attempt this one anyway rather than exhaust to zero attempts.
                 attempts += 1
                 label = agent_cls.__name__
                 if model_override:
@@ -383,6 +529,7 @@ def make_fallback_agent(
 
                 logger.info("[Fallback] provider %d/%d: %s", attempts, total, label)
                 try:
+                    ran_any = True
                     result = await sub.run_async(piped_input)
                 except Exception as exc:
                     stderr = getattr(sub, "stderr", "") or ""
@@ -468,6 +615,17 @@ def make_fallback_agent(
                     provider_key = agent_cls.__name__
                     current_model = model_override or self._configs.get(
                         agent_cls, {}).get("model", self.model)
+                    # Issue #82: a usage wall that reported a reset time gets cached so
+                    # the NEXT call skips THIS specific (provider, model) until the
+                    # window clears, instead of re-probing + re-walling it every call.
+                    # Recorded REGARDLESS of whether a sibling model exists — it caches
+                    # the exact walled (provider, model). A wall with no/malformed
+                    # resets_at is silently not cached -> still re-probed as before.
+                    if looked_like_usage:
+                        record_rate_limited(
+                            provider_key, current_model,
+                            getattr(sub, "usage_wall_resets_at", None),
+                        )
                     if looked_like_model_unavailable:
                         record_inaccessible_model(provider_key, current_model)
                         logger.warning(
