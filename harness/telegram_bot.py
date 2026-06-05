@@ -37,9 +37,10 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import fcntl  # POSIX-only; the singleton poller lock degrades gracefully without it
@@ -70,20 +71,16 @@ logger = logging.getLogger(__name__)
 # command menu/autocomplete (issue #63: "it's not registering my commands"). Kept
 # in sync with handle_command + HELP_TEXT.
 BOT_COMMANDS: List[Dict[str, str]] = [
+    {"command": "build", "description": "launch a build: /build <instruction> [--mode m]"},
+    {"command": "cancel", "description": "abort a run (latest | <run_id>)"},
+    {"command": "retry", "description": "re-run a finished run (latest | <run_id>)"},
+    {"command": "run", "description": "facets: [id] summary|why|files|diff"},
+    {"command": "notify", "description": "mute / watch / quiet / verbosity controls"},
     {"command": "status", "description": "most recent run (or in-progress)"},
-    {"command": "summary", "description": "rich recap card for a run"},
-    {"command": "files", "description": "list files changed by a run"},
-    {"command": "why", "description": "explain the verdict/reconciliation"},
     {"command": "runs", "description": "recent runs (default 5)"},
     {"command": "track", "description": "follow a live run (latest | <id> | all)"},
-    {"command": "untrack", "description": "stop following a live run"},
-    {"command": "verbosity", "description": "show or set notification verbosity"},
-    {"command": "mute", "description": "silence progress updates (30m|2h|on)"},
-    {"command": "watch", "description": "resume updates (unmute)"},
-    {"command": "quiet", "description": "quiet hours HH:MM-HH:MM (or off)"},
     {"command": "health", "description": "poller status, live runs, last outcome"},
     {"command": "tail", "description": "last N rendered events (default 10)"},
-    {"command": "diff", "description": "changed-files diff summary"},
     {"command": "help", "description": "list commands"},
 ]
 
@@ -304,8 +301,10 @@ def _short_tag(run_id: str) -> str:
 
 # Verbs the inline-keyboard buttons (and their callback_data) carry. callback_data
 # is "verb:short_run_id" (<=64 bytes); the dispatch routes each verb to an
-# existing read-only helper. Unknown verbs are a safe no-op.
-CALLBACK_VERBS = ("files", "why", "diff")
+# existing read-only helper. Unknown verbs are a safe no-op. `approve`/`reject`
+# are the mission-critical gate buttons (D): they write a gate_decision.json
+# sidecar — an OPT-IN seam that the default dispatch flow does NOT consume.
+CALLBACK_VERBS = ("files", "why", "diff", "approve", "reject")
 
 
 def build_run_keyboard(run_id: str) -> Optional[dict]:
@@ -324,6 +323,56 @@ def build_run_keyboard(run_id: str) -> Optional[dict]:
             {"text": "📊 Diff", "callback_data": f"diff:{short}"},
         ]]
     }
+
+
+def build_gate_keyboard(run_id: str) -> Optional[dict]:
+    """Inline-keyboard reply_markup for a mission-critical gate: [✅ Approve] [⛔ Reject].
+
+    callback_data is ``"approve:<short>"`` / ``"reject:<short>"`` (the short tag
+    keeps it well under Telegram's 64-byte cap). A tap writes
+    ``runs/<id>/gate_decision.json`` (see :func:`_record_gate_decision`); the
+    default dispatch flow does NOT block on that sidecar (D). Returns None when
+    there is no run id to attach to.
+    """
+    short = _short_tag(run_id)
+    if not short:
+        return None
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"approve:{short}"},
+            {"text": "⛔ Reject", "callback_data": f"reject:{short}"},
+        ]]
+    }
+
+
+def _now() -> float:
+    """Wall clock seam (server-stamped gate ts). Patchable in tests."""
+    import time
+
+    return time.time()
+
+
+def _record_gate_decision(run_id: str, decision: str) -> str:
+    """Write ``runs/<id>/gate_decision.json`` for an approve/reject tap (D).
+
+    The timestamp is stamped SERVER-side via :func:`_now` (never a
+    client-supplied value). Best-effort; never raises. The run-side CONSUMPTION
+    of this sidecar is out of scope — this only provides the write seam.
+    """
+    d = _run_dir_by_id(run_id)
+    if d is None:
+        return "📭 <b>Run not found</b>"
+    payload = {"decision": decision, "ts": _now()}
+    try:
+        (d / "gate_decision.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    except Exception as exc:
+        logger.debug("telegram gate_decision write failed: %s", exc)
+        return "⚠️ Could not record the gate decision."
+    icon = "✅" if decision == "approve" else "⛔"
+    verb = "approved" if decision == "approve" else "rejected"
+    return f"{icon} Gate <b>{verb}</b> · <code>{_e(_short_tag(run_id))}</code>"
 
 
 def _resolve_short_tag(tag: str) -> Optional[str]:
@@ -723,23 +772,27 @@ def summarize_runs(n: int = 5) -> str:
 # --------------------------------------------------------------------------- #
 HELP_TEXT = (
     "🤖 <b>AgentOrch build bot</b>\n"
+    "<b>Actions</b>\n"
+    "/build &lt;instruction&gt; [--mode m] [--test-cmd c] [--mission-critical] "
+    "[--web-search] — launch a build\n"
+    "/cancel [latest|&lt;run_id&gt;] — abort a running dispatch\n"
+    "/retry [latest|&lt;run_id&gt;] — re-run a finished run's instruction\n"
+    "<b>Inspect</b>\n"
+    "/run [latest|&lt;id&gt;] [summary|why|files|diff] — recap facets (default: summary)\n"
     "/status — most recent run\n"
-    "/summary [latest|<run_id>] — rich recap card\n"
-    "/files [latest|<run_id>] — list changed files\n"
-    "/why [latest|<run_id>] — explain the verdict\n"
     "/runs [N] — recent runs (default 5)\n"
-    "/verbosity [level] — show or set default ("
-    + " / ".join(VERBOSITY_ORDER)
-    + ")\n"
     "/track [latest|&lt;run_id&gt;|all] — follow a live run (default: latest)\n"
     "/untrack [&lt;run_id&gt;|all] — stop following (default: all)\n"
-    "/mute [30m|2h|on] — silence progress (failures + summary still come)\n"
-    "/watch — resume updates (unmute)\n"
-    "/quiet HH:MM-HH:MM — quiet hours (DND); /quiet off to clear\n"
-    "/health — poller status, live runs, last outcome, recent signals\n"
-    "/tail [N] [run] — last N rendered events (default 10, latest run)\n"
-    "/diff [run] — changed-files diff summary + first lines\n"
-    "/help — this message"
+    "/health — poller status, live runs, last outcome\n"
+    "/tail [N] [run] — last N rendered events (default 10)\n"
+    "<b>Notifications</b>\n"
+    "/notify [show | mute 30m|2h|on | watch | quiet HH:MM-HH:MM|off | "
+    "verbosity &lt;lvl&gt;] — one place for "
+    + " / ".join(VERBOSITY_ORDER)
+    + "\n"
+    "/help — this message\n"
+    "<i>Aliases still work: /summary /files /why /diff → /run · "
+    "/mute /watch /quiet /verbosity → /notify</i>"
 )
 
 
@@ -1066,6 +1119,423 @@ def _handle_diff_command(run_id: str, *, max_lines: int = 60) -> str:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# A. Action commands — DRIVE builds from the phone (/build, /cancel, /retry)
+#
+# Every spawn goes through the _spawn_dispatch seam (argv LIST, never a shell
+# string), and every signal through the _killpg / _kill seams, so tests stub
+# them and NO real subprocess / signal is ever issued. The instruction is a
+# SINGLE argv element — shell metacharacters in it are inert (no injection).
+# --------------------------------------------------------------------------- #
+_ALLOWED_MODES = (
+    "direct", "adversarial", "feedback", "cascade", "master", "pat", "vote", "auto",
+)
+# Flags a phone user may append after the instruction. Anything else is dropped
+# (never passed through) so the surface can't smuggle arbitrary CLI flags.
+#
+# SCOPE NOTE: the argv-list spawn makes shell metacharacters in the INSTRUCTION
+# inert, but --test-cmd is a deliberate exception — its value is, by design, run
+# through a shell by QualityVerifier (create_subprocess_shell / `/bin/sh -c`).
+# That mirrors the CLI's own --test-cmd contract; it is intended operator
+# functionality, NOT an instruction-injection hole. The trust boundary for this
+# shell channel is the from.id whitelist (only whitelisted senders reach here),
+# the same boundary that authorises launching builds at all.
+_BUILD_BOOL_FLAGS = ("--mission-critical", "--web-search")
+_BUILD_VALUE_FLAGS = ("--mode", "--test-cmd")
+_BUILD_RECOGNISED_FLAGS = set(_BUILD_BOOL_FLAGS) | set(_BUILD_VALUE_FLAGS)
+
+# Bounded new-run discovery poll (~5s worst case). _sleep is a seam so tests
+# never actually sleep.
+_BUILD_DISCOVER_ATTEMPTS = 25
+_BUILD_DISCOVER_INTERVAL = 0.2
+
+
+def _sleep(seconds: float) -> None:
+    """Sleep seam (patched to a no-op in tests so the poll never blocks)."""
+    import time
+
+    time.sleep(seconds)
+
+
+def _project_root() -> Path:
+    """AgentOrch repo root (cwd for a spawned dispatch). Resolved lazily."""
+    from harness.dispatch import PROJECT_ROOT
+
+    return PROJECT_ROOT
+
+
+def _spawn_dispatch(argv: List[str]) -> int:
+    """Spawn a detached ``python -m harness do …`` and return its pid.
+
+    DETACHED + its own process group (``start_new_session=True``) so the child's
+    recorded ``run.pid`` is killpg-able by /cancel. argv is a LIST — never
+    ``shell=True`` / ``os.system`` / a joined shell string — so a malicious
+    instruction is inert. Tests stub this seam (no real subprocess).
+    """
+    import subprocess
+
+    proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+        argv,
+        cwd=str(_project_root()),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return int(proc.pid)
+
+
+def _signals_self(pid: int) -> bool:
+    """True if signaling ``pid`` would hit the bot's OWN process or process group.
+
+    Defends /cancel against a stale/recycled ``run.pid`` that now resolves to the
+    bot itself (or a process sharing the bot's group): without this, killpg of a
+    reused pid could SIGTERM the daemon. Best-effort — any error answers False
+    (the kill seams stay the backstop), and a detached dispatch (own session via
+    ``start_new_session=True``) is in a distinct group so it is never refused."""
+    try:
+        if pid == os.getpid():
+            return True
+    except Exception:
+        pass
+    try:
+        # os.getpgid raises for a dead pid; treat that as "not us" (proceed).
+        if os.getpgid(pid) == os.getpgid(0):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _killpg(pid: int, sig: int) -> None:
+    """Signal a process GROUP (seam; patched in tests so no real signal fires)."""
+    os.killpg(os.getpgid(pid), sig)
+
+
+def _kill(pid: int, sig: int) -> None:
+    """Signal a single process (seam; patched in tests)."""
+    os.kill(pid, sig)
+
+
+def _parse_build_message(words: List[str]) -> Tuple[str, List[str]]:
+    """Split a /build (or /retry) argument list into (instruction, flags).
+
+    The instruction is EVERYTHING before the first recognised ``--flag``; it is
+    rejoined into a single string (one argv element downstream). From the first
+    recognised flag onward only the allowlist is honoured — ``--mode`` (value
+    must be a known mode), ``--test-cmd <str>``, ``--mission-critical``,
+    ``--web-search``; an unknown flag or a bad ``--mode`` value is dropped, never
+    passed through. Never raises.
+    """
+    toks = [str(w) for w in words]
+    boundary = len(toks)
+    for i, w in enumerate(toks):
+        if w in _BUILD_RECOGNISED_FLAGS:
+            boundary = i
+            break
+    instruction = " ".join(toks[:boundary]).strip()
+    flag_toks = toks[boundary:]
+    flags: List[str] = []
+    i = 0
+    while i < len(flag_toks):
+        tok = flag_toks[i]
+        if tok in _BUILD_BOOL_FLAGS:
+            if tok not in flags:
+                flags.append(tok)
+            i += 1
+        elif tok in _BUILD_VALUE_FLAGS:
+            # Consume value tokens up to the next recognised flag (so a
+            # multi-word --test-cmd survives), then validate.
+            j = i + 1
+            val_toks: List[str] = []
+            while j < len(flag_toks) and flag_toks[j] not in _BUILD_RECOGNISED_FLAGS:
+                val_toks.append(flag_toks[j])
+                j += 1
+            val = " ".join(val_toks).strip()
+            if val:
+                if tok == "--mode":
+                    if val in _ALLOWED_MODES:
+                        flags.extend([tok, val])
+                    # bad mode -> drop silently
+                else:  # --test-cmd
+                    flags.extend([tok, val])
+            i = j
+        else:
+            # Unrecognised flag/token among the trailing flags -> drop.
+            i += 1
+    return instruction, flags
+
+
+def _build_dispatch_argv(instruction: str, flags: List[str]) -> List[str]:
+    """Construct the dispatch argv as a LIST (instruction is one element)."""
+    return [sys.executable, "-m", "harness", "do", instruction, *list(flags)]
+
+
+def _discover_new_run(before: set) -> Optional[str]:
+    """Poll briefly+bounded for a run dir that did not exist in ``before``.
+
+    Returns the newest (mtime-desc) new run id, or None if none appears within
+    the bounded window. Never raises, never hangs (each attempt is capped and
+    sleeps via the _sleep seam)."""
+    attempts = max(1, _BUILD_DISCOVER_ATTEMPTS)
+    for i in range(attempts):
+        try:
+            current = [d.name for d in _run_dirs()]  # mtime desc
+        except Exception:
+            current = []
+        for name in current:
+            if name not in before:
+                return name
+        if i < attempts - 1:
+            try:
+                _sleep(_BUILD_DISCOVER_INTERVAL)
+            except Exception:
+                break
+    return None
+
+
+def _launch_and_track(
+    argv: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """Spawn a dispatch, discover the new run, auto-track it, reply. Never raises."""
+    try:
+        before = {d.name for d in _run_dirs()}
+    except Exception:
+        before = set()
+    try:
+        pid = _spawn_dispatch(argv)
+    except Exception as exc:
+        logger.debug("telegram build spawn failed: %s", exc)
+        return "⚠️ Could not launch the build."
+    try:
+        new_run = _discover_new_run(before)
+    except Exception:
+        new_run = None
+    if new_run:
+        try:
+            # Reuse the /track plumbing, then guarantee registration even if a
+            # brand-new run isn't classed "live" yet (run.pid race).
+            _handle_track(
+                [new_run], state=state, chat_id=chat_id, state_file=state_file
+            )
+            entry = _chat_tracking(state, chat_id)
+            if new_run not in entry:
+                entry[new_run] = 0
+                save_state(state, state_file)
+        except Exception as exc:
+            logger.debug("telegram build auto-track failed: %s", exc)
+        return (
+            f"🚀 Launched <code>{_e(new_run)}</code> (pid {pid}) — tracking it now."
+        )
+    return f"🚀 Launched (pid {pid}); the run will appear shortly."
+
+
+def _handle_build(
+    args: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """/build <instruction…> [--mode m] [--test-cmd c] [--mission-critical] [--web-search]."""
+    instruction, flags = _parse_build_message(args)
+    if not instruction:
+        return (
+            "⚙️ <b>/build &lt;instruction&gt;</b> "
+            "[--mode direct|adversarial|feedback|cascade|master|pat|vote|auto] "
+            "[--test-cmd &lt;cmd&gt;] [--mission-critical] [--web-search]"
+        )
+    argv = _build_dispatch_argv(instruction, flags)
+    return _launch_and_track(
+        argv, state=state, chat_id=chat_id, state_file=state_file
+    )
+
+
+def _resolve_target_dir(target: str) -> Optional[Path]:
+    """Resolve a 'latest' / full-id / short-tag target to a run dir, or None."""
+    t = (target or "latest").strip()
+    if t.lower() in ("", "latest"):
+        return latest_live_run() or (_run_dirs()[0] if _run_dirs() else None)
+    full = _resolve_short_tag(t) or t
+    return _run_dir_by_id(full)
+
+
+def _handle_cancel(
+    args: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """/cancel [latest|<run_id>] — SIGTERM the dispatch recorded in run.pid.
+
+    Only ever signals a pid READ from a real ``runs/<id>/run.pid`` (never an
+    arbitrary/unrecorded pid). killpg first, then a plain-kill fallback; both go
+    through patchable seams. Never raises."""
+    target = (args[0].strip() if args else "latest")
+    if target.lower() in ("", "latest"):
+        d = latest_live_run()
+        if d is None:
+            return "📭 No live run to cancel."
+    else:
+        d = _resolve_target_dir(target)
+    if d is None:
+        return "📭 <b>Run not found</b>"
+    pid_file = d / "run.pid"
+    if not pid_file.exists():
+        return f"📭 No pid recorded for <code>{_e(_short_tag(d.name))}</code>."
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except Exception:
+        return f"⚠️ Unreadable pid for <code>{_e(_short_tag(d.name))}</code>."
+    if pid <= 0:
+        return f"⚠️ Invalid pid for <code>{_e(_short_tag(d.name))}</code>."
+    short = _short_tag(d.name)
+    # Terminal-state gate: meta.json is written ONLY when a run finishes, but
+    # run.pid is never cleared — so a finished run keeps a stale (possibly
+    # OS-recycled) pid on disk. The "latest" branch is already liveness-filtered
+    # by latest_live_run(); guard the explicit-id branch here so /cancel of a
+    # completed run never signals whatever process now owns that recycled pid.
+    if (d / "meta.json").exists():
+        return f"✅ <code>{_e(short)}</code> already finished (nothing to cancel)."
+    # Never signal ourselves: a recycled pid that resolves to the bot's own
+    # process/group would otherwise let /cancel SIGTERM the daemon.
+    if _signals_self(pid):
+        return f"⚠️ Refusing to cancel <code>{_e(short)}</code> — recorded pid is the bot itself."
+    try:
+        _killpg(pid, signal.SIGTERM)
+        return f"🛑 Signaled <code>{_e(short)}</code> (pid {pid})."
+    except Exception:
+        pass
+    # killpg failed for ANY reason -> fall back to a single-process kill.
+    try:
+        _kill(pid, signal.SIGTERM)
+        return f"🛑 Signaled <code>{_e(short)}</code> (pid {pid})."
+    except ProcessLookupError:
+        return f"✅ <code>{_e(short)}</code> already finished (pid {pid} gone)."
+    except Exception:
+        return f"✅ <code>{_e(short)}</code> already finished (pid {pid} gone)."
+
+
+def _handle_retry(
+    args: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """/retry [latest|<run_id>] — re-dispatch a finished run's instruction."""
+    target = args[0] if args else "latest"
+    d = _resolve_target_dir(target)
+    if d is None:
+        return "📭 <b>Run not found</b>"
+    prompt_file = d / "prompt.txt"
+    if not prompt_file.exists():
+        return f"📭 No prompt recorded for <code>{_e(_short_tag(d.name))}</code>."
+    try:
+        instruction = prompt_file.read_text(encoding="utf-8").strip()
+    except Exception:
+        return f"⚠️ Could not read the prompt for <code>{_e(_short_tag(d.name))}</code>."
+    if not instruction:
+        return f"📭 Empty prompt for <code>{_e(_short_tag(d.name))}</code>."
+    flags: List[str] = []
+    meta = _read_meta(d) or {}
+    mode = meta.get("mode")
+    if isinstance(mode, str) and mode in _ALLOWED_MODES:
+        flags.extend(["--mode", mode])
+    argv = _build_dispatch_argv(instruction, flags)
+    return _launch_and_track(
+        argv, state=state, chat_id=chat_id, state_file=state_file
+    )
+
+
+# --------------------------------------------------------------------------- #
+# B. Consolidated verbs — /run (summary|why|files|diff) and /notify subs
+# --------------------------------------------------------------------------- #
+_RUN_FACETS = ("summary", "why", "files", "diff")
+
+
+def _handle_run_command(args: List[str]) -> str:
+    """/run [latest|<id>] [summary|why|files|diff] — folds /summary /why /files /diff."""
+    toks = [a.strip() for a in args if a and a.strip()]
+    run_id = "latest"
+    facet = "summary"
+    if toks:
+        if toks[0].lower() in _RUN_FACETS:
+            facet = toks[0].lower()
+            if len(toks) > 1:
+                run_id = toks[1]
+        else:
+            run_id = toks[0]
+            if len(toks) > 1:
+                facet = toks[1].lower()
+    if facet not in _RUN_FACETS:
+        return (
+            "ℹ️ <b>/run [latest|&lt;id&gt;] [summary|why|files|diff]</b> "
+            "(default: summary)"
+        )
+    if facet == "summary":
+        return summarize_run(run_id)
+    if facet == "why":
+        return _handle_why(run_id)
+    if facet == "files":
+        return _handle_files(run_id)
+    return _handle_diff_command(run_id)
+
+
+def _handle_verbosity(
+    args: List[str], *, state: dict, state_file: Optional[str]
+) -> str:
+    """Show or set the persisted default verbosity (shared by /verbosity + /notify)."""
+    if not args:
+        return f"🔧 Default verbosity: <b>{_e(get_verbosity(state))}</b>"
+    requested = args[0].strip().lower()
+    if requested not in VERBOSITY_ORDER:
+        return (
+            f"⚠️ Unknown level <code>{_e(requested)}</code>. "
+            f"Choose: {', '.join(VERBOSITY_ORDER)}"
+        )
+    state["verbosity"] = requested
+    save_state(state, state_file)
+    return f"✅ Default verbosity set to <b>{_e(requested)}</b>"
+
+
+def _notify_show(state: dict, chat_id: Any) -> str:
+    """One-card view of the chat's mute + quiet + verbosity state."""
+    prefs = _chat_prefs(state, chat_id)
+    mute_until = prefs.get("mute_until")
+    if mute_until == "on":
+        mute_str = "🔕 muted (indefinite)"
+    elif isinstance(mute_until, (int, float)):
+        import time as _t
+
+        remaining = mute_until - _t.time()
+        if remaining > 0:
+            mute_str = f"🔕 muted ~{int(remaining // 60)}m"
+        else:
+            mute_str = "🔔 on"
+    else:
+        mute_str = "🔔 on"
+    quiet = prefs.get("quiet_window")
+    quiet_str = _e(str(quiet)) if quiet else "off"
+    verb = get_verbosity(state)
+    return (
+        "🔔 <b>Notifications</b>\n"
+        f"Updates: {mute_str}\n"
+        f"Quiet hours: <b>{quiet_str}</b>\n"
+        f"Verbosity: <b>{_e(verb)}</b>"
+    )
+
+
+def _handle_notify(
+    args: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """/notify [show|mute …|watch|quiet …|verbosity <lvl>] — folds /mute /watch /quiet /verbosity."""
+    sub = (args[0].strip().lower() if args else "show")
+    rest = list(args[1:])
+    if sub in ("", "show"):
+        return _notify_show(state, chat_id)
+    if sub == "mute":
+        return _handle_mute(rest, state=state, chat_id=chat_id, state_file=state_file)
+    if sub == "watch":
+        return _handle_watch(rest, state=state, chat_id=chat_id, state_file=state_file)
+    if sub == "quiet":
+        return _handle_quiet(rest, state=state, chat_id=chat_id, state_file=state_file)
+    if sub == "verbosity":
+        return _handle_verbosity(rest, state=state, state_file=state_file)
+    return (
+        "ℹ️ <b>/notify</b> [show | mute 30m|2h|on | watch | "
+        "quiet HH:MM-HH:MM|off | verbosity &lt;lvl&gt;]"
+    )
+
+
 def handle_command(
     text: str,
     *,
@@ -1092,28 +1562,31 @@ def handle_command(
         )
     if cmd == "/help":
         return HELP_TEXT
+    # ---- A. action verbs (drive builds from the phone) ----
+    if cmd == "/build":
+        return _handle_build(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/cancel":
+        return _handle_cancel(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/retry":
+        return _handle_retry(args, state=state, chat_id=chat_id, state_file=state_file)
+    # ---- B. consolidated verbs ----
+    if cmd == "/run":
+        return _handle_run_command(args)
+    if cmd == "/notify":
+        return _handle_notify(args, state=state, chat_id=chat_id, state_file=state_file)
     if cmd == "/status":
         return summarize_latest()
+    # /summary /files /why /diff are thin back-compat aliases -> /run facets.
     if cmd == "/summary":
-        return summarize_run(args[0] if args else "latest")
+        return _handle_run_command(["summary", args[0]] if args else ["summary"])
     if cmd == "/files":
-        return _handle_files(args[0] if args else "latest")
+        return _handle_run_command(["files", args[0]] if args else ["files"])
     if cmd == "/why":
-        return _handle_why(args[0] if args else "latest")
+        return _handle_run_command(["why", args[0]] if args else ["why"])
     if cmd == "/runs":
         return summarize_runs(args[0] if args else 5)
-    if cmd == "/verbosity":
-        if not args:
-            return f"🔧 Default verbosity: <b>{_e(get_verbosity(state))}</b>"
-        requested = args[0].strip().lower()
-        if requested not in VERBOSITY_ORDER:
-            return (
-                f"⚠️ Unknown level <code>{_e(requested)}</code>. "
-                f"Choose: {', '.join(VERBOSITY_ORDER)}"
-            )
-        state["verbosity"] = requested
-        save_state(state, state_file)
-        return f"✅ Default verbosity set to <b>{_e(requested)}</b>"
+    if cmd == "/verbosity":  # back-compat alias -> /notify verbosity
+        return _handle_verbosity(args, state=state, state_file=state_file)
     if cmd == "/track":
         return _handle_track(args, state=state, chat_id=chat_id, state_file=state_file)
     if cmd == "/showliveall":  # alias for /track all
@@ -1207,6 +1680,11 @@ class BotDaemon:
                             reply = _handle_why(run_id)
                         elif verb == "diff":
                             reply = _handle_diff(run_id)
+                        elif verb in ("approve", "reject"):
+                            # Mission-critical gate sidecar (D): write
+                            # gate_decision.json; the default flow does NOT block
+                            # on it. Server-stamped ts (never client-supplied).
+                            reply = _record_gate_decision(run_id, verb)
 
             if reply and chat_id is not None:
                 try:

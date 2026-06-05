@@ -111,11 +111,16 @@ def _state():
 # Public surface: commands wired into help + the menu
 # --------------------------------------------------------------------------- #
 def test_f3_commands_in_help_and_bot_commands():
+    # /diff is still reachable (now folded under /run diff, listed in HELP_TEXT's
+    # alias line) but the consolidation contract deliberately keeps deprecated
+    # aliases OUT of the setMyCommands menu, so only the canonical verbs appear.
     for cmd in ("/health", "/tail", "/diff"):
         assert cmd in tb.HELP_TEXT, f"{cmd} missing from HELP_TEXT"
     names = {c["command"] for c in tb.BOT_COMMANDS}
-    for c in ("health", "tail", "diff"):
+    for c in ("health", "tail"):
         assert c in names, f"{c} missing from BOT_COMMANDS"
+    # /diff still answers as a back-compat alias even though it's not in the menu.
+    assert tb.handle_command("/diff", state=tb.load_state(), chat_id=FAKE_CHAT_ID) is not None
 
 
 # --------------------------------------------------------------------------- #
