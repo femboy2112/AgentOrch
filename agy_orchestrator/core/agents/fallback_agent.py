@@ -19,6 +19,7 @@ from agy_orchestrator.core.agent import (
     WATCHDOG_TRANSPORT_STALL,
     AgentInstance,
     is_context_overflow,
+    is_model_unavailable,
     is_transport_error,
     is_usage_wall,
     is_wedged_session,
@@ -36,6 +37,29 @@ PostConstructHook = Callable[[AgentInstance, Type[AgentInstance]], None]
 
 # Agent classes that support warm-session resume across calls.
 _SESSION_CAPABLE = (ClaudeAgent, GrokAgent)
+
+# Process-level dynamic model-availability cache. When a provider's model fails
+# with a model-unavailable signature (e.g. codex reports "model is not supported
+# when using a ChatGPT account" — invisible on stderr, folded in by CodexAgent),
+# we record (provider_class_name, model) here so NO later step in this process ever
+# offers that model again. This is the "dynamic detection" the operator asked for:
+# the valid fallback set self-discovers per account instead of being hardcoded — a
+# model the account can't use is tried at most once, then pruned for the run.
+_INACCESSIBLE_MODELS: set = set()
+
+
+def record_inaccessible_model(provider: str, model: Optional[str]) -> None:
+    if model:
+        _INACCESSIBLE_MODELS.add((provider, str(model)))
+
+
+def is_model_known_inaccessible(provider: str, model: Optional[str]) -> bool:
+    return bool(model) and (provider, str(model)) in _INACCESSIBLE_MODELS
+
+
+def reset_inaccessible_models() -> None:
+    """Clear the dynamic model-availability cache (test/diagnostic hook)."""
+    _INACCESSIBLE_MODELS.clear()
 
 
 def _watchdog_reason_in(stderr: str) -> Optional[str]:
@@ -122,6 +146,7 @@ def make_fallback_agent(
     configs: Optional[Dict[Type[AgentInstance], Dict[str, object]]] = None,
     watchdog_rules: Optional[Dict[str, List[Type[AgentInstance]]]] = None,
     post_construct_hook: Optional[PostConstructHook] = None,
+    model_fallbacks: Optional[Dict[Type[AgentInstance], List[str]]] = None,
 ) -> Type[AgentInstance]:
     """Return an AgentInstance subclass that tries ``chain`` in order per call.
 
@@ -150,6 +175,16 @@ def make_fallback_agent(
 
     Rules apply ONCE per trip and re-enter the normal sequence afterwards, so a
     bad chain order can't get stuck in an infinite rules-table ping-pong.
+
+    ``model_fallbacks`` optionally maps an agent class to an ordered list of
+    ALTERNATE model names to try on the SAME provider when it hits a usage/quota
+    wall, BEFORE advancing to the next provider in the chain. Codex's spark window
+    can be exhausted while the account still has headroom on gpt-5.5/gpt-5.4 — those
+    are separate rate-limit windows — so a per-model wall should retry the provider
+    on its other models first (operator request). Each alternate is tried at most
+    once per ``run_async``; once they're exhausted the chain advances normally. Only
+    a usage wall triggers this (a transport blip / generic error does not) so it
+    composes with the bounded transport-retry path without double-counting.
     """
 
     if not chain:
@@ -163,6 +198,9 @@ def make_fallback_agent(
         _configs: Dict[Type[AgentInstance], Dict[str, object]] = dict(configs or {})
         _watchdog_rules: Dict[str, List[Type[AgentInstance]]] = {
             reason: list(targets) for reason, targets in (watchdog_rules or {}).items()
+        }
+        _model_fallbacks: Dict[Type[AgentInstance], List[str]] = {
+            cls_: list(models) for cls_, models in (model_fallbacks or {}).items()
         }
         _post_construct_hook: Optional[PostConstructHook] = post_construct_hook
 
@@ -178,9 +216,14 @@ def make_fallback_agent(
             # Satisfies the ABC; never used because run_async is overridden.
             return []
 
-        def _make_sub(self, agent_cls: Type[AgentInstance]) -> AgentInstance:
+        def _make_sub(self, agent_cls: Type[AgentInstance],
+                      model_override: Optional[str] = None) -> AgentInstance:
             cfg = self._configs.get(agent_cls, {})
-            model = cfg.get("model", self.model)
+            # A usage-wall model-fallback (#78 / operator request) re-runs the SAME
+            # provider on a different model; the override wins over both the per-
+            # provider config model and the wrapper's self.model, while the rest of
+            # the provider's config (effort, codex config_overrides) still applies.
+            model = model_override or cfg.get("model", self.model)
             effort = cfg.get("effort", getattr(self, "effort", None))
             kwargs: dict[str, object] = {"prompt": self.prompt, "model": model}
             if effort:
@@ -274,8 +317,15 @@ def make_fallback_agent(
             if base and off:
                 off %= len(base)
                 base = base[off:] + base[:off]
-            pending: List[Type[AgentInstance]] = base * self._cycles
+            # Each pending entry is (agent_cls, model_override): None means "use the
+            # provider's configured model". A usage-wall model-fallback splices the
+            # same class with a different model override (see below).
+            pending: List[tuple] = [(c, None) for c in base] * self._cycles
             total = len(pending)
+            # Per-provider set of alternate models already tried this run, so each
+            # configured model_fallback is attempted at most once (the provider's
+            # initial configured model counts as already-used via the empty-seed).
+            model_fallback_tried: Dict[Type[AgentInstance], set] = {}
             attempts = 0
             # Per-provider count of bounded same-provider transport retries already
             # spent, so a flapping link can't loop a single provider forever (#57).
@@ -309,7 +359,7 @@ def make_fallback_agent(
             # transport budget must not reset on it.
             respliced = 0
             while pending:
-                agent_cls = pending.pop(0)
+                agent_cls, model_override = pending.pop(0)
                 # A normal-sequence advance (not a re-spliced retry/reroute) drains
                 # one base-chain slot; crossing a base_len boundary starts a fresh
                 # cycle, at which point the per-provider transport-retry budget is
@@ -322,8 +372,10 @@ def make_fallback_agent(
                     base_consumed += 1
                 attempts += 1
                 label = agent_cls.__name__
+                if model_override:
+                    label = f"{label}({model_override})"
                 try:
-                    sub = self._make_sub(agent_cls)
+                    sub = self._make_sub(agent_cls, model_override)
                 except Exception as exc:  # construction failure -> skip provider
                     logger.warning("[Fallback] could not build %s: %s", label, exc)
                     last_error = exc
@@ -339,6 +391,10 @@ def make_fallback_agent(
                     looked_like_overflow = is_context_overflow(stderr)
                     looked_like_usage = is_usage_wall(stderr)
                     looked_like_wedged = is_wedged_session(stderr)
+                    # The requested model is inaccessible to this account (codex
+                    # reports it only in its --json stdout, folded into stderr by
+                    # CodexAgent). Prune it dynamically and try a sibling model.
+                    looked_like_model_unavailable = is_model_unavailable(stderr)
                     reason = _watchdog_reason_in(stderr)
                     # A transport blip (plain network reset, or the watchdog's
                     # transport-stall trip) failed the CONNECTION, not the provider.
@@ -387,16 +443,72 @@ def make_fallback_agent(
                             attempt=attempts,
                             attempt_total=len(self._chain),
                         )
-                        # Retry the SAME provider next; it does not consume a chain
-                        # slot conceptually, but counts toward total attempts above.
-                        # Mark it as re-spliced so the next pop doesn't advance the
-                        # cycle (and thus doesn't reset the per-cycle transport budget).
-                        pending.insert(0, agent_cls)
+                        # Retry the SAME provider (same model) next; it does not
+                        # consume a chain slot conceptually, but counts toward total
+                        # attempts above. Mark it as re-spliced so the next pop doesn't
+                        # advance the cycle (and thus doesn't reset the per-cycle
+                        # transport budget).
+                        pending.insert(0, (agent_cls, model_override))
                         respliced += 1
                         if backoff > 0:
                             await asyncio.sleep(backoff)
                         last_error = exc
                         continue
+                    # This provider's CURRENT model can't serve right now — either a
+                    # usage/quota wall (spark window exhausted) OR the model is
+                    # inaccessible to this account. Before switching providers, try
+                    # the provider's OTHER models (operator request / #78): codex's
+                    # spark window can be exhausted while gpt-5.5/gpt-5.4 still have
+                    # headroom (separate windows), and an inaccessible model has a
+                    # sibling that works. No backoff here: a different model is a
+                    # different window. DYNAMIC DETECTION: a model that fails
+                    # inaccessible is recorded process-wide and never offered again,
+                    # so the valid set self-discovers per account instead of being
+                    # hardcoded. Each alternate is used at most once per run.
+                    provider_key = agent_cls.__name__
+                    current_model = model_override or self._configs.get(
+                        agent_cls, {}).get("model", self.model)
+                    if looked_like_model_unavailable:
+                        record_inaccessible_model(provider_key, current_model)
+                        logger.warning(
+                            "[Fallback] %s model unavailable on this account — pruned "
+                            "'%s' for the run", label, current_model,
+                        )
+                    alt_models = self._model_fallbacks.get(agent_cls) or []
+                    if (looked_like_usage or looked_like_model_unavailable) and alt_models:
+                        tried = model_fallback_tried.setdefault(agent_cls, set())
+                        # Never re-pick the model that just failed.
+                        if current_model:
+                            tried.add(current_model)
+                        next_model = next(
+                            (m for m in alt_models
+                             if m not in tried
+                             and not is_model_known_inaccessible(provider_key, m)),
+                            None,
+                        )
+                        if next_model is not None:
+                            tried.add(next_model)
+                            why = "usage" if looked_like_usage else "model_unavailable"
+                            logger.warning(
+                                "[Fallback] %s %s — trying same-provider model '%s' "
+                                "before switching providers", label, why, next_model,
+                            )
+                            self._emit_orchestration(
+                                phase="fallback",
+                                action="model_fallback",
+                                from_worker=label,
+                                to_worker=f"{agent_cls.__name__}({next_model})",
+                                reason=why,
+                                reason_category="usage" if looked_like_usage else "error",
+                                attempt=attempts,
+                                attempt_total=len(self._chain),
+                            )
+                            # Re-splice the SAME provider with the new model to the
+                            # front; mark as re-spliced so it doesn't advance the cycle.
+                            pending.insert(0, (agent_cls, next_model))
+                            respliced += 1
+                            last_error = exc
+                            continue
                     if reason and reason in self._watchdog_rules and reroute_budget > 0:
                         targets = self._watchdog_rules[reason]
                         # Splice rule-based re-route targets to the FRONT of pending,
@@ -406,7 +518,7 @@ def make_fallback_agent(
                         # referencing rules table can't re-splice forever (it drains
                         # to the exhaustion RuntimeError instead of hanging).
                         reroute_budget -= len(targets)
-                        pending[0:0] = list(targets)
+                        pending[0:0] = [(t, None) for t in targets]
                         logger.warning(
                             "[Fallback] %s tripped watchdog:%s — re-routing to %s",
                             label, reason, [c.__name__ for c in targets],
@@ -437,7 +549,7 @@ def make_fallback_agent(
                             f" (watchdog:{reason})" if reason else "",
                             exc,
                         )
-                        to_worker = pending[0].__name__ if pending else None
+                        to_worker = pending[0][0].__name__ if pending else None
                         self._emit_orchestration(
                             phase="fallback",
                             action="reroute",

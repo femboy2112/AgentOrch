@@ -101,6 +101,59 @@ AGENT_DEFAULTS: Dict[str, Dict[str, object]] = {
 GENERATOR_CHAIN: List[str] = ["codex", "agy", "grok"]
 CRITIC_CHAIN: List[str] = ["agy", "codex", "grok"]
 
+# Operator request / #78: when codex hits a usage/quota wall (or its model is
+# inaccessible) on its current model, try its OTHER models BEFORE switching
+# providers. spark's rolling window can be exhausted while gpt-5.5/gpt-5.4 still
+# have headroom (separate rate-limit windows), so a per-model wall should retry the
+# same provider on an untried model first.
+#
+# DYNAMIC DETECTION (operator-requested): the candidate set is codex's whole known-
+# model universe (CodexAgent.AVAILABLE_MODELS) in preference order — NOT a per-
+# account hardcoded list, because account access varies (this account: no gpt-5.2,
+# and gpt-5.3-codex only via the spark variant). The fallback layer detects a model
+# that's inaccessible to the account at RUNTIME (codex reports "model is not
+# supported" only in its --json stdout, empty stderr) and prunes it process-wide so
+# it's never offered again — the valid set self-discovers. Env
+# AGY_CODEX_MODEL_FALLBACKS overrides the order (comma-separated; empty disables).
+
+
+def _codex_model_fallbacks(
+    configs_by_cls: Dict[Type[AgentInstance], Dict[str, object]],
+) -> Dict[Type[AgentInstance], List[str]]:
+    """Per-provider usage-wall model-fallback map for make_fallback_agent.
+
+    Only codex gets one today (its multi-model account is the documented case). The
+    candidate universe is ``CodexAgent.AVAILABLE_MODELS`` (strong models first); the
+    currently-configured model and the ``standard``->``-spark`` alias are excluded so
+    a wall never re-picks the same window. Account-validity is NOT decided here —
+    the fallback layer prunes inaccessible models at runtime (dynamic detection).
+    Env AGY_CODEX_MODEL_FALLBACKS overrides the order; an empty value disables it.
+    Any name not in AVAILABLE_MODELS is dropped (a typo can't reach codex)."""
+    codex_cls = _class_for("codex")
+    if codex_cls not in configs_by_cls:
+        return {}
+    valid = list(getattr(CodexAgent, "AVAILABLE_MODELS", []))
+    raw = os.environ.get("AGY_CODEX_MODEL_FALLBACKS")
+    if raw is not None:
+        order = [m.strip() for m in raw.split(",") if m.strip()]
+    else:
+        order = list(valid)
+    current = str(configs_by_cls.get(codex_cls, {}).get("model") or "")
+    alias = "gpt-5.3-codex-spark" if current == "standard" else current
+    valid_set = set(valid)
+    cleaned: List[str] = []
+    for m in order:
+        if not m or m in (current, alias) or m in cleaned:
+            continue
+        if valid_set and m not in valid_set:
+            logger.warning(
+                "[roles] dropping unknown codex model '%s' from usage-wall "
+                "fallback list (not in CodexAgent.AVAILABLE_MODELS)", m,
+            )
+            continue
+        cleaned.append(m)
+    return {codex_cls: cleaned} if cleaned else {}
+
 
 # --- watchdog arming ------------------------------------------------------- #
 # A single CalibrationTable is loaded on first need and reused for the process.
@@ -298,6 +351,7 @@ def build_role_agent(
     fb_cls = make_fallback_agent(
         classes, cycles=cycles, configs=configs_by_cls,
         post_construct_hook=arm_hook,
+        model_fallbacks=_codex_model_fallbacks(configs_by_cls),
     )
     # Lead config seeds self.model/self.effort; per-provider configs override.
     return fb_cls(prompt=prompt, model=lead_cfg["model"], effort=lead_cfg["effort"])
@@ -364,6 +418,7 @@ def build_master_agent_class(
     fb_cls = make_fallback_agent(
         classes, cycles=cycles, configs=configs_by_cls,
         post_construct_hook=arm_hook,
+        model_fallbacks=_codex_model_fallbacks(configs_by_cls),
     )
     return fb_cls, lead_cfg["model"], lead_cfg["effort"]
 

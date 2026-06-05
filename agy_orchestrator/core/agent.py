@@ -67,6 +67,35 @@ def is_usage_wall(stderr: str) -> bool:
     return any(marker in s for marker in USAGE_MARKERS)
 
 
+# Substrings (lowercased) that indicate the requested MODEL is not available to
+# this account — a per-account access failure, NOT a quota wall and NOT a transient
+# error. codex reports this only in its --json stdout error event (empty stderr):
+#   {"type":"error","message":"...400...The 'gpt-5.2' model is not supported when
+#    using Codex with a ChatGPT account."}
+# The correct response is to STOP offering that model and try a different one
+# (dynamic model detection / operator request): retrying the same model never
+# clears, and a sibling model on the same provider may serve fine. Distinct from a
+# usage wall so the fallback layer PRUNES the model rather than waiting on a quota
+# window that isn't the problem.
+MODEL_UNAVAILABLE_MARKERS = (
+    "is not supported when using", "model is not supported", "model not supported",
+    "does not have access", "model_not_found", "unsupported_model",
+    "does not exist or you do not have access", "invalid_request_error",
+)
+
+
+def is_model_unavailable(stderr: str) -> bool:
+    """True when stderr indicates the requested model is inaccessible to this
+    account (distinct from a quota wall / context overflow / transport blip).
+
+    Conservative: a usage wall or context overflow is never a model-unavailable
+    error, even if a marker overlaps, so a real quota outage can't be mis-pruned."""
+    s = (stderr or "").lower()
+    if is_usage_wall(s) or is_context_overflow(s):
+        return False
+    return any(marker in s for marker in MODEL_UNAVAILABLE_MARKERS)
+
+
 # Substrings (lowercased) that indicate a TRANSPORT/network blip — a websocket
 # reset, a dropped connection, a transient 502/503 — rather than the provider
 # itself being out of quota or the prompt being malformed. Kept deliberately
@@ -446,6 +475,18 @@ class AgentInstance(ABC):
         Default: return it unchanged. Override (claude/grok) to unwrap a JSON
         envelope and capture a resumable session id for warm-cache reuse."""
         return raw_stdout
+
+    def _augment_failure_stderr(self, raw_stdout: str, stderr: str) -> str:
+        """Hook: fold OUT-OF-BAND failure telemetry into ``stderr`` on a non-zero
+        exit, BEFORE the usage-wall / context-overflow / wedged classification.
+
+        Default: return ``stderr`` unchanged (byte-identical for every agent that
+        does not override). ``CodexAgent`` overrides this to read its rollout JSONL
+        — the ONLY place codex reports a real quota wall (rate_limits.used_percent),
+        invisible to the stderr-only classifier (issue #78) — and append a synthetic
+        ``usage limit`` marker so ``is_usage_wall`` fires and the fallback layer
+        demotes/cycles the walled provider instead of retrying it 3x/step."""
+        return stderr
 
     def _cleanup(self) -> None:
         """Release any per-call resources (e.g. a temp prompt file). No-op by default."""
@@ -1284,6 +1325,18 @@ class AgentInstance(ABC):
                             self._emit_event(event)
                         finished = True
                         return self.stdout
+
+                    # Give subclasses a chance to fold OUT-OF-BAND failure telemetry
+                    # into stderr BEFORE classification. Some providers report a real
+                    # quota wall only in a side-channel the classifier never reads —
+                    # codex signals exhaustion solely in its rollout JSONL
+                    # (rate_limits.used_percent), with an EMPTY stderr (issue #78).
+                    # The default impl is a no-op, so non-overriding agents are byte-
+                    # identical; never let a faulty augmentation crash the real path.
+                    try:
+                        self.stderr = self._augment_failure_stderr(raw_stdout, self.stderr)
+                    except Exception as _aug_exc:  # pragma: no cover - defensive
+                        logger.debug("_augment_failure_stderr raised: %s", _aug_exc)
 
                     logger.warning("Attempt %d/%d failed with code %s:\n%s",
                                    attempt, self.max_retries, self.returncode, self.stderr)

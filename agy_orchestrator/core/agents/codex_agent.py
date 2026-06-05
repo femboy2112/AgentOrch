@@ -1,4 +1,6 @@
+import glob
 import json
+import logging
 import math
 import os
 import tempfile
@@ -6,6 +8,166 @@ from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.model_discovery import discover_models
+
+logger = logging.getLogger(__name__)
+
+# A codex usage/quota wall is reported ONLY in the rollout JSONL's token_count
+# event (rate_limits.primary/secondary.used_percent), never on stderr — so the
+# stderr-only classifier misses it and a walled codex is retried 3x/step and
+# re-led every step for the whole window (issue #78). We detect it out-of-band and
+# fold a synthetic marker into stderr. Default threshold is deliberately high (a
+# real wall reports 100.0); overridable for tuning/tests. 0 disables the detector.
+def _codex_usage_wall_percent() -> float:
+    try:
+        v = float(os.environ.get("AGY_CODEX_USAGE_WALL_PERCENT", "99") or "99")
+    except ValueError:
+        v = 99.0
+    return v
+
+
+def _codex_home() -> str:
+    # codex honours CODEX_HOME; default ~/.codex. Sessions live under
+    # <home>/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl.
+    return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def extract_codex_thread_id(raw_stdout: str) -> Optional[str]:
+    """Pull the codex session/thread id from a --json stdout stream.
+
+    codex --json emits a ``{"type":"thread.started","thread_id":"<uuid>"}`` event
+    first; that uuid is the suffix of the rollout filename. Tolerates older
+    ``session.created``/``session_configured`` shapes too. Returns None when the
+    stream carries no start event (e.g. codex died before a session existed)."""
+    for line in raw_stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or "thread" not in line and "session" not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        etype = str(ev.get("type") or ev.get("event") or "")
+        if etype in ("thread.started", "session.created", "session_configured", "session.started"):
+            sess = ev.get("session")
+            nested = sess.get("id") if isinstance(sess, dict) else None
+            tid = (
+                ev.get("thread_id")
+                or ev.get("session_id")
+                or ev.get("id")
+                or nested
+            )
+            if tid:
+                return str(tid)
+    return None
+
+
+def find_codex_rollout(thread_id: str, codex_home: Optional[str] = None) -> Optional[str]:
+    """Locate the rollout JSONL for ``thread_id`` (the uuid suffixes the filename).
+
+    Unique per call, so safe under concurrent ToT branches. Returns the newest
+    match (there is normally exactly one) or None."""
+    if not thread_id:
+        return None
+    home = codex_home or _codex_home()
+    pattern = os.path.join(home, "sessions", "*", "*", "*", f"rollout-*-{thread_id}.jsonl")
+    matches = glob.glob(pattern)
+    if not matches:
+        # Fallback: some codex builds use a flatter sessions/ layout.
+        matches = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*-{thread_id}.jsonl"),
+                            recursive=True)
+    if not matches:
+        return None
+    try:
+        return max(matches, key=os.path.getmtime)
+    except OSError:
+        return matches[0]
+
+
+def read_codex_rate_limits(rollout_path: str) -> Optional[dict]:
+    """Return the LAST token_count event's ``rate_limits`` dict from a rollout, or None.
+
+    Reads the whole (small) JSONL and keeps the final rate_limits seen; tolerant of
+    truncated/garbage lines (a mid-write kill can't crash detection)."""
+    last: Optional[dict] = None
+    try:
+        with open(rollout_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("{") or "rate_limits" not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+                rl = payload.get("rate_limits") if isinstance(payload, dict) else None
+                if isinstance(rl, dict):
+                    last = rl
+    except OSError:
+        return None
+    return last
+
+
+def extract_codex_model_error(raw_stdout: str) -> Optional[str]:
+    """Return codex's error message when the --json stream reports a failed turn,
+    else None. codex emits model-access / request errors ONLY here (empty stderr):
+        {"type":"error","message":"...400...is not supported..."}
+        {"type":"turn.failed","error":{"message":"..."}}
+    Returns the innermost message string so the classifier can inspect it."""
+    found: Optional[str] = None
+    for line in raw_stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or ("error" not in line and "failed" not in line):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        etype = str(ev.get("type") or ev.get("event") or "")
+        if etype in ("error", "turn.failed", "response.failed", "item.failed"):
+            msg = ev.get("message")
+            err = ev.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or msg
+            if msg:
+                found = str(msg)  # keep the LAST (most specific) failure message
+    return found
+
+
+def codex_usage_wall_marker(rate_limits: Optional[dict], threshold: float) -> Optional[str]:
+    """Synthetic stderr marker when codex's rate_limits show a wall, else None.
+
+    Walls when EITHER the primary (rolling, ~5h) OR secondary (weekly) window is at
+    ``used_percent >= threshold``. The returned string contains the literal
+    ``usage limit`` so ``is_usage_wall`` matches it; it also carries the window's
+    ``limit_name``/``resets_at`` so a reader (and the fallback layer) can see which
+    model walled and when it clears. threshold<=0 disables (returns None)."""
+    if not isinstance(rate_limits, dict) or threshold <= 0:
+        return None
+    worst_pct = -1.0
+    worst: dict = {}
+    for key in ("primary", "secondary"):
+        win = rate_limits.get(key)
+        if not isinstance(win, dict):
+            continue
+        pct = win.get("used_percent")
+        if isinstance(pct, (int, float)) and math.isfinite(pct) and pct > worst_pct:
+            worst_pct = float(pct)
+            worst = win
+    if worst_pct < threshold:
+        return None
+    limit_name = rate_limits.get("limit_name") or rate_limits.get("limit_id") or "codex"
+    resets_at = worst.get("resets_at")
+    return (
+        f"usage limit reached (codex rate_limits.used_percent={worst_pct} "
+        f"limit_name={limit_name} resets_at={resets_at})"
+    )
 
 
 class CodexAgent(AgentInstance):
@@ -77,6 +239,57 @@ class CodexAgent(AgentInstance):
                     pass
         msg = self._message_text_from_jsonl(raw_stdout)
         return msg if msg is not None else raw_stdout
+
+    def _augment_failure_stderr(self, raw_stdout: str, stderr: str) -> str:
+        # A real codex quota wall reports nothing on stderr — exhaustion lives only
+        # in the rollout JSONL (rate_limits.used_percent). Read it out-of-band and,
+        # when walled, append a synthetic 'usage limit' marker so is_usage_wall()
+        # fires and the fallback layer demotes/cycles codex instead of retrying a
+        # dead window 3x/step + re-leading it every step (issue #78). Already
+        # carries the marker? leave it. Best-effort: any miss returns stderr as-is
+        # (graceful degrade to the prior, undetected-wall behavior).
+        low = (stderr or "").lower()
+        # (1) Model inaccessible to this account — codex reports it ONLY in the
+        # --json stdout error event (empty stderr). Fold it in so is_model_unavailable
+        # fires and the fallback layer PRUNES this model and tries another (dynamic
+        # model detection / operator request). Cheap (no disk) so check it first.
+        if "is not supported" not in low and "does not have access" not in low:
+            err_msg = extract_codex_model_error(raw_stdout)
+            if err_msg:
+                from agy_orchestrator.core.agent import (
+                    is_model_unavailable as _is_unavail,
+                    is_usage_wall as _is_usage,
+                )
+                # A 'usage'/'rate limit' phrased error still routes to the usage path.
+                if _is_unavail(err_msg) and not _is_usage(err_msg):
+                    logger.warning("[codex] model unavailable (from stdout): %s", err_msg)
+                    return f"{stderr}\n{err_msg}".strip() if stderr else err_msg
+        # (2) Out-of-band quota wall — codex reports exhaustion only in the rollout
+        # JSONL (rate_limits.used_percent), never on stderr (issue #78).
+        if "usage limit" in low:
+            return stderr
+        threshold = _codex_usage_wall_percent()
+        if threshold <= 0:
+            return stderr
+        thread_id = extract_codex_thread_id(raw_stdout)
+        if not thread_id:
+            return stderr
+        rollout = find_codex_rollout(thread_id)
+        if not rollout:
+            return stderr
+        rate_limits = read_codex_rate_limits(rollout)
+        marker = codex_usage_wall_marker(rate_limits, threshold)
+        if not marker:
+            return stderr
+        # Stash structured fields so a caller can skip the walled model until reset.
+        try:
+            primary = (rate_limits or {}).get("primary") or {}
+            self.usage_wall_resets_at = primary.get("resets_at")
+            self.usage_wall_limit_name = (rate_limits or {}).get("limit_name")
+        except Exception:
+            pass
+        logger.warning("[codex] out-of-band quota wall from rollout %s: %s", rollout, marker)
+        return f"{stderr}\n{marker}".strip() if stderr else marker
 
     @staticmethod
     def _message_text_from_jsonl(raw_stdout: str) -> Optional[str]:
