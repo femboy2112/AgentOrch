@@ -956,6 +956,13 @@ class AgentInstance(ABC):
             worker_pgid = os.getpgid(process.pid)
         except Exception:
             worker_pgid = None
+        # Capture the stdout/stderr pipe inodes NOW (while the transports are live)
+        # so that if a grandchild escapes the worker's process group and orphans
+        # past exit, we can still find and kill the actual fd-holder by inode (#80).
+        pipe_inodes = [
+            self._pipe_inode(process.stdout),
+            self._pipe_inode(process.stderr),
+        ]
 
         feed_task = asyncio.ensure_future(_feed())
         out_task = asyncio.ensure_future(
@@ -992,6 +999,15 @@ class AgentInstance(ABC):
             logger.warning(
                 "worker pipe still open %.1fs after exit (orphan holding the fd?); "
                 "abandoning the drain so the call can return (#66)", grace)
+            # #80: don't just abandon the drain — KILL the orphan that's holding the
+            # fd. killpg(worker_pgid) above missed it because it ran in its own
+            # session/group (a worker-spawned `make check` -> `pytest -n auto` tree).
+            # Match by the shared pipe inode so the actual fd-holder dies regardless
+            # of session escaping, instead of running unbounded post-exit.
+            try:
+                self._kill_pipe_fd_holders(pipe_inodes, reason="post-exit drain timeout")
+            except Exception as _exc:  # never let cleanup block the return
+                logger.debug("#80 fd-holder kill raised: %s", _exc)
             out_task.cancel()
             err_task.cancel()
         # Wind down the helper tasks and collect everything (swallow cancellations).
@@ -1056,6 +1072,83 @@ class AgentInstance(ABC):
             proc.kill()
         except Exception:
             pass
+
+    @staticmethod
+    def _pipe_inode(stream) -> Optional[str]:
+        """Return the 'pipe:[N]' inode string for an asyncio subprocess read
+        stream, or None. Used to identify orphans still holding the write-end."""
+        try:
+            transport = stream._transport  # type: ignore[attr-defined]
+            pipe = transport.get_extra_info("pipe")
+            fd = pipe.fileno()
+            return os.readlink(f"/proc/self/fd/{fd}")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _kill_pipe_fd_holders(inodes, reason: str = "") -> int:
+        """SIGKILL every process (other than us) still holding one of ``inodes`` —
+        the write-end of the worker's stdout/stderr pipe (issue #80).
+
+        ``os.killpg(worker_pgid)`` only reaches descendants that stayed in the
+        worker's process group; a worker CLI that runs a build command (e.g. a
+        `make check` -> `pytest -n auto` tree) in its OWN session/group escapes that
+        kill, reparents to init, and keeps running unbounded — #66 then merely
+        ABANDONS the drain instead of terminating it. Matching by the SHARED pipe
+        inode finds the actual fd-holder regardless of session/group escaping, and is
+        safe: only a process that inherited THIS worker's pipe can hold the inode, so
+        no unrelated process is ever touched. Linux-only (/proc); a graceful no-op
+        elsewhere. Returns the number of processes signalled."""
+        targets = {i for i in (inodes or []) if i}
+        if not targets or not os.path.isdir("/proc"):
+            return 0
+        me = os.getpid()
+        killed = 0
+        seen_pgids: set = set()
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except OSError:
+            return 0
+        for pid_s in pids:
+            pid = int(pid_s)
+            if pid == me:
+                continue
+            fd_dir = f"/proc/{pid_s}/fd"
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue  # process gone or not ours to inspect
+            holds = False
+            for fd in fds:
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") in targets:
+                        holds = True
+                        break
+                except OSError:
+                    continue
+            if not holds:
+                continue
+            # Kill the holder's whole group first (reaps its xdist/execnet workers),
+            # then the pid itself as a belt.
+            try:
+                pgid = os.getpgid(pid)
+                if pgid not in seen_pgids:
+                    seen_pgids.add(pgid)
+                    os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if killed:
+            logger.warning(
+                "#80: killed %d orphaned process(es) still holding the worker pipe "
+                "fd%s — they escaped the worker's process group and would otherwise "
+                "run unbounded after the worker exited.", killed,
+                f" ({reason})" if reason else "")
+        return killed
 
     async def _kill_current(self) -> None:
         """Kill and reap the tracked child TREE if it is still running.
