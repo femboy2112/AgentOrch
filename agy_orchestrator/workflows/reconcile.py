@@ -94,6 +94,15 @@ RECONCILE_MANDATE_PREAMBLE = (
     "sub_kind (one of: uncalled, stub_constant, untrained, bypassed_proxy, "
     "mocked_none, saturated) and a file:line.\n"
     "  - absent: the goal requires it and it does not exist.\n\n"
+    "TEST-ESTABLISHED LOAD-BEARING (do NOT flag as dead): a component whose load-"
+    "bearingness is established by the TEST SUITE is not dead wiring. (1) A test "
+    "MODULE is invoked by pytest, not by production code — never call it uncalled/dead "
+    "because the cert/runtime entrypoint doesn't reach it; that is the expected, "
+    "correct state for a test. (2) A deliberately test-gated control/lesion/ablation "
+    "arm — off the default live path BY DESIGN and reached by a dedicated passing test "
+    "that asserts its behaviour — is load-bearing FOR ITS CLAIM; classify it "
+    "load_bearing, not uncalled/bypassed_proxy. Only flag exists_not_load_bearing when "
+    "NOTHING exercises the component — neither the runtime path NOR a test.\n\n"
     "LOAD-BEARING WITNESS: for each mechanism report an ablation witness — ablate the "
     "component and state whether a live/at-scale signal moves. witness value 0 means "
     "DEAD WIRING (a bug masquerading as honest-incomplete); witness > 0 with the "
@@ -157,11 +166,18 @@ class MechanismFinding:
     location: Optional[str] = None
     witness: Witness = field(default_factory=Witness)
     evidence: str = ""
+    # Set when a finding the model called ``exists_not_load_bearing`` is EXCUSED
+    # because its own location is a pytest-collected TEST MODULE — uncalled by runtime
+    # BY DESIGN, not dead wiring (#81). The slug is ``"test_module"``. An excused
+    # finding is kept in the trace for transparency but is NOT counted as runtime-dead.
+    excused: Optional[str] = None
 
     @property
     def is_dead(self) -> bool:
-        """True iff this mechanism exists but is not load-bearing (a real defect)."""
-        return self.classification == "exists_not_load_bearing"
+        """True iff this mechanism exists but is not load-bearing on the RUNTIME path
+        (a real defect). An EXCUSED finding — load-bearing-for-its-claim via the test
+        suite — is not a runtime defect and does NOT count as dead (#81)."""
+        return self.classification == "exists_not_load_bearing" and not self.excused
 
 
 @dataclass
@@ -256,6 +272,16 @@ class ReconciliationResult:
         """Mechanisms the goal requires that do not exist at all."""
         return [f for f in self.findings_list if f.classification == "absent"]
 
+    def excused_findings(self) -> List[MechanismFinding]:
+        """Findings the model called dead but EXCUSED as a test module (#81).
+
+        These were classified ``exists_not_load_bearing`` by the trace yet point at a
+        pytest-collected test module (``excused == "test_module"``); a test being
+        uncalled by production code is by design. They are surfaced for transparency
+        but do not flip ``reconciled`` or appear in the actionable ``findings()`` set."""
+        return [f for f in self.findings_list
+                if f.classification == "exists_not_load_bearing" and f.excused]
+
     def load_bearing_findings(self) -> List[MechanismFinding]:
         """Mechanisms confirmed on the live path with a moving witness."""
         return [f for f in self.findings_list if f.classification == "load_bearing"]
@@ -292,6 +318,7 @@ class ReconciliationResult:
                     "name": f.name,
                     "classification": f.classification,
                     "sub_kind": f.sub_kind,
+                    "excused": f.excused,
                     "location": f.location,
                     "witness": {
                         "value": f.witness.value,
@@ -516,6 +543,60 @@ def _parse_finding(raw: Dict[str, Any]) -> Optional[MechanismFinding]:
     if finding.is_dead and finding.sub_kind is None:
         finding.sub_kind = "uncalled"
     return finding
+
+
+# --- test-module excusal (#81) -------------------------------------------------
+# A reconcile traces reachability from the PRODUCTION / cert entrypoint ONLY, so a
+# TEST MODULE is misread as dead wiring: it is uncalled by runtime BY DESIGN (pytest
+# invokes it, not the cert entrypoint), yet flagging it ``uncalled`` flips
+# reconciled=False and hard-fails the build under disposition=fail. A test module
+# being uncalled by production code is the EXPECTED, correct state — never a defect.
+# We excuse such findings here (kept in the trace for transparency, not counted as
+# dead wiring).
+#
+# We deliberately do NOT try to deterministically excuse the issue's OTHER case — a
+# test-gated control/lesion arm living in PRODUCTION code. Distinguishing such an arm
+# (load-bearing-for-its-claim because a test drives its gate and ASSERTS a behavioural
+# difference) from a genuine dead stub that merely happens to have a unit test is a
+# SEMANTIC judgement about what the test asserts — not something a grep can do safely.
+# An adversarial fuzz pass confirmed any text-matching heuristic over-suppresses real
+# dead wiring (a stub with a unit test + "lesion"/"control" prose would be excused),
+# which is the exact silent-hollow-win this station exists to prevent. That case is
+# handled at the right layer instead: the RECONCILE_MANDATE_PREAMBLE instructs the
+# tracing agent (which can read the test and judge its assertion) to classify a
+# test-gated control arm as load_bearing rather than emitting a dead finding at all.
+
+# pytest's default collection globs: a finding at one of these IS a test module,
+# regardless of directory. A file merely living under a tests/ dir but NOT matching
+# (fixtures, helpers, data, non-pytest shims) is NOT treated as a test — it may be
+# production code, and excusing it would silently bless dead wiring.
+_TEST_FILE_RE = re.compile(r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.py|conftest\.py)$")
+
+
+def _location_path(location: Optional[str]) -> Optional[str]:
+    """The file part of a ``path:line[:col]`` location string (forward-slashed), or None."""
+    if not location:
+        return None
+    loc = str(location).strip()
+    # Drop a pytest nodeid tail (file.py::Class::method) before the :line suffix, so a
+    # legitimately test-located finding reported as a nodeid is still recognized.
+    loc = loc.split("::", 1)[0].strip()
+    m = re.match(r"^(.*?\.py)(?::\d+)*$", loc, re.IGNORECASE)
+    return (m.group(1) if m else loc).replace("\\", "/")
+
+
+def _is_test_path(location: Optional[str]) -> bool:
+    """True iff ``location`` is a pytest-COLLECTED test module (by filename convention:
+    ``test_*.py`` / ``*_test.py`` / ``conftest.py``).
+
+    Intentionally strict: a file merely under a ``tests/`` (or ``test/``) directory but
+    NOT matching the collection globs is NOT a test — it could be production code, and
+    excusing it would silently bless dead wiring (the over-suppression the station
+    exists to prevent)."""
+    path = _location_path(location)
+    if not path:
+        return False
+    return bool(_TEST_FILE_RE.search(path.lower()))
 
 
 class ReconciliationReview:
@@ -880,6 +961,59 @@ class ReconciliationReview:
         )
         return result
 
+    def _excuse_test_exercised_findings(
+        self, result: ReconciliationResult
+    ) -> ReconciliationResult:
+        """Excuse dead findings that point at a pytest-collected TEST MODULE (#81).
+
+        The classifier traces reachability from the cert/production entrypoint ONLY, so
+        a test module is misread as dead wiring (``uncalled``) → flip reconciled=False →
+        hard-fail under disposition=fail. A test module being uncalled by production
+        code is the EXPECTED, correct state, never a defect. Mark such findings
+        ``excused`` (kept in the trace, not counted as dead) and re-derive the verdict.
+
+        Scope is deliberately narrow: only a finding whose own ``location`` is a pytest
+        module (``test_*.py`` / ``*_test.py`` / ``conftest.py``) is excused — a strictly
+        decidable fact. The issue's other case (a test-gated control/lesion arm in
+        PRODUCTION code) is NOT excused here: telling such an arm apart from a genuine
+        dead stub that merely has a unit test requires judging what the test ASSERTS,
+        which a grep cannot do without over-suppressing real dead wiring; that case is
+        steered at the source by the mandate preamble instead. Genuine runtime-dead and
+        MEASURED-dead findings are untouched. Best-effort — never raises into execute()."""
+        dead = [f for f in result.findings_list
+                if f.classification == "exists_not_load_bearing" and not f.excused]
+        if not dead:
+            return result
+        changed = False
+        for f in dead:
+            # A test being uncalled by production code is BY DESIGN. (A pytest module is
+            # never ablation-measured, so excusing it regardless of witness.measured is
+            # sound — _is_test_path matches only true collection-glob filenames.)
+            if _is_test_path(f.location):
+                f.excused = "test_module"
+                changed = True
+        if changed:
+            excused = result.excused_findings()
+            logger.warning(
+                "Reconciliation: excused %d test-module finding(s) — uncalled by "
+                "runtime BY DESIGN, not dead wiring (#81): %s",
+                len(excused),
+                ", ".join(f"{f.name}[{f.excused}]" for f in excused),
+            )
+            self._emit_orchestration(
+                phase="reconcile", action="excused_test_module",
+                excused_count=len(excused),
+            )
+            # Re-derive: a build with NO remaining runtime-dead findings reconciles
+            # (the hollow-empty rule still holds — an empty trace can't read green; a
+            # starved/hollow verdict can never be resurrected to green by excusal).
+            result.reconciled = (
+                not result.is_starved
+                and bool(result.findings_list)
+                and not any(f.is_dead for f in result.findings_list)
+            )
+        return result
+
     async def _cycle_providers_for_verdict(self) -> Optional[ReconciliationResult]:
         """#79: rotate the fallback chain's LEAD through every remaining provider,
         re-asking (JSON-only) until one returns a parseable verdict.
@@ -1001,6 +1135,16 @@ class ReconciliationReview:
         # no-op when no command is set, so the verdict is byte-identical otherwise.
         if self.ablation_enabled:
             result = await self._apply_ablation_witnesses(result)
+
+        # #81: the trace only follows the cert/production entrypoint, so a TEST MODULE
+        # (uncalled by runtime by design) is misread as dead wiring and hard-fails
+        # disposition=fail. Excuse those (kept in the trace, not counted dead) and
+        # re-derive the verdict. Runtime-dead findings stay dead; test-gated control
+        # arms in production code are handled by the mandate preamble, not here.
+        try:
+            result = self._excuse_test_exercised_findings(result)
+        except Exception as exc:  # best-effort: never fail a build on the excusal pass
+            logger.warning("Reconciliation test-exercise excusal raised (continuing): %s", exc)
 
         self.result = result
         self.reconciled = result.reconciled
