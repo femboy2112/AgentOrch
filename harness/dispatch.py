@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1460,6 +1461,10 @@ async def dispatch_async(
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
+    # --git-pr (docs/git-pr-mode-design.md): run on an isolated git worktree +
+    # temp branch (agentorch/<run_id>), commit accepted work to it, and persist a
+    # pr_session.json. Off (default) => zero git ops, byte-identical dispatch.
+    git_pr: bool = False,
     resume_policy: str = "auto",
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
@@ -1658,6 +1663,63 @@ async def dispatch_async(
         (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
     except Exception:
         pass
+
+    # --git-pr preflight + worktree setup (docs/git-pr-mode-design.md). Run on an
+    # isolated git worktree + temp branch so the operator's checkout never moves
+    # and accepted work lands on a reviewable branch (later phases push it as a
+    # draft PR). Refuse FAST on an unsafe tree (non-repo / detached / dirty)
+    # BEFORE any worktree is created — mirroring the #36 data-loss lesson: never
+    # risk clobbering uncommitted work. When off, none of this runs and the
+    # dispatch is byte-identical.
+    git_pr_session = None
+    git_pr_target_repo: Optional[Path] = None
+    git_pr_worktree: Optional[Path] = None
+    if git_pr:
+        from harness import gitpr
+        target_repo = work_dir
+        if not gitpr.is_git_repo(target_repo):
+            raise ValueError(
+                f"--git-pr requires a git repository at {target_repo}; "
+                f"initialise one (and check out a base branch) first"
+            )
+        if gitpr.is_detached_head(target_repo):
+            raise ValueError(
+                "--git-pr requires a checked-out base branch, but HEAD is "
+                "detached at {0}; `git checkout <branch>` first".format(target_repo)
+            )
+        if gitpr.is_dirty(target_repo):
+            raise ValueError(
+                f"--git-pr requires a clean working tree at {target_repo} "
+                f"(commit or stash your changes first); refusing so uncommitted "
+                f"or untracked work can never be clobbered"
+            )
+        base_branch = gitpr.current_branch(target_repo)
+        base_sha = gitpr.head_sha(target_repo)
+        temp_branch = gitpr.branch_name_for_run(run_id)
+        git_pr_worktree = (
+            Path(tempfile.mkdtemp(prefix=f"agentorch-gitpr-{run_id}-")) / "worktree"
+        )
+        gitpr.add_worktree(
+            target_repo, git_pr_worktree, branch=temp_branch, start_point=base_sha,
+        )
+        git_pr_target_repo = target_repo
+        git_pr_session = gitpr.PrSession(
+            run_id=run_id,
+            base_branch=base_branch or "",
+            temp_branch=temp_branch,
+            base_sha=base_sha or "",
+            work_dir=str(git_pr_worktree),
+        )
+        gitpr.save_session(run_dir, git_pr_session)
+        # Repoint the whole run at the worktree: the snapshot scope, worker cwd,
+        # verifier, and run monitor all key off work_dir, so this single
+        # reassignment routes the entire dispatch into the isolated branch
+        # checkout — the operator's own working tree is never touched.
+        work_dir = git_pr_worktree
+        logger.info(
+            "git-pr: base branch=%s -> temp branch=%s (isolated worktree %s)",
+            base_branch, temp_branch, git_pr_worktree,
+        )
 
     # Plan provenance (#56): when --plan injected a file, hash its raw bytes and
     # record where it came from so the executed plan is auditable after the fact.
@@ -2397,6 +2459,51 @@ async def dispatch_async(
         except Exception as exc:
             logger.debug("telegram command poller stop failed: %s", exc)
 
+    # --git-pr finalize (Phase 1): commit any accepted work to the temp branch so
+    # it survives as a reviewable branch, persist the session, then tear down the
+    # worktree. The BRANCH and its commits remain in the operator's repo — only the
+    # throwaway worktree checkout dir is removed (push + draft-PR land in a later
+    # phase). On a commit failure the worktree is RETAINED for inspection so the
+    # worker's writes are never silently lost.
+    if git_pr and git_pr_session is not None:
+        from harness import gitpr
+        committed_ok = True
+        try:
+            msg = f"agentorch {run_id}: {instruction.strip()[:72]}"
+            sha = gitpr.commit(git_pr_worktree, msg)
+            if sha:
+                git_pr_session.commits.append({
+                    "sha": sha,
+                    "outcome": "verified" if final_verified else "unverified",
+                    "title": instruction.strip()[:72],
+                })
+            git_pr_session.verified = final_verified
+            git_pr_session.status = "branch_ready"
+            gitpr.save_session(run_dir, git_pr_session)
+            logger.info(
+                "git-pr: branch %s ready (%d commit(s), verified=%s); "
+                "worktree removed, branch retained",
+                git_pr_session.temp_branch, len(git_pr_session.commits),
+                final_verified,
+            )
+        except gitpr.GitError as exc:
+            committed_ok = False
+            git_pr_session.status = "error"
+            try:
+                gitpr.save_session(run_dir, git_pr_session)
+            except Exception:
+                pass
+            logger.warning(
+                "git-pr: commit failed (%s); RETAINING worktree %s for inspection",
+                exc, git_pr_worktree,
+            )
+        if committed_ok and git_pr_target_repo is not None and git_pr_worktree is not None:
+            gitpr.remove_worktree(git_pr_target_repo, git_pr_worktree)
+            try:  # drop the now-empty mkdtemp parent
+                os.rmdir(git_pr_worktree.parent)
+            except OSError:
+                pass
+
     return result
 
 
@@ -2420,6 +2527,7 @@ def dispatch(
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
+    git_pr: bool = False,
     resume_policy: str = "auto",
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
@@ -2491,6 +2599,7 @@ def dispatch(
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,
             candidate_setup=candidate_setup,
+            git_pr=git_pr,
             resume_policy=resume_policy,
             protect_paths=protect_paths,
             allow_paths=allow_paths,

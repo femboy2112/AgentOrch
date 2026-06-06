@@ -538,6 +538,7 @@ def _cmd_do(args) -> int:
         mission_critical=args.mission_critical,
         spec=spec_text,
         out_dir=args.out_dir,
+        git_pr=getattr(args, "git_pr", False),
         computer_use_mode=cu_mode,
         computer_use_task_priority=cu_priority,
         computer_use_budgets=cu_budgets,
@@ -1005,6 +1006,13 @@ def main(argv=None) -> int:
                          "Default: AgentOrch's own repo root. Set when invoking AgentOrch "
                          "from another repo so workers don't pollute AgentOrch. "
                          "Snapshot diff and changed-files list scope follow this path.")
+    do.add_argument("--git-pr", action="store_true",
+                    help="Run on an ISOLATED git worktree + temp branch "
+                         "(agentorch/<run_id>) instead of writing into your checkout. "
+                         "Commits accepted work to the branch and persists a "
+                         "runs/<id>/pr_session.json (later phases push it as a draft PR "
+                         "to your current branch). Requires a clean git work tree; your "
+                         "own checkout is never moved. See docs/git-pr-mode-design.md.")
     # Step 12: computer-use config (forwarded only when --generator contains computer-use)
     do.add_argument("--computer-use-mode", choices=["ISOLATED", "OBSERVE", "REAL"], default=None,
                     help="computer-use: ISOLATED (default: private Xvfb, full perceive+act) or "

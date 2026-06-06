@@ -127,6 +127,7 @@ def _expected_default_kwargs():
         test_cmd=None,
         verifier_mem_max=None,
         candidate_setup=None,
+        git_pr=False,
         resume_policy="auto",
         protect_paths=None,
         allow_paths=None,
