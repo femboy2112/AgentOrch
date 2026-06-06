@@ -17,7 +17,10 @@ from typing import Callable, List, Optional
 # in both. agent.py does not import verifier, so this import introduces no cycle.
 from agy_orchestrator.core.agent import (
     _THREAD_PIN_VARS,
+    _build_worker_preexec,
+    _register_worker_pgid,
     _resource_bound_disabled,
+    _unregister_worker_pgid,
     looks_like_infra,
 )
 
@@ -298,6 +301,9 @@ class QualityVerifier:
                     # can SIGKILL the WHOLE group — reaping forked pool workers that
                     # a direct-child kill would orphan to PID 1.
                     start_new_session=True,
+                    # Kernel SIGKILLs this verifier tree if the orchestrator is
+                    # killed from outside (survives even SIGKILL of the parent).
+                    preexec_fn=_build_worker_preexec(),
                 )
             else:
                 process = await asyncio.create_subprocess_shell(
@@ -307,11 +313,16 @@ class QualityVerifier:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,  # #61: see above
+                    preexec_fn=_build_worker_preexec(),  # see above
                 )
             # #61: capture the group id now, while the child is alive, so a timeout
             # kill (or post-completion sweep) can signal the whole group even after
             # the direct child has been reaped.
             pgid = _safe_getpgid(process)
+            # Register the verifier GROUP so an external kill of the orchestrator
+            # reaps this (potentially long `make check`) tree via the entrypoint
+            # hooks; unregistered at each reap site below.
+            _register_worker_pgid(pgid)
             stdout = b""
             stderr = b""
             timed_out = False
@@ -332,6 +343,8 @@ class QualityVerifier:
                     await asyncio.wait_for(process.wait(), 5)
                 except Exception:
                     pass
+                finally:
+                    _unregister_worker_pgid(pgid)
             duration_ms = round((time.monotonic() - start) * 1000)
             total_duration_ms += duration_ms
 
@@ -406,11 +419,13 @@ class QualityVerifier:
                 # #61: a non-zero exit can still leave forked pool workers blocked
                 # on stdin — sweep the group before returning.
                 _kill_process_group(pgid)
+                _unregister_worker_pgid(pgid)
                 return self._finalize(result)
 
             # #61: clean (rc 0) completion can still leak daemon pool workers on a
             # buggy test suite — sweep the group at the end of each iteration.
             _kill_process_group(pgid)
+            _unregister_worker_pgid(pgid)
 
         logger.info("All verifications passed successfully.")
         final_cmd = "<multi>" if len(self.test_commands) > 1 else self.test_commands[0]

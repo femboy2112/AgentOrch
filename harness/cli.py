@@ -19,6 +19,7 @@ import os
 import sys
 from pathlib import Path
 
+from agy_orchestrator.core.agent import install_process_cleanup_handlers
 from agy_orchestrator.version import version_string
 from harness import roles
 from harness.dispatch import RUNS_DIR, dispatch
@@ -750,6 +751,10 @@ def _cmd_dashboard(args) -> int:
 
 
 def main(argv=None) -> int:
+    # Reap any spawned worker trees if this process is killed from outside
+    # (kill/pkill SIGTERM/SIGHUP, atexit); SIGKILL is covered kernel-side by the
+    # worker PDEATHSIG preexec. Both only ever touch groups we spawned.
+    install_process_cleanup_handlers()
     parser = argparse.ArgumentParser(
         prog="harness", description="Workflow harness: drive agy/codex via the orchestrator."
     )

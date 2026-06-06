@@ -1,10 +1,13 @@
 import asyncio
+import atexit
+import ctypes
 import logging
 import os
 import random
 import shlex
 import signal
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Tuple
@@ -52,6 +55,158 @@ CONTEXT_OVERFLOW_MARKERS = (
     "context_length_exceeded", "exceeds the context window", "context window",
     "remote compaction failed", "compact_remote", "maximum context length",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Worker death-cascade hardening
+#
+# When the orchestrator is killed FROM OUTSIDE, its spawned worker trees must not
+# be left running. Python destructors (__del__), atexit, and signal handlers are
+# the wrong/insufficient tools here: a SIGKILL (`kill -9`/`pkill -9`) runs NO
+# in-process code at all, and a default SIGTERM (`kill`/`pkill`) terminates with
+# no handler installed — in both cases the worker (spawned start_new_session, so
+# in its OWN session, NOT the orchestrator's group) is orphaned, reparents to
+# init, and keeps burning CPU/quota. Two complementary layers close this:
+#
+#   Layer A (kernel, survives even SIGKILL of the orchestrator):
+#     PR_SET_PDEATHSIG in the worker preexec_fn asks the kernel to SIGKILL the
+#     worker the instant THIS process dies, however it dies.
+#   Layer B (orderly, common `kill`/`pkill` case, full group):
+#     install_process_cleanup_handlers() arms SIGTERM/SIGHUP + atexit hooks that
+#     killpg every registered LIVE worker group, reaping the whole tree.
+#
+# Both ONLY ever touch groups WE spawned — never another orchestrator instance.
+# --------------------------------------------------------------------------- #
+
+PR_SET_PDEATHSIG = 1  # from <sys/prctl.h>
+
+# Resolve libc.prctl ONCE in the parent, at import. The preexec_fn runs post-fork
+# in the child where a dlopen (its lock state inherited from the forking thread)
+# could deadlock; by binding the function pointer now the child only invokes an
+# already-resolved syscall wrapper + getppid + _exit, all async-signal-safe.
+_PRCTL = None
+if sys.platform.startswith("linux"):
+    try:
+        _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _PRCTL = _libc.prctl
+        _PRCTL.restype = ctypes.c_int
+        _PRCTL.argtypes = (ctypes.c_int, ctypes.c_ulong,
+                           ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+    except Exception:
+        _PRCTL = None
+
+
+def _pdeathsig_enabled() -> bool:
+    """Layer A is default-ON on Linux; ``AGY_WORKER_PDEATHSIG=0`` opts out (and it
+    is a silent no-op where ``prctl`` is unavailable, e.g. off Linux)."""
+    return os.environ.get("AGY_WORKER_PDEATHSIG", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _worker_preexec() -> None:
+    """Run in the forked worker child, AFTER setsid (start_new_session) and BEFORE
+    execve. (1) Ask the kernel to SIGKILL this worker the moment the orchestrator
+    dies — even on an un-catchable SIGKILL no Python handler could react to.
+    (2) Close the fork/exec race: if the orchestrator ALREADY died before we got
+    here, getppid() reads 1 (reparented to init) and the death signal will never
+    arrive, so exit now. Best-effort — any failure just leaves the pre-existing
+    in-process killpg teardown as the reaper, exactly as before."""
+    try:
+        if _PRCTL is not None:
+            _PRCTL(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except Exception:
+        pass
+    try:
+        if os.getppid() == 1:
+            os._exit(0)
+    except Exception:
+        pass
+
+
+def _build_worker_preexec():
+    """Return the preexec_fn for a worker spawn, or None when disabled/unavailable
+    — None preserves the prior spawn behavior byte-for-byte."""
+    if _PRCTL is not None and _pdeathsig_enabled():
+        return _worker_preexec
+    return None
+
+
+# Process-wide registry of LIVE worker process-group ids. Each worker leads its
+# own session (start_new_session=True), so its pgid == the worker pid. Only groups
+# WE spawned are ever registered, so the teardown hooks can never signal another
+# orchestrator instance or any unrelated process.
+_LIVE_WORKER_PGIDS = set()
+_LIVE_WORKER_LOCK = threading.Lock()
+
+
+def _register_worker_pgid(pgid: Optional[int]) -> None:
+    if pgid is None:
+        return
+    with _LIVE_WORKER_LOCK:
+        _LIVE_WORKER_PGIDS.add(pgid)
+
+
+def _unregister_worker_pgid(pgid: Optional[int]) -> None:
+    if pgid is None:
+        return
+    with _LIVE_WORKER_LOCK:
+        _LIVE_WORKER_PGIDS.discard(pgid)
+
+
+def kill_all_live_workers(sig: int = signal.SIGKILL) -> int:
+    """SIGKILL (default) every registered live worker GROUP, best-effort. Returns
+    the count attempted. Reads the registry lock-free: it is only called from a
+    signal handler / atexit (main thread, no concurrent mutation at that instant),
+    and taking the lock there could deadlock against an interrupted registrar."""
+    try:
+        pgids = list(_LIVE_WORKER_PGIDS)
+    except RuntimeError:  # set mutated mid-iteration (defensive); one retry
+        pgids = list(_LIVE_WORKER_PGIDS)
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return len(pgids)
+
+
+_CLEANUP_HANDLERS_INSTALLED = False
+
+
+def install_process_cleanup_handlers() -> None:
+    """Arm SIGTERM/SIGHUP + atexit hooks that reap any live worker trees when THIS
+    orchestrator process is terminated from outside. Idempotent; call from every
+    entrypoint. SIGINT is deliberately left alone — Python turns it into
+    KeyboardInterrupt, which the run_async finally-blocks already use to kill the
+    current worker, with atexit backstopping. Without this a default `kill`
+    (SIGTERM) or `pkill` of the orchestrator runs NO cleanup at all and orphans the
+    worker tree. (SIGKILL of the orchestrator is covered by Layer A / PDEATHSIG.)"""
+    global _CLEANUP_HANDLERS_INSTALLED
+    if _CLEANUP_HANDLERS_INSTALLED:
+        return
+    _CLEANUP_HANDLERS_INSTALLED = True
+    atexit.register(kill_all_live_workers)
+
+    def _handler(signum, _frame):
+        try:
+            kill_all_live_workers()
+        finally:
+            # Restore the default disposition and re-raise so the process still
+            # terminates with the conventional signal status — we only interposed
+            # to reap the worker tree first.
+            try:
+                signal.signal(signum, signal.SIG_DFL)
+            except Exception:
+                pass
+            os.kill(os.getpid(), signum)
+
+    for _sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if _sig is None:
+            continue
+        try:
+            signal.signal(_sig, _handler)
+        except (ValueError, OSError):
+            # Not the main thread / unsupported: atexit still covers normal exit.
+            pass
 
 
 def is_context_overflow(stderr: str) -> bool:
@@ -290,6 +445,9 @@ class AgentInstance(ABC):
         # exception, or task cancellation (a losing ToT/swarm branch) instead of
         # leaking an orphaned worker CLI.
         self._current_process = None
+        # The live worker's registered process-group id (Layer B teardown), so it
+        # can be unregistered the moment the worker is reaped.
+        self._registered_pgid = None
         # Wall-clock ceiling for a single subprocess call. A worker CLI that
         # stalls on a network read (no timeout of its own) would otherwise hang
         # the whole dispatch indefinitely. On timeout we kill it and fail fast so
@@ -1150,12 +1308,29 @@ class AgentInstance(ABC):
                 f" ({reason})" if reason else "")
         return killed
 
+    def _track_worker_pgid(self, process) -> None:
+        """Record the live worker's group in the process-wide registry (Layer B)."""
+        try:
+            pgid = os.getpgid(process.pid)
+        except Exception:
+            pgid = None
+        self._registered_pgid = pgid
+        _register_worker_pgid(pgid)
+
+    def _untrack_worker_pgid(self) -> None:
+        """Drop this worker's group from the registry once it has been reaped."""
+        pgid = getattr(self, "_registered_pgid", None)
+        if pgid is not None:
+            _unregister_worker_pgid(pgid)
+            self._registered_pgid = None
+
     async def _kill_current(self) -> None:
         """Kill and reap the tracked child TREE if it is still running.
         Best-effort, bounded so a wedged process can't hang the reaping itself."""
         proc = self._current_process
         self._current_process = None
         if proc is None:
+            self._untrack_worker_pgid()
             return
         if proc.returncode is None:
             self._killpg_tree(proc)
@@ -1163,6 +1338,7 @@ class AgentInstance(ABC):
                 await asyncio.wait_for(proc.wait(), 5)
             except Exception:
                 pass
+        self._untrack_worker_pgid()
         # #69: close the subprocess transport in-loop so it isn't left for the GC
         # to finalize after the event loop is gone ("Event loop is closed").
         self._close_transport(proc)
@@ -1319,8 +1495,14 @@ class AgentInstance(ABC):
                         # and keep burning CPU, starving the real verifier. See
                         # _kill_current()/_killpg_tree().
                         start_new_session=True,
+                        # Layer A: kernel SIGKILLs this worker if the orchestrator
+                        # dies (survives even SIGKILL of the orchestrator).
+                        preexec_fn=_build_worker_preexec(),
                     )
                     self._current_process = process
+                    # Layer B: register the worker GROUP so an external kill of the
+                    # orchestrator reaps the whole tree via the entrypoint hooks.
+                    self._track_worker_pgid(process)
 
                     # Live mode: drain both pipes line-by-line, echoing the child's
                     # stderr as it arrives (tailable progress) while accumulating
@@ -1394,6 +1576,7 @@ class AgentInstance(ABC):
                     self.stderr = self.filter_stderr(stderr_bytes.decode(errors="replace"))
                     self.returncode = process.returncode
                     self._current_process = None
+                    self._untrack_worker_pgid()
                     self.last_wall_ms = (time.monotonic() - attempt_start) * 1000
                     self._emit_usage_event(
                         raw_stdout, self.stderr, attempt=attempt, success=bool(self.returncode == 0)

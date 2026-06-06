@@ -6,6 +6,7 @@ from agy_orchestrator.core.agents.agy_agent import AgyAgent
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
 from agy_orchestrator.core.agents.grok_agent import GrokAgent
+from agy_orchestrator.core.agent import install_process_cleanup_handlers
 from agy_orchestrator.core.profile import UserProfile
 from agy_orchestrator.version import version_string
 from agy_orchestrator.execution.pipeline import LinearPipeline
@@ -133,6 +134,9 @@ async def run_chain(args, profile):
 
 
 def main():
+    # Reap spawned worker trees on an external kill of this process (SIGTERM/SIGHUP/
+    # atexit); SIGKILL is covered kernel-side by the worker PDEATHSIG preexec.
+    install_process_cleanup_handlers()
     parser = argparse.ArgumentParser(description="Agy Orchestrator - Advanced Multi-Agent Wrapper")
     parser.add_argument(
         "--version", action="version", version=version_string("agy-orchestrator"),
