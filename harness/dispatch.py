@@ -388,6 +388,151 @@ def _resolve_run_stall_abort(
     return default
 
 
+def _git_pr_body(session, *, mode: str, diff, quality, run_id: str) -> str:
+    """Render the draft-PR body: a compact run summary + commit list. The commit
+    list is capped (PR bodies have size limits — the Telegram 4096 lesson) and the
+    remainder is noted rather than silently dropped."""
+    conf = (quality or {}).get("confidence", "?")
+    n_add = len(getattr(diff, "added", []) or [])
+    n_mod = len(getattr(diff, "modified", []) or [])
+    n_del = len(getattr(diff, "deleted", []) or [])
+    lines = [
+        f"Automated build by **AgentOrch** (`--git-pr`), run `{run_id}`.",
+        "",
+        f"- mode: `{mode}`",
+        f"- confidence: **{conf}**",
+        f"- commits: {len(session.commits)}",
+        f"- files: +{n_add} ~{n_mod} -{n_del}",
+        "",
+        "### Commits",
+    ]
+    _CAP = 50
+    for c in session.commits[:_CAP]:
+        sha = str(c.get("sha", ""))[:9]
+        step = f"step {c['step']}: " if c.get("step") else ""
+        lines.append(f"- `{sha}` {step}{c.get('title', '')} [{c.get('outcome', '')}]")
+    if len(session.commits) > _CAP:
+        lines.append(f"- … and {len(session.commits) - _CAP} more")
+    lines += ["", f"Artifacts: `runs/{run_id}/`", "",
+              "🤖 Opened by AgentOrch git-pr mode."]
+    return "\n".join(lines)
+
+
+def _drop_git_pr_worktree(target_repo: Optional[Path], worktree: Optional[Path]) -> None:
+    """Tear down the temp worktree (the BRANCH + commits persist in the repo).
+    Best-effort — never raises."""
+    if target_repo is None or worktree is None:
+        return
+    from harness import gitpr
+    gitpr.remove_worktree(target_repo, worktree)
+    try:  # drop the now-empty mkdtemp parent
+        os.rmdir(worktree.parent)
+    except OSError:
+        pass
+
+
+def _finalize_git_pr(*, session, worktree: Optional[Path], target_repo: Optional[Path],
+                     run_dir: Path, run_id: str, instruction: str,
+                     final_verified: bool, success: bool, mode: str, diff, quality):
+    """Commit any leftover work, push the temp branch, and open a draft PR to the
+    base branch (promoted to ready when the run verified). Tears down the worktree
+    (branch + PR persist for the operator's later merge/corrective decision).
+
+    Every git/gh failure downgrades the session ``status`` and is logged — it
+    never crashes the dispatch. Returns the (mutated) session. Status ladder:
+      no_changes | branch_ready (local, no remote/push) | pushed_no_pr (gh absent
+      / PR failed) | awaiting_decision (PR open) | error (commit failed).
+    """
+    from harness import gitpr
+
+    # 1. Final-sweep commit of anything not already captured by per-step commits
+    #    (single-step modes, or a non-accepted step's leftover output).
+    try:
+        sweep_sha = gitpr.commit(
+            worktree, f"agentorch {run_id}: {instruction.strip()[:72]}",
+        )
+        if sweep_sha:
+            session.commits.append({
+                "sha": sweep_sha,
+                "outcome": "verified" if final_verified else "unverified",
+                "title": instruction.strip()[:72],
+            })
+    except gitpr.GitError as exc:
+        session.status = "error"
+        session.verified = final_verified
+        gitpr.save_session(run_dir, session)
+        logger.warning("git-pr: final commit failed (%s); RETAINING worktree %s "
+                       "for inspection", exc, worktree)
+        return session  # leave the worktree so the worker's writes aren't lost
+
+    session.verified = final_verified
+
+    # 2. Nothing committed at all -> the branch has no content beyond base; no PR.
+    if not session.commits:
+        session.status = "no_changes"
+        gitpr.save_session(run_dir, session)
+        logger.info("git-pr: no changes committed; branch %s left at base, no PR",
+                    session.temp_branch)
+        _drop_git_pr_worktree(target_repo, worktree)
+        return session
+
+    # 3. Push (needs a remote). Degrade to a local-only branch otherwise.
+    pushed = False
+    if gitpr.has_remote(target_repo):
+        try:
+            gitpr.push(target_repo, session.temp_branch)
+            pushed = True
+        except gitpr.GitError as exc:
+            logger.warning("git-pr: push failed (%s); branch %s retained locally",
+                           exc, session.temp_branch)
+    else:
+        logger.info("git-pr: no git remote; branch %s retained locally (no PR). "
+                    "Add a remote + `gh pr create` to publish.", session.temp_branch)
+
+    if not pushed:
+        session.status = "branch_ready"
+        gitpr.save_session(run_dir, session)
+        _drop_git_pr_worktree(target_repo, worktree)
+        return session
+
+    # 4. Open a DRAFT PR when gh is usable; promote to ready when the run verified.
+    manual = (f"gh pr create --base {session.base_branch} "
+              f"--head {session.temp_branch} --draft")
+    if gitpr.gh_available() and gitpr.gh_authed(target_repo):
+        try:
+            title = f"[agentorch] {instruction.strip()[:64]}"
+            body = _git_pr_body(session, mode=mode, diff=diff, quality=quality,
+                                run_id=run_id)
+            info = gitpr.create_pr(target_repo, base=session.base_branch,
+                                   head=session.temp_branch, title=title,
+                                   body=body, draft=True)
+            session.pr_url = info.url
+            session.pr_number = info.number
+            session.draft = True
+            if success and final_verified and info.number is not None:
+                try:
+                    gitpr.mark_ready(target_repo, info.number)
+                    session.draft = False
+                except gitpr.GitError as exc:
+                    logger.warning("git-pr: pr ready failed (%s); left as draft", exc)
+            session.status = "awaiting_decision"
+            logger.info("git-pr: opened %s PR %s (%s -> %s)",
+                        "draft" if session.draft else "ready",
+                        info.url, session.temp_branch, session.base_branch)
+        except gitpr.GitError as exc:
+            session.status = "pushed_no_pr"
+            logger.warning("git-pr: PR creation failed (%s); branch pushed. "
+                           "Open it manually: %s", exc, manual)
+    else:
+        session.status = "pushed_no_pr"
+        logger.info("git-pr: gh CLI unavailable/unauthed; branch %s pushed. "
+                    "Open a PR with: %s", session.temp_branch, manual)
+
+    gitpr.save_session(run_dir, session)
+    _drop_git_pr_worktree(target_repo, worktree)
+    return session
+
+
 def plan_file_sha256(path: Union[str, Path]) -> str:
     """Return the sha256 (hex) of a plan file's raw bytes (#56).
 
@@ -2301,6 +2446,28 @@ async def dispatch_async(
                     run_id, len(dead),
                 )
 
+    # --git-pr finalize (Phase 3): now that success is final (path-policy +
+    # reconciliation gates have run), commit any sweep, push the temp branch, and
+    # open a draft PR (promoted to ready when verified). The worktree is torn down
+    # here; the branch + PR persist for the operator's later merge/corrective
+    # decision. Best-effort — never crashes the dispatch.
+    git_pr_pr_url: Optional[str] = None
+    if git_pr and git_pr_session is not None:
+        git_pr_session = _finalize_git_pr(
+            session=git_pr_session,
+            worktree=git_pr_worktree,
+            target_repo=git_pr_target_repo,
+            run_dir=run_dir,
+            run_id=run_id,
+            instruction=instruction,
+            final_verified=final_verified,
+            success=success,
+            mode=mode,
+            diff=diff,
+            quality=quality,
+        )
+        git_pr_pr_url = git_pr_session.pr_url
+
     # Notify on anomalies + finish (#40). The stall ping already fired from the
     # watchdog; here we cover OOM / verifier-fail / a clean finish, now that
     # success is final (the path-policy gate above may have flipped it).
@@ -2313,7 +2480,10 @@ async def dispatch_async(
                 "phase": "baseline" if baseline_oom else "run",
             }),
         )
-    notifier.fire("finish", monitor.payload(extra={"success": success, "outcome": run_outcome}))
+    finish_extra: Dict[str, Any] = {"success": success, "outcome": run_outcome}
+    if git_pr_pr_url:  # keep non-git-pr finish payloads byte-identical
+        finish_extra["pr_url"] = git_pr_pr_url
+    notifier.fire("finish", monitor.payload(extra=finish_extra))
 
     # Encoding-safe + atomic (long-run resilience): a surrogate in worker output
     # must not crash the unguarded artifact tail, and a mid-write kill must not
@@ -2496,51 +2666,6 @@ async def dispatch_async(
             telegram_poller.stop()
         except Exception as exc:
             logger.debug("telegram command poller stop failed: %s", exc)
-
-    # --git-pr finalize (Phase 1): commit any accepted work to the temp branch so
-    # it survives as a reviewable branch, persist the session, then tear down the
-    # worktree. The BRANCH and its commits remain in the operator's repo — only the
-    # throwaway worktree checkout dir is removed (push + draft-PR land in a later
-    # phase). On a commit failure the worktree is RETAINED for inspection so the
-    # worker's writes are never silently lost.
-    if git_pr and git_pr_session is not None:
-        from harness import gitpr
-        committed_ok = True
-        try:
-            msg = f"agentorch {run_id}: {instruction.strip()[:72]}"
-            sha = gitpr.commit(git_pr_worktree, msg)
-            if sha:
-                git_pr_session.commits.append({
-                    "sha": sha,
-                    "outcome": "verified" if final_verified else "unverified",
-                    "title": instruction.strip()[:72],
-                })
-            git_pr_session.verified = final_verified
-            git_pr_session.status = "branch_ready"
-            gitpr.save_session(run_dir, git_pr_session)
-            logger.info(
-                "git-pr: branch %s ready (%d commit(s), verified=%s); "
-                "worktree removed, branch retained",
-                git_pr_session.temp_branch, len(git_pr_session.commits),
-                final_verified,
-            )
-        except gitpr.GitError as exc:
-            committed_ok = False
-            git_pr_session.status = "error"
-            try:
-                gitpr.save_session(run_dir, git_pr_session)
-            except Exception:
-                pass
-            logger.warning(
-                "git-pr: commit failed (%s); RETAINING worktree %s for inspection",
-                exc, git_pr_worktree,
-            )
-        if committed_ok and git_pr_target_repo is not None and git_pr_worktree is not None:
-            gitpr.remove_worktree(git_pr_target_repo, git_pr_worktree)
-            try:  # drop the now-empty mkdtemp parent
-                os.rmdir(git_pr_worktree.parent)
-            except OSError:
-                pass
 
     return result
 

@@ -93,6 +93,53 @@ def test_refuses_detached_head(tmp_path):
 # --------------------------------------------------------------------------- #
 # Happy path
 # --------------------------------------------------------------------------- #
+_GH_STUB = """#!/usr/bin/env python3
+import os, sys, json
+args = sys.argv[1:]
+log = os.environ.get("GH_STUB_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps(args) + "\\n")  # JSON: newline-safe for multi-line --body
+if args[:2] == ["auth", "status"]:
+    sys.exit(0)
+if args[:2] == ["pr", "create"]:
+    sys.stdout.write("https://github.com/acme/repo/pull/77\\n")
+    sys.exit(0)
+if args[:2] in (["pr", "ready"], ["pr", "merge"], ["pr", "close"]):
+    sys.exit(0)
+sys.stderr.write("gh stub: unhandled %r\\n" % (args,))
+sys.exit(2)
+"""
+
+
+@pytest.fixture
+def gh_stub(tmp_path, monkeypatch):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "gh"
+    stub.write_text(_GH_STUB, encoding="utf-8")
+    import os as _os
+    _os.chmod(stub, 0o755)
+    log = tmp_path / "gh_calls.log"
+    monkeypatch.setenv("PATH", str(bindir) + _os.pathsep + _os.environ["PATH"])
+    monkeypatch.setenv("GH_STUB_LOG", str(log))
+    return log
+
+
+def _gh_calls(log):
+    if not log.exists():
+        return []
+    import json as _json
+    return [_json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines()]
+
+
+def _add_remote(repo, tmp_path):
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    _git(repo, "remote", "add", "origin", str(bare))
+    return bare
+
+
 def test_runs_in_isolated_worktree_not_the_checkout(tmp_path, monkeypatch):
     repo = _init_repo(tmp_path)
     result, captured = _dispatch(
@@ -146,7 +193,7 @@ def test_no_changes_makes_no_commit(tmp_path, monkeypatch):
     repo = _init_repo(tmp_path)
     result, _ = _dispatch(repo, monkeypatch, writer=None)  # worker writes nothing
     sess = gitpr.load_session(Path(result.run_dir))
-    assert sess.status == "branch_ready"
+    assert sess.status == "no_changes"  # nothing committed -> no PR
     assert sess.commits == []  # nothing to commit -> no empty commit
     # Branch still exists (created at base), just with no new commits.
     assert gitpr.head_sha(repo) == _git(
@@ -257,3 +304,71 @@ def test_graph_run_uses_single_finalize_commit(tmp_path, monkeypatch):
     branch = gitpr.branch_name_for_run("p2-graph")
     files = _git(repo, "ls-tree", "-r", "--name-only", branch)
     assert "a.py" in files and "b.py" in files
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — push + draft-PR creation / promotion
+# --------------------------------------------------------------------------- #
+def test_pr_created_and_promoted_on_verified(tmp_path, monkeypatch, gh_stub):
+    repo = _init_repo(tmp_path)
+    bare = _add_remote(repo, tmp_path)
+    result, _ = _dispatch(
+        repo, monkeypatch, verified=True,
+        writer=lambda wd: (wd / "feature.py").write_text("ok\n", encoding="utf-8"),
+    )
+    sess = gitpr.load_session(Path(result.run_dir))
+    assert sess.status == "awaiting_decision"
+    assert sess.pr_url == "https://github.com/acme/repo/pull/77"
+    assert sess.pr_number == 77
+    assert sess.draft is False  # verified -> promoted to ready
+    # the temp branch was actually pushed to the remote
+    assert sess.temp_branch in _git(bare, "branch", "--list", sess.temp_branch)
+    calls = _gh_calls(gh_stub)
+    create = [c for c in calls if c[:2] == ["pr", "create"]][0]
+    assert "--draft" in create
+    assert ["pr", "ready", "77"] in calls
+
+
+def test_pr_stays_draft_when_not_verified(tmp_path, monkeypatch, gh_stub):
+    repo = _init_repo(tmp_path)
+    _add_remote(repo, tmp_path)
+    result, _ = _dispatch(
+        repo, monkeypatch, verified=False,
+        writer=lambda wd: (wd / "f.py").write_text("x\n", encoding="utf-8"),
+    )
+    sess = gitpr.load_session(Path(result.run_dir))
+    assert sess.status == "awaiting_decision"
+    assert sess.draft is True
+    calls = _gh_calls(gh_stub)
+    assert any(c[:2] == ["pr", "create"] for c in calls)
+    assert not any(c[:2] == ["pr", "ready"] for c in calls)  # never promoted
+
+
+def test_no_gh_degrades_to_pushed_no_pr(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    bare = _add_remote(repo, tmp_path)
+    # gh present-or-not on the host shouldn't matter: force it unavailable.
+    monkeypatch.setattr(gitpr, "gh_available", lambda: False)
+    result, _ = _dispatch(
+        repo, monkeypatch, verified=True,
+        writer=lambda wd: (wd / "f.py").write_text("x\n", encoding="utf-8"),
+    )
+    sess = gitpr.load_session(Path(result.run_dir))
+    assert sess.status == "pushed_no_pr"
+    assert sess.pr_url is None
+    # branch still pushed to the remote so a human can open the PR manually
+    assert sess.temp_branch in _git(bare, "branch", "--list", sess.temp_branch)
+
+
+def test_no_remote_stays_local_branch_ready(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)  # no remote added
+    result, _ = _dispatch(
+        repo, monkeypatch, verified=True,
+        writer=lambda wd: (wd / "f.py").write_text("x\n", encoding="utf-8"),
+    )
+    sess = gitpr.load_session(Path(result.run_dir))
+    assert sess.status == "branch_ready"
+    assert sess.pr_url is None
+    # branch exists locally with the commit
+    assert "f.py" in _git(repo, "ls-tree", "-r", "--name-only",
+                          gitpr.branch_name_for_run(result.run_id))

@@ -1,8 +1,15 @@
 # Git PR Mode (`--git-pr`) — design
 
 **Status:** building. ✅ Phase 0 (`harness/gitpr.py`), ✅ Phase 1 (preflight +
-worktree setup), ✅ Phase 2 (per-accepted-step commits) landed on `main`
-(a60bd88 + follow-up). Phases 3–6 pending. Opt-in. Owner: operator + Claude session.
+worktree setup), ✅ Phase 2 (per-accepted-step commits), ✅ Phase 3 (push +
+draft-PR create/promote) landed on `main`. Phases 4–6 pending. Opt-in. Owner:
+operator + Claude session.
+
+Phase 3 session `status` ladder: `no_changes` (nothing committed) · `branch_ready`
+(committed, no remote → local branch only) · `pushed_no_pr` (pushed, gh absent or
+PR-create failed → manual `gh pr create` logged) · `awaiting_decision` (PR open;
+`draft` flips false when the run verified) · `error` (commit failed → worktree
+retained for inspection).
 **One line:** a dispatch runs on an isolated temp git branch, commits each accepted
 step, opens a **draft PR** to the clean base branch (promoted to ready when
 verification passes), and persists a session so the operator can later **merge** or
