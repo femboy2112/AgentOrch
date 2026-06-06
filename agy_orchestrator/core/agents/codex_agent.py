@@ -437,6 +437,23 @@ class CodexAgent(AgentInstance):
             self._codex_last_msg_path = path
         return path
 
+    # Resolved identity for observers — MUST mirror build_command's aliasing so
+    # telegram/dashboard show the model codex actually runs, not the "standard"
+    # alias (which is meaningless to the operator) or the "max" effort tier
+    # (which codex sends as reasoning_effort=xhigh).
+    @classmethod
+    def resolve_effective_model(cls, model: Optional[str]) -> Optional[str]:
+        if model and model != "standard":
+            return model
+        # "standard" and the unset default both land on the ChatGPT-account
+        # model the command-builder pins (bare gpt-5.3-codex 400s; see
+        # build_command). Surface that real name.
+        return "gpt-5.3-codex-spark"
+
+    @classmethod
+    def resolve_effective_effort(cls, effort: Optional[str]) -> Optional[str]:
+        return "xhigh" if effort == "max" else effort
+
     def build_command(self, piped_input: Optional[str] = None) -> List[str]:
         cmd = [
             "codex",

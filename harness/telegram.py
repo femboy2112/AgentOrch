@@ -461,7 +461,13 @@ class BuildState:
         self.cur_iter_total = None
         
         self.active_role = ""
-        
+        # Live worker identity (top-level, stamped by the bus on each canonical
+        # spin-up) so the status card answers "which model is running NOW", not
+        # just the role. Codex's are already alias-resolved upstream.
+        self.active_worker = ""
+        self.active_model = ""
+        self.active_effort = ""
+
         self.completed_steps = set()
         self.step_durations = []
         self._step_started_at = {}
@@ -512,9 +518,17 @@ class BuildState:
                 self.run_start_ts = ts
             elif ev == "agent_started":
                 detail = data.get("detail", {})
-                if isinstance(detail, dict) and "role" in detail:
-                    # Do not move step geometry on compact spin-ups
-                    self.active_role = detail.get("role", "")
+                # Only the CANONICAL per-call spin-up (dict detail) updates the
+                # live identity; per-turn adapter noise has a str detail.
+                if isinstance(detail, dict):
+                    if "role" in detail:
+                        # Do not move step geometry on compact spin-ups
+                        self.active_role = detail.get("role", "")
+                    w = event.get("worker")
+                    if w and w not in ("orchestrator", "run-monitor"):
+                        self.active_worker = w
+                        self.active_model = str(event.get("model") or "")
+                        self.active_effort = str(event.get("effort") or "")
             # Removed the return here to allow orchestration transitions to be processed
 
         orch = data.get("orchestration")
@@ -666,7 +680,22 @@ def render_status_card(state: BuildState) -> str:
     if state.since_progress_s > 60:
         stall_flag = f"  ⚠️ <b>no progress {_fmt_duration(state.since_progress_s)}</b>"
 
-    worker_state = _e(state.active_role or "running")
+    # Live worker identity: role + "worker model/effort" so the card answers
+    # "what's running now" — e.g. "draft · codex gpt-5.3-codex-spark/high".
+    ident_bits: List[str] = []
+    if state.active_role:
+        ident_bits.append(state.active_role)
+    wm: List[str] = []
+    if getattr(state, "active_worker", ""):
+        wm.append(state.active_worker)
+    mc = _chip(getattr(state, "active_model", ""))
+    ec = _chip(getattr(state, "active_effort", ""))
+    me = "/".join(c for c in (mc, ec) if c)
+    if me:
+        wm.append(me)
+    if wm:
+        ident_bits.append(" ".join(wm))
+    worker_state = _e(" · ".join(ident_bits)) if ident_bits else "running"
 
     goal = str(getattr(state, "goal", "") or "").strip()
     goal_line = f"<i>{_e(goal[:80])}</i>\n" if goal else ""
@@ -884,9 +913,11 @@ def render_event(
                 to_worker = _e(orch.get("to_worker") or "next worker")
                 return f"↪️ <b>Rotation</b> → <b>{to_worker}</b>{it_str}{ctx_suffix}"
             if action == "iteration_started":
-                # Generator drafting this round (carries its model+effort).
+                # Generator drafting this round (carries its resolved model+effort).
                 model = _chip(orch.get("model"))
-                mchip = f" · <code>{_e(model)}</code>" if model else ""
+                effort = _chip(orch.get("effort"))
+                chips = " · ".join(c for c in (model, effort) if c)
+                mchip = f" · <code>{_e(chips)}</code>" if chips else ""
                 return f"✍️ <b>Draft</b>{it_str}{mchip}{ctx_suffix}"
             if action in ("iteration_completed", "completed"):
                 # Critic verdict, keyed on outcome so an infra OOM never reads

@@ -1739,8 +1739,20 @@ async def dispatch_async(
             logger.warning(agy_warning)
 
     def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
-        model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
-        effort_val = cfg.get("effort")
+        # Prefer the agent's RESOLVED identity so the per-worker spin-up shows the
+        # model the CLI actually runs (codex maps its "standard" alias ->
+        # gpt-5.3-codex-spark, "max" effort -> xhigh); fall back to the cfg/raw
+        # values for agents that don't alias.
+        try:
+            resolved_model = agent.effective_model()
+        except Exception:
+            resolved_model = None
+        model = str(resolved_model or cfg.get("model") or getattr(agent, "model", None) or "n/a")
+        try:
+            resolved_effort = agent.effective_effort()
+        except Exception:
+            resolved_effort = None
+        effort_val = resolved_effort if resolved_effort not in (None, "n/a") else cfg.get("effort")
         effort = str(effort_val if effort_val not in (None, "n/a") else getattr(agent, "effort", None) or "n/a")
         agent.event_callback = EVENT_BUS.publisher_for(
             run_id,

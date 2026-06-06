@@ -136,6 +136,23 @@ class AdversarialReview:
         except Exception:
             pass
 
+    def _gen_model(self) -> Optional[str]:
+        # Resolved generator model (codex "standard" -> gpt-5.3-codex-spark) so the
+        # draft line shows the real model; degrade to the raw attr for agents
+        # without a resolver.
+        gen = self.generator
+        try:
+            return gen.effective_model()
+        except Exception:
+            return getattr(gen, "model", None)
+
+    def _gen_effort(self) -> Optional[str]:
+        gen = self.generator
+        try:
+            return gen.effective_effort()
+        except Exception:
+            return getattr(gen, "effort", None)
+
     def _iteration_outcome(self) -> str:
         if self.verified:
             return "verified"
@@ -160,8 +177,8 @@ class AdversarialReview:
                 action="iteration_started",
                 iteration=iteration + 1,
                 iteration_total=self.max_iterations,
-                model=getattr(self.generator, "model", None),
-                effort=getattr(self.generator, "effort", None),
+                model=self._gen_model(),
+                effort=self._gen_effort(),
             )
 
             self.generator.prompt = current_prompt

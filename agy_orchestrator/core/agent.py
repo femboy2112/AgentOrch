@@ -657,6 +657,33 @@ class AgentInstance(ABC):
                 return worker
         return "agy"
 
+    # ------------------------------------------------------------------ #
+    # Resolved (effective) identity for observability.
+    #
+    # The configured ``model``/``effort`` can be an INTERNAL ALIAS that the
+    # CLI command-builder rewrites before exec (e.g. codex maps "standard" ->
+    # gpt-5.3-codex-spark and "max" -> reasoning_effort=xhigh). An observer
+    # (telegram/dashboard/meta) that prints the raw alias shows the operator
+    # something they didn't pick and can't recognise. These resolvers surface
+    # the value the CLI will ACTUALLY run with. The base is identity; only the
+    # providers that alias override the classmethods.
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def resolve_effective_model(cls, model: Optional[str]) -> Optional[str]:
+        return model
+
+    @classmethod
+    def resolve_effective_effort(cls, effort: Optional[str]) -> Optional[str]:
+        return effort
+
+    def effective_model(self) -> Optional[str]:
+        """The model the worker CLI will actually run (aliases resolved)."""
+        return type(self).resolve_effective_model(self.model)
+
+    def effective_effort(self) -> Optional[str]:
+        """The reasoning-effort the worker CLI will actually use (aliases resolved)."""
+        return type(self).resolve_effective_effort(getattr(self, "effort", None))
+
     def _emit_event(self, event: dict) -> None:
         cb = self.event_callback
         if cb is None:

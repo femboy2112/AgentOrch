@@ -267,6 +267,29 @@ def make_fallback_agent(
         _post_construct_hook: Optional[PostConstructHook] = post_construct_hook
 
         @classmethod
+        def resolve_effective_model(cls, model: Optional[str]) -> Optional[str]:
+            # Delegate alias resolution to the chain LEAD (the provider whose
+            # model/effort the wrapper carries as its seed) so a codex-led
+            # fallback wrapper surfaces gpt-5.3-codex-spark, not "standard".
+            lead = cls._chain[0] if cls._chain else None
+            if lead is not None:
+                try:
+                    return lead.resolve_effective_model(model)
+                except Exception:
+                    pass
+            return model
+
+        @classmethod
+        def resolve_effective_effort(cls, effort: Optional[str]) -> Optional[str]:
+            lead = cls._chain[0] if cls._chain else None
+            if lead is not None:
+                try:
+                    return lead.resolve_effective_effort(effort)
+                except Exception:
+                    pass
+            return effort
+
+        @classmethod
         async def get_available_models(cls) -> List[str]:
             return await cls._chain[0].get_available_models()
 
