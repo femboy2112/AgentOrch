@@ -8,6 +8,7 @@ the temp branch with a persisted session.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import types
 from pathlib import Path
@@ -223,6 +224,28 @@ def test_without_flag_no_session_no_branch(tmp_path, monkeypatch):
     branches = _git(repo, "branch", "--list", "agentorch/*")
     assert branches.strip() == ""
     assert (repo / "inplace.py").exists()
+    # meta.json carries NO git_pr block on a normal run (byte-identical contract).
+    meta = json.loads((Path(result.run_dir) / "meta.json").read_text())
+    assert "git_pr" not in meta
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 — observability (meta.json git_pr block)
+# --------------------------------------------------------------------------- #
+def test_meta_json_has_git_pr_block(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    result, _ = _dispatch(
+        repo, monkeypatch, verified=True,
+        writer=lambda wd: (wd / "f.py").write_text("x\n", encoding="utf-8"))
+    meta = json.loads((Path(result.run_dir) / "meta.json").read_text())
+    assert "git_pr" in meta
+    gp = meta["git_pr"]
+    assert gp["temp_branch"] == gitpr.branch_name_for_run(result.run_id)
+    assert gp["base_branch"] == "main"
+    assert gp["commits"] == 1
+    assert gp["verified"] is True
+    assert gp["status"] == "branch_ready"  # no remote in this repo
+    assert gp["contributing_runs"] == [result.run_id]
 
 
 # --------------------------------------------------------------------------- #

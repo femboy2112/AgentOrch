@@ -660,7 +660,13 @@ def _cmd_runs(args) -> int:
         m = json.loads(meta_path.read_text())
         status = "OK" if m.get("success") else "FAIL"
         n = len(m.get("changed_files", []))
-        print(f"{d.name}  {status:4}  {m.get('mode',''):11}  {n} changed  {m.get('duration_s')}s")
+        line = (f"{d.name}  {status:4}  {m.get('mode',''):11}  "
+                f"{n} changed  {m.get('duration_s')}s")
+        gp = m.get("git_pr")
+        if gp:  # surface the --git-pr branch/PR state
+            ref = gp.get("pr_url") or gp.get("temp_branch", "")
+            line += f"  {C_CYAN}[PR {gp.get('status','')}: {ref}]{C_RESET}"
+        print(line)
     return 0
 
 

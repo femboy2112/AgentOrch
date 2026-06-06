@@ -114,3 +114,33 @@ def test_cmd_abandon_without_pr_still_marks(tmp_path, monkeypatch, capsys):
     # No PR -> no gh call needed, but the session is still marked abandoned.
     assert cli.main(["abandon", "r5"]) == 0
     assert gitpr.load_session(run_dir).status == "abandoned"
+
+
+def test_cmd_runs_shows_pr_marker(tmp_path, monkeypatch, capsys):
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(cli, "RUNS_DIR", runs)
+    rd = runs / "rX"
+    rd.mkdir(parents=True)
+    (rd / "meta.json").write_text(json.dumps({
+        "success": True, "mode": "master", "changed_files": ["a", "b"],
+        "duration_s": 1.0,
+        "git_pr": {"status": "awaiting_decision",
+                   "pr_url": "https://github.com/o/r/pull/3",
+                   "temp_branch": "agentorch/rX"},
+    }), encoding="utf-8")
+    assert cli.main(["runs"]) == 0
+    out = capsys.readouterr().out
+    assert "PR awaiting_decision" in out
+    assert "pull/3" in out
+
+
+def test_cmd_runs_no_marker_without_git_pr(tmp_path, monkeypatch, capsys):
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(cli, "RUNS_DIR", runs)
+    rd = runs / "rY"
+    rd.mkdir(parents=True)
+    (rd / "meta.json").write_text(json.dumps({
+        "success": True, "mode": "direct", "changed_files": [], "duration_s": 0.5,
+    }), encoding="utf-8")
+    assert cli.main(["runs"]) == 0
+    assert "PR " not in capsys.readouterr().out

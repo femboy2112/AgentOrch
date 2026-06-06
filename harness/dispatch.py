@@ -270,6 +270,11 @@ class DispatchResult:
     #     loaded file's hash against an operator-supplied ``--plan-expect-sha``
     #     pin (None = no pin given, so no comparison was made).
     plan_provenance: Optional[Dict[str, Any]] = None
+    # --git-pr summary (docs/git-pr-mode-design.md), present only for a --git-pr
+    # run: ``{base_branch, temp_branch, status, pr_url, pr_number, draft, verified,
+    # commits, decision, contributing_runs}``. None (and dropped from meta.json) for
+    # a normal run, so non-git-pr meta.json stays byte-identical.
+    git_pr: Optional[Dict[str, Any]] = None
 
 
 def _decide_reconcile_status(
@@ -2536,6 +2541,23 @@ async def dispatch_async(
         )
         git_pr_pr_url = git_pr_session.pr_url
 
+    # --git-pr meta summary (#git-pr Phase 6): a compact, durable record of the
+    # branch/PR/decision for meta.json. None for a normal run (dropped below).
+    git_pr_meta: Optional[Dict[str, Any]] = None
+    if git_pr and git_pr_session is not None:
+        git_pr_meta = {
+            "base_branch": git_pr_session.base_branch,
+            "temp_branch": git_pr_session.temp_branch,
+            "status": git_pr_session.status,
+            "pr_url": git_pr_session.pr_url,
+            "pr_number": git_pr_session.pr_number,
+            "draft": git_pr_session.draft,
+            "verified": git_pr_session.verified,
+            "commits": len(git_pr_session.commits),
+            "decision": git_pr_session.decision,
+            "contributing_runs": list(git_pr_session.contributing_runs),
+        }
+
     # Notify on anomalies + finish (#40). The stall ping already fired from the
     # watchdog; here we cover OOM / verifier-fail / a clean finish, now that
     # success is final (the path-policy gate above may have flipped it).
@@ -2694,6 +2716,7 @@ async def dispatch_async(
         graph=graph_meta,
         verifier=(verifier_telemetry or None),
         plan_provenance=plan_provenance,
+        git_pr=git_pr_meta,
     )
     meta_dict = asdict(result)
     # The graph-execution summary is present ONLY for a graph DAG run; honor the
@@ -2714,6 +2737,10 @@ async def dispatch_async(
     # meta.json byte-identical to the pre-#56 shape.
     if meta_dict.get("plan_provenance") is None:
         meta_dict.pop("plan_provenance", None)
+    # --git-pr summary follows the same drop-when-absent contract: a normal run
+    # leaves meta.json byte-identical to the pre-git-pr shape.
+    if meta_dict.get("git_pr") is None:
+        meta_dict.pop("git_pr", None)
     # Atomic + encoding-safe: meta.json is the run's authoritative record (success
     # /diff/tokens/reconcile). A mid-write kill must leave it valid-or-absent, and a
     # surrogate that reached a string field must not abort the write. ensure_ascii is

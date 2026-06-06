@@ -3,8 +3,9 @@
 **Status:** building. ✅ Phase 0 (`harness/gitpr.py`), ✅ Phase 1 (preflight +
 worktree setup), ✅ Phase 2 (per-accepted-step commits), ✅ Phase 3 (push +
 draft-PR create/promote), ✅ Phase 4a (CLI verbs `pr`/`merge`/`abandon`),
-✅ Phase 5 (corrective resume `--continue`) landed on `main`. Pending: Phase 4b
-(Telegram buttons), Phase 6 (observability). Opt-in. Owner: operator + Claude session.
+✅ Phase 5 (corrective resume `--continue`), ✅ Phase 6a (meta.json `git_pr` block +
+`harness runs` PR marker) landed on `main`. Pending: Phase 4b (Telegram buttons) +
+6b (PR on the Telegram finish card). Opt-in. Owner: operator + Claude session.
 
 Phase 5 corrective resume: `harness do "FIX…" --continue <run_id>` re-attaches a
 worktree to the prior run's temp branch (which already holds all committed work, so
