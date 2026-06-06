@@ -211,6 +211,36 @@ Each level is a superset of the one before it.
 | `verbose` | + Tree-of-Thought branch activity and finer per-iteration detail |
 | `debug` | + heartbeats and per-call token usage |
 
+## Message format — Card + expandable detail
+
+All build messages render as **`parse_mode=HTML`** and follow one layout rule: a
+compact, emoji-led **card** carries the at-a-glance state on the surface, and any
+long or secondary detail is tucked into a Telegram **`<blockquote expandable>`** —
+a block that collapses by default and expands when the operator taps it. This
+keeps each message short and scannable while still being more informative on tap.
+Three render sites use it:
+
+- **Live status card** (`render_status_card`, the pinned edit-in-place card): the
+  surface always shows status (`⚡ Building · <id>`), the goal, the progress bar +
+  step reference (`Step 2/4`), the phase · worker · current-step line, and the
+  `⏱ elapsed · ETA` line. The recent-activity line and the per-step "steps so far"
+  progress are tucked into the expandable. The expandable is omitted entirely when
+  there is no secondary detail yet (no empty block is ever sent).
+- **Plan-ready event** (`render_event`, plan phase): the `📋 Plan ready · N steps`
+  headline stays on the surface; the full numbered step list (tree connectors,
+  capped with a `… +K more` tail for very large plans) is tucked into the
+  expandable, so a 12-step plan collapses to a one-line headline.
+- **End-of-run summary card** (`_summary_card`): the surface keeps the outcome
+  headline (`✅ Build verified` / `☑️ Build complete` / `🛑 Build failed`), the
+  goal, the `N/N steps · status · duration` line, and the tokens · mode · run
+  footer. The changed-files list **and** the `<pre>` per-step recap are tucked
+  into the expandable (`<pre>` nests inside `<blockquote expandable>`), so a
+  many-file / many-step run stays a tidy card.
+
+Only the allowed Telegram HTML tags are emitted (`<b> <i> <u> <s> <code> <pre>
+<a> <blockquote> <blockquote expandable> <tg-spoiler>`); all dynamic text (goal,
+titles, file paths, run ids) is HTML-escaped, and blockquotes are never nested.
+
 ## Inline callback buttons
 
 `/status` (and the per-run live summary card) attaches an inline keyboard:

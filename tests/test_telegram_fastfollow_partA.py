@@ -222,15 +222,17 @@ def test_summary_card_verified_headline_and_goal(posts):
 def test_summary_card_shows_file_count_and_truncates(posts):
     n = _notifier()
     _feed_three_steps(n)
-    changed = [f"src/file_{i}.py" for i in range(12)]
+    # Exceed the (post-polish) expandable file-list cap so the "+K more" tail
+    # is exercised. The list now lives inside the <blockquote expandable>.
+    changed = [f"src/file_{i}.py" for i in range(25)]
     card = n._summary_card({
         "success": True, "mode": "master", "duration_s": 288,
         "changed_files": changed, "quality": {"confidence": "verified"},
         "tokens": {"grand_total": {"total_tokens": 42000}},
     })
     # the total file count appears
-    assert "12" in card, "file count not shown"
-    # changed-files block truncates with a "+K more" tail (first ~8 then rest)
+    assert "25" in card, "file count not shown"
+    # changed-files block truncates with a "+K more" tail
     assert "more" in card.lower(), "changed-files block did not truncate with '+K more'"
 
 

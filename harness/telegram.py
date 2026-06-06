@@ -55,6 +55,14 @@ _INFRA_OUTCOMES = frozenset(
 )
 _FAILURE_OUTCOMES = frozenset({"stalled"}) | _INFRA_OUTCOMES
 
+# Render caps to keep messages well under Telegram's 4096-char limit even on
+# long (30+ step) runs. The live status card is editMessageText'd in place on
+# every event, so an over-limit render 400s and silently freezes the pinned
+# card — hence the tight tail cap on the live "Steps so far" list. The
+# end-of-run recap is sent once, so it can carry a larger cap.
+_STATUS_STEP_CAP = 12
+_SUMMARY_STEP_CAP = 40
+
 # Pretty labels for the failure/stall banner.
 _OUTCOME_LABEL = {
     "verifier_timeout": "⏱ verifier timed out",
@@ -656,24 +664,61 @@ def render_status_card(state: BuildState) -> str:
 
     stall_flag = ""
     if state.since_progress_s > 60:
-        stall_flag = f" ⚠️ no progress {_fmt_duration(state.since_progress_s)}"
-
-    last_block = f"\n└ last: {_e(state.last_event_line)}" if state.last_event_line else ""
+        stall_flag = f"  ⚠️ <b>no progress {_fmt_duration(state.since_progress_s)}</b>"
 
     worker_state = _e(state.active_role or "running")
 
     goal = str(getattr(state, "goal", "") or "").strip()
     goal_line = f"<i>{_e(goal[:80])}</i>\n" if goal else ""
 
-    return (
-        f"⚡ <b>Building</b> · <code>{rid_short}</code>\n"
+    # ---- always-visible compact card --------------------------------------- #
+    # Status · bar+step · phase/worker/title · elapsed+ETA stay on the surface;
+    # everything else is tucked into the expandable so the live card never grows.
+    header = (
+        f"⚡ <b>Building</b> · <code>{rid_short}</code>{stall_flag}\n"
         f"{goal_line}"
         f"<code>{bar}</code>  <b>{step_ref}</b>\n"
-        f"<i>{_e(title)}</i>\n\n"
-        f"{phase_glyph} {phase_label} · {worker_state}{iter_str}\n"
-        f"⏱ {elapsed_str} elapsed · {eta_str}{stall_flag}"
-        f"{last_block}"
+        f"{phase_glyph} <b>{phase_label}</b> · {worker_state}{iter_str} · <i>{_e(title)}</i>\n"
+        f"⏱ <b>{elapsed_str}</b> elapsed · {eta_str}"
     )
+
+    # ---- expandable secondary detail (recent activity + per-step progress) -- #
+    detail: List[str] = []
+    records = list(getattr(state, "step_records", []) or [])
+    if records:
+        # Cap to the most-recent N so the in-place card can never grow past
+        # Telegram's 4096-char limit (which would 400 the editMessageText and
+        # freeze the pinned live card). Recent steps matter most here, so we
+        # keep the tail and note "+K earlier" at the top.
+        shown = records[-_STATUS_STEP_CAP:]
+        earlier = len(records) - len(shown)
+        detail.append("<b>Steps so far</b>")
+        if earlier > 0:
+            detail.append(f"  … +{earlier} earlier")
+        for rec in shown:
+            outcome = str(rec.get("outcome") or "")
+            if outcome == "verified":
+                glyph = "✅"
+            elif outcome == "approved":
+                glyph = "☑️"
+            elif outcome in _FAILURE_OUTCOMES:
+                glyph = "❌"
+            else:
+                glyph = "▪"
+            idx_s = _e(rec.get("index") if rec.get("index") is not None else "?")
+            rtitle = _e(str(rec.get("title") or ""))
+            d = rec.get("duration")
+            dstr = f" · {_fmt_duration(d)}" if d is not None else ""
+            detail.append(f"{glyph} <b>{idx_s}</b> · {rtitle}{dstr}")
+    if state.last_event_line:
+        if detail:
+            detail.append("")
+        detail.append(f"💬 <i>{_e(state.last_event_line)}</i>")
+
+    if detail:
+        body = "\n".join(detail)
+        return f"{header}\n<blockquote expandable>{body}</blockquote>"
+    return header
 
 # --------------------------------------------------------------------------- #
 # Pure gating + rendering
@@ -869,14 +914,22 @@ def render_event(
             if phase == "plan" and action == "completed":
                 total = orch.get("step_total") or 0
                 titles = orch.get("step_titles") or []
-                lines = [f"📋 <b>Plan ready</b> · <b>{total} steps</b>{_run_tag(rid)}"]
-                for i, t in enumerate(titles, 1):
-                    prefix = "└" if i == len(titles) else "├"
-                    lines.append(f"{prefix} {i} · {_e(t)}")
-                    if i >= 12 and len(titles) > 13:
-                        lines.append(f"└ … +{len(titles) - 12} more")
-                        break
-                return "\n".join(lines)
+                head = f"📋 <b>Plan ready</b> · <b>{total} steps</b>{_run_tag(rid)}"
+                if not titles:
+                    return head
+                # Tuck the full step list into an expandable so a 12-step plan
+                # collapses to a one-line headline until the operator taps it.
+                shown = titles[:40]
+                extra = len(titles) - len(shown)
+                n = len(shown)
+                rows: List[str] = []
+                for i, t in enumerate(shown, 1):
+                    prefix = "└" if (i == n and extra <= 0) else "├"
+                    rows.append(f"{prefix} <b>{i}</b> · {_e(t)}")
+                if extra > 0:
+                    rows.append(f"└ … +{extra} more")
+                body = "\n".join(rows)
+                return f"{head}\n<blockquote expandable>{body}</blockquote>"
             if phase in ("plan", "reconcile"):
                 act = _e(action or phase)
                 return f"🗂 <b>{_e(str(phase).title())}</b> · <i>{act}</i>{_run_tag(rid)}"
@@ -1463,21 +1516,29 @@ class TelegramNotifier:
         if meta_bits:
             lines.append(" · ".join(meta_bits))
 
-        # ---- changed-files block (first ~8 + "… +K more") ----------------- #
+        # ---- expandable detail: changed-files list + <pre> per-step recap -- #
+        # The headline + key stats stay on the surface; the long lists collapse
+        # into a single tap-to-expand block so a 40-file / 30-step run is a tidy
+        # card rather than a wall of text.
+        detail: List[str] = []
         if n_files:
-            lines.append(f"\n📂 <b>{n_files} file{'s' if n_files != 1 else ''} changed</b>")
-            shown = files[:8]
+            detail.append(f"📂 <b>{n_files} file{'s' if n_files != 1 else ''} changed</b>")
+            shown = files[:20]
             for f in shown:
-                lines.append(f"  • <code>{_e(f)}</code>")
+                detail.append(f"  • <code>{_e(f)}</code>")
             extra = n_files - len(shown)
             if extra > 0:
-                lines.append(f"  … +{extra} more")
+                detail.append(f"  … +{extra} more")
 
-        # ---- <pre> per-step recap ---------------------------------------- #
         records = list(getattr(state, "step_records", []) or [])
         if records:
+            # Cap the recap so a long run stays well under 4096 chars even with
+            # the changed-files list above it. Keep the most-recent steps and
+            # note "+K earlier" at the top.
+            shown_recs = records[-_SUMMARY_STEP_CAP:]
+            earlier = len(records) - len(shown_recs)
             recap_rows = []
-            for rec in records:
+            for rec in shown_recs:
                 idx = rec.get("index")
                 title = str(rec.get("title") or "")
                 outcome = str(rec.get("outcome") or "")
@@ -1495,8 +1556,16 @@ class TelegramNotifier:
                 idx_s = str(idx if idx is not None else "?")
                 title_col = title[:22].ljust(22)
                 recap_rows.append(f"{idx_s:>2} {glyph} {title_col} {dstr}")
+            if earlier > 0:
+                recap_rows.insert(0, f"… +{earlier} earlier")
             recap = "\n".join(_e(r) for r in recap_rows)
-            lines.append(f"\n<pre>{recap}</pre>")
+            if detail:
+                detail.append("")
+            detail.append(f"<b>Step recap</b>\n<pre>{recap}</pre>")
+
+        if detail:
+            body = "\n".join(detail)
+            lines.append(f"<blockquote expandable>{body}</blockquote>")
 
         # ---- tokens + mode + run ----------------------------------------- #
         footer_bits = [b for b in (token_str, f"<code>{mode}</code>") if b]
