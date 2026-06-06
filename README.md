@@ -135,6 +135,16 @@ operator environments and is exercised against locally installed `codex`,
 `claude`, `agy`, and `grok` CLIs.
 
 ## Documentation
+Reference (source-checked, in [`docs/reference/`](docs/reference/)):
+
+- [`docs/reference/cli.md`](docs/reference/cli.md) — complete CLI reference for `harness` and `agy_orchestrator` (every subcommand, flag, and mode).
+- [`docs/reference/python-api.md`](docs/reference/python-api.md) — programmer's API: agents, workflows, verifier, and fallback chains.
+- [`docs/reference/configuration.md`](docs/reference/configuration.md) — the full environment-variable surface.
+- [`docs/reference/telegram-commands.md`](docs/reference/telegram-commands.md) — Telegram bot command reference.
+
+Guides and design:
+
+- `llms.txt` — dense, token-efficient digest of the whole surface for LLM coding agents.
 - `AGENTS.md` — guidance for LLM agents integrating AgentOrch as a callable tool.
 - `CLAUDE.md` — operator/maintainer guide with runtime rules and architecture notes.
 - `docs/experiments.md` — empirical findings that informed workflow defaults.

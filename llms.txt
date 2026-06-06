@@ -1,0 +1,99 @@
+# AgentOrch
+
+> Cloud-only multi-LLM orchestrator: dispatch coding work to worker CLIs (codex/claude/agy/grok), gate it with a real verifier, capture a diff-backed run record every time.
+
+AgentOrch runs from your workstation and delegates implementation to existing worker CLIs instead of adding another hosted agent. The core pattern: write a concrete instruction, pick a workflow mode, run workers, gate the result with a programmatic verifier (`--test-cmd`) when one applies. Every dispatch is captured under `runs/<timestamp>/` (prompt, logs, structured events, snapshot diff, metadata) so you can review what changed and why before accepting it. Two layers: `agy_orchestrator/` (the workflow engine) and `harness/` (the operator-facing dispatch/control CLI). Requires Python 3.10+ and locally installed worker CLIs.
+
+## Surface map
+
+### CLI entrypoints
+- `python -m harness <cmd>` — operator layer (primary interface).
+  - `do "INSTRUCTION"` — dispatch one instruction (see modes below).
+  - `spec GOAL [-c CONSTRAINT ...]` — FloodSpec: goal+constraints -> design doc.
+  - `runs [--limit N]` — list recent runs (default 20).
+  - `show RUN_ID` — print a run's diff + metadata.
+  - `serve [--cap N]` — run the singleton broker (persistent queue, cap-2 drain, IPC socket).
+  - `queue` — list the broker's build queue.
+  - `dashboard [--port 8765] [--browser]` — local control dashboard (127.0.0.1:8765, no browser by default).
+- `python -m agy_orchestrator <cmd>` — standalone engine: `adversarial` | `tot` | `master` | `chain`.
+
+### Canonical dispatch
+```bash
+python -m harness do "INSTRUCTION" --mode <mode> \
+  --generator codex,agy,grok --critic agy,codex,grok \
+  --test-cmd "pytest -q" --out-dir /path/to/target/repo
+```
+
+### Workflow modes (`--mode`, default `adversarial`)
+| Mode | Shape | `--test-cmd` |
+|---|---|---|
+| `direct` | one generator pass, no critic, no gate | not required |
+| `adversarial` | generator + critic refinement loop; verifier can short-circuit | optional |
+| `feedback` | generator -> run tests -> feed error back -> repair | **required** |
+| `cascade` | cheap-first stages, escalate only on verifier failure | **required** |
+| `master` | plan -> tree-of-thought -> adversarial per step; runs DAG plans | optional (advised) |
+| `pat` | Plan-after-Trial: direct first, escalate to master on fail | **required** |
+| `vote` | K parallel candidates in isolated workspaces, verifier picks winner (`--branches K`) | **required** |
+| `auto` | RoutingPolicy picks the concrete mode | not required |
+
+### Workers & default chains
+- Worker tokens: `codex` (openai) · `agy` (google) · `claude` (anthropic) · `grok` (xai) · `computer-use`.
+- Default generator chain: `codex,agy,grok`. Default critic chain: `agy,codex,grok`. (Claude excluded by default — account-sharing rule.)
+- Chains are comma-separated fallback chains; `--fallback`/`--no-fallback` toggles usage-wall rollover (default on).
+- Per-role/provider overrides: `--gen-model`/`--critic-model`/`--codex-model`, `--gen-effort`/`--critic-effort`, `--effort-profile {low,balanced,max}`.
+
+### Key Python entry points
+| Symbol | Location | Role |
+|---|---|---|
+| `make_fallback_agent(...)` | `agy_orchestrator/core/agents/fallback_agent.py` | wrap a class chain into usage-wall fallback agent |
+| `QualityVerifier(test_commands, ...).verify(cwd)` | `agy_orchestrator/execution/verifier.py` | programmatic test gate -> `VerifierResult` |
+| `AdversarialReview` | `agy_orchestrator/workflows/adversarial.py` | generator/critic loop |
+| `TreeOfThought` | `agy_orchestrator/workflows/tree_of_thought.py` | parallel scored branches |
+| `TestFeedbackWorkflow` | `agy_orchestrator/workflows/test_feedback.py` | generate->test->repair |
+| `CascadeWorkflow` | `agy_orchestrator/workflows/cascade.py` | cheap-first escalation |
+| `PatWorkflow` | `agy_orchestrator/workflows/pat.py` | plan-after-trial |
+| `VoteWorkflow` | `agy_orchestrator/workflows/vote.py` | best-of-K candidate selection |
+| `MasterWorkflow.execute(initial_prompt)` | `agy_orchestrator/workflows/master.py` | plan->ToT->adversarial, checkpointed |
+| `build_role_agent(...)`, `GENERATOR_CHAIN`, `CRITIC_CHAIN` | `harness/roles.py` | role->agent mapping, default chains |
+
+### Run artifacts (`runs/<timestamp>/`)
+`prompt.txt` (exact worker prompt) · `stdout.log` (workflow output) · `stderr.log` (runtime logging) · `events.jsonl` (per-worker event stream) · `changed-files.diff` (snapshot diff of on-disk changes) · `meta.json` (mode, timing, file changes, `quality.confidence` = `verified`/`approved`/`unverified`/`stalled`/`failed`, where `stalled` = run aborted by the watchdog/run-stall before completing). Artifacts always live under AgentOrch, never under `--out-dir`.
+
+### Key env vars (names + gloss)
+| Var | Gloss |
+|---|---|
+| `AGY_WATCHDOG` | `off` disables streaming watchdog |
+| `AGY_WATCHDOG_SCALE` | multiply byte/stall budgets |
+| `AGY_LIVE_LEDGER` | `off` disables live calibration ledger |
+| `AGY_CALIBRATION_JSONL` | offline calibration table path |
+| `AGY_STALL_SECONDS` | per-worker stall budget |
+| `AGY_MAX_OUTPUT_BYTES` | per-worker output cap |
+| `AGY_WORKER_CMD_TIMEOUT` | per-call wall-clock kill |
+| `AGY_ABSOLUTE_TIMEOUT` | hard per-worker cap |
+| `AGY_WORKER_RESOURCE_BOUND` | `0` opts out of worker thread/mem pinning |
+| `AGY_CODEX_MODEL_FALLBACKS` | override codex intra-provider model order |
+| `AGY_CRITIC_FAMILY_CHECK` | `off` silences cross-family critic warning |
+| `AGY_PARALLELISM_CHECK` | `off` silences agy-parallel warning |
+| `AGY_RECONCILE` | toggle reconciliation station |
+| `AGY_VERIFIER_MEM_MAX` | verifier memory cap (systemd-scope) |
+| `AGY_STREAM` | worker stream mode |
+| `TELEGRAM_BOT_KEY` | Telegram bot token (env only, never committed) |
+| `AGY_TELEGRAM_USERS` | Telegram whitelist (outside repo) |
+| `AGY_BENCH_MOCK` | `1` swaps real workers for hermetic MockAgent |
+
+## Docs
+- [CLI reference](docs/reference/cli.md): full `harness`/`agy_orchestrator` flags and subcommands.
+- [Python API](docs/reference/python-api.md): workflow classes, verifier, fallback agent.
+- [Configuration](docs/reference/configuration.md): env vars, chains, effort/model overrides.
+- [Telegram commands](docs/reference/telegram-commands.md): bot command surface and verbosity.
+- [AGENTS.md](AGENTS.md): integrating AgentOrch as a callable tool; worker rules.
+- [CLAUDE.md](CLAUDE.md): operator/maintainer guide, runtime rules, architecture.
+- [README.md](README.md): high-level overview, quick start, workflow table.
+
+## Conventions for agents working in this repo
+- **Every dispatch is captured** under `runs/<id>/`. Read `meta.json` -> `quality.confidence` then `changed-files.diff` before accepting; treat anything below `verified` as a draft.
+- **Workers write directly into the repo** at cwd. When dispatching from another repo, pass `--out-dir /path/to/target` so workers write there, not into AgentOrch. The snapshot diff scopes to `--out-dir`; run artifacts always stay under AgentOrch.
+- **Don't create unrelated files while a dispatch runs** — the diff is a whole-tree before/after snapshot and they'll leak into it.
+- **Account-sharing rule**: don't run a worker on the same provider+account as the calling agent — when workers hit a usage wall, the caller walls at the same instant. If you are Claude Code, avoid `--generator claude`/`--critic claude`; default chains exclude Claude for this reason. If you must reuse a provider, use a different model tier and rely on `--fallback`.
+- **`--test-cmd` is the verifier gate** — required for `feedback`/`cascade`/`pat`/`vote`, optional (advised) for `adversarial`/`master`, unused by `direct`. The verifier, not LLM self-eval, is the hard pass/fail oracle.
+- **Tests run via `python -m pytest -q`** (orchestrator workflows + harness). Run before submitting changes.
