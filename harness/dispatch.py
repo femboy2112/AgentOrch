@@ -495,7 +495,24 @@ def _finalize_git_pr(*, session, worktree: Optional[Path], target_repo: Optional
         _drop_git_pr_worktree(target_repo, worktree)
         return session
 
-    # 4. Open a DRAFT PR when gh is usable; promote to ready when the run verified.
+    # 4a. A corrective --continue run reuses the SAME branch, so the push above
+    #     already updated the existing PR — don't open a second one; just
+    #     (re)promote it when the corrective run verified.
+    if session.pr_number is not None or session.pr_url:
+        if success and final_verified and session.draft and session.pr_number is not None:
+            try:
+                gitpr.mark_ready(target_repo, session.pr_number)
+                session.draft = False
+            except gitpr.GitError as exc:
+                logger.warning("git-pr: pr ready failed (%s); left as draft", exc)
+        session.status = "awaiting_decision"
+        gitpr.save_session(run_dir, session)
+        logger.info("git-pr: updated existing PR %s (%s, %s)", session.pr_url,
+                    session.temp_branch, "ready" if not session.draft else "draft")
+        _drop_git_pr_worktree(target_repo, worktree)
+        return session
+
+    # 4b. Open a DRAFT PR when gh is usable; promote to ready when the run verified.
     manual = (f"gh pr create --base {session.base_branch} "
               f"--head {session.temp_branch} --draft")
     if gitpr.gh_available() and gitpr.gh_authed(target_repo):
@@ -1610,6 +1627,10 @@ async def dispatch_async(
     # temp branch (agentorch/<run_id>), commit accepted work to it, and persist a
     # pr_session.json. Off (default) => zero git ops, byte-identical dispatch.
     git_pr: bool = False,
+    # --continue <prior_run_id>: corrective resume. Re-attach a worktree to the
+    # prior run's temp branch and run this instruction on top, updating the SAME
+    # branch + PR + canonical session. Implies git_pr.
+    git_pr_continue: Optional[str] = None,
     resume_policy: str = "auto",
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
@@ -1816,10 +1837,55 @@ async def dispatch_async(
     # BEFORE any worktree is created — mirroring the #36 data-loss lesson: never
     # risk clobbering uncommitted work. When off, none of this runs and the
     # dispatch is byte-identical.
+    git_pr = git_pr or bool(git_pr_continue)  # --continue implies --git-pr
     git_pr_session = None
     git_pr_target_repo: Optional[Path] = None
     git_pr_worktree: Optional[Path] = None
-    if git_pr:
+    # Where the canonical pr_session.json lives. Fresh runs own it under their own
+    # run dir; a corrective --continue run keeps updating the ORIGINAL run's session.
+    git_pr_session_dir = run_dir
+    if git_pr_continue:
+        from harness import gitpr
+        prior_dir = RUNS_DIR / git_pr_continue
+        prior = gitpr.load_session(prior_dir)
+        if prior is None:
+            raise ValueError(
+                f"--continue {git_pr_continue}: no git-pr session found at "
+                f"{prior_dir} (was that run dispatched with --git-pr?)"
+            )
+        target_repo = Path(prior.target_repo)
+        if not gitpr.is_git_repo(target_repo):
+            raise ValueError(
+                f"--continue {git_pr_continue}: recorded target repo "
+                f"{target_repo} is not a git repository"
+            )
+        if not gitpr.branch_exists(target_repo, prior.temp_branch):
+            raise ValueError(
+                f"--continue {git_pr_continue}: temp branch {prior.temp_branch} "
+                f"no longer exists in {target_repo} (was it deleted/merged?)"
+            )
+        git_pr_worktree = (
+            Path(tempfile.mkdtemp(prefix=f"agentorch-gitpr-{run_id}-")) / "worktree"
+        )
+        # Re-attach a worktree to the EXISTING temp branch — it already holds all
+        # prior committed work, so the worker continues from where it left off.
+        gitpr.add_worktree(
+            target_repo, git_pr_worktree, branch=prior.temp_branch, create=False,
+        )
+        git_pr_target_repo = target_repo
+        git_pr_session = prior
+        git_pr_session.status = "running"
+        git_pr_session.parent_run_id = git_pr_continue
+        if run_id not in git_pr_session.contributing_runs:
+            git_pr_session.contributing_runs.append(run_id)
+        git_pr_session_dir = prior_dir  # keep updating the original's session
+        gitpr.save_session(git_pr_session_dir, git_pr_session)
+        work_dir = git_pr_worktree
+        logger.info(
+            "git-pr: continuing run %s on branch %s (corrective run %s; worktree %s)",
+            git_pr_continue, prior.temp_branch, run_id, git_pr_worktree,
+        )
+    elif git_pr:
         from harness import gitpr
         target_repo = work_dir
         if not gitpr.is_git_repo(target_repo):
@@ -1855,8 +1921,9 @@ async def dispatch_async(
             base_sha=base_sha or "",
             work_dir=str(git_pr_worktree),
             target_repo=str(target_repo),
+            contributing_runs=[run_id],
         )
-        gitpr.save_session(run_dir, git_pr_session)
+        gitpr.save_session(git_pr_session_dir, git_pr_session)
         # Repoint the whole run at the worktree: the snapshot scope, worker cwd,
         # verifier, and run monitor all key off work_dir, so this single
         # reassignment routes the entire dispatch into the isolated branch
@@ -2021,7 +2088,7 @@ async def dispatch_async(
                     git_pr_session.commits.append(
                         {"step": idx, "sha": sha, "outcome": outcome, "title": title}
                     )
-                    _gitpr_step.save_session(run_dir, git_pr_session)
+                    _gitpr_step.save_session(git_pr_session_dir, git_pr_session)
             except Exception as exc:  # a commit hiccup must never break the stream
                 logger.debug("git-pr step commit skipped: %s", exc)
 
@@ -2458,7 +2525,7 @@ async def dispatch_async(
             session=git_pr_session,
             worktree=git_pr_worktree,
             target_repo=git_pr_target_repo,
-            run_dir=run_dir,
+            run_dir=git_pr_session_dir,
             run_id=run_id,
             instruction=instruction,
             final_verified=final_verified,
@@ -2692,6 +2759,7 @@ def dispatch(
     out_dir: Optional[Union[str, Path]] = None,
     candidate_setup: Optional[str] = None,
     git_pr: bool = False,
+    git_pr_continue: Optional[str] = None,
     resume_policy: str = "auto",
     protect_paths: Optional[List[str]] = None,
     allow_paths: Optional[List[str]] = None,
@@ -2764,6 +2832,7 @@ def dispatch(
             out_dir=out_dir,
             candidate_setup=candidate_setup,
             git_pr=git_pr,
+            git_pr_continue=git_pr_continue,
             resume_policy=resume_policy,
             protect_paths=protect_paths,
             allow_paths=allow_paths,

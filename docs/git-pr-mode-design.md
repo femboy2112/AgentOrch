@@ -2,8 +2,18 @@
 
 **Status:** building. ✅ Phase 0 (`harness/gitpr.py`), ✅ Phase 1 (preflight +
 worktree setup), ✅ Phase 2 (per-accepted-step commits), ✅ Phase 3 (push +
-draft-PR create/promote) landed on `main`. Phases 4–6 pending. Opt-in. Owner:
-operator + Claude session.
+draft-PR create/promote), ✅ Phase 4a (CLI verbs `pr`/`merge`/`abandon`),
+✅ Phase 5 (corrective resume `--continue`) landed on `main`. Pending: Phase 4b
+(Telegram buttons), Phase 6 (observability). Opt-in. Owner: operator + Claude session.
+
+Phase 5 corrective resume: `harness do "FIX…" --continue <run_id>` re-attaches a
+worktree to the prior run's temp branch (which already holds all committed work, so
+the worker continues from that state), runs the instruction on top, keeps
+committing to the SAME branch → the SAME PR updates on push (no second PR; promoted
+to ready when the corrective verifies). The corrective run gets its own run_id but
+updates the ORIGINAL canonical `pr_session.json` (`parent_run_id` + appended to
+`contributing_runs`). Works for any mode — no master-checkpoint surgery needed,
+because a completed run's correction is new work on top, not a half-step resume.
 
 Phase 3 session `status` ladder: `no_changes` (nothing committed) · `branch_ready`
 (committed, no remote → local branch only) · `pushed_no_pr` (pushed, gh absent or

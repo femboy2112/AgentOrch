@@ -145,21 +145,34 @@ def gh_authed(path: Optional[Path] = None) -> bool:
 # Worktree lifecycle
 # --------------------------------------------------------------------------- #
 def add_worktree(base: Path, target: Path, *, branch: str,
-                 start_point: Optional[str] = None,
+                 start_point: Optional[str] = None, create: bool = True,
                  timeout: int = WORKTREE_TIMEOUT) -> None:
-    """``git worktree add -b <branch> <target> [<start_point>]``.
+    """Check out ``branch`` in a fresh worktree at ``target``; the operator's own
+    checkout never moves. Raises :class:`GitError` on failure.
 
-    Creates ``branch`` at ``start_point`` (default: base HEAD) and checks it out
-    in a fresh worktree at ``target``. The operator's own checkout never moves.
-    Raises :class:`GitError` on failure."""
-    args = ["worktree", "add", "-b", branch, str(target)]
-    if start_point:
-        args.append(start_point)
+    ``create`` True  -> ``git worktree add -b <branch> <target> [<start_point>]``
+                        (creates a NEW branch at start_point, default base HEAD).
+    ``create`` False -> ``git worktree add <target> <branch>`` (checks out an
+                        EXISTING branch — used by corrective ``--continue`` runs to
+                        re-attach to a run's temp branch)."""
+    if create:
+        args = ["worktree", "add", "-b", branch, str(target)]
+        if start_point:
+            args.append(start_point)
+    else:
+        args = ["worktree", "add", str(target), branch]
     rc, out, err = _git(Path(base), *args, timeout=timeout)
     if rc != 0:
         raise GitError(
             f"git worktree add failed (rc={rc}): {(err or out).strip()}"
         )
+
+
+def branch_exists(path: Path, branch: str) -> bool:
+    """True iff ``branch`` exists in the repo at ``path``."""
+    rc, _, _ = _git(Path(path), "rev-parse", "--verify", "--quiet",
+                    f"refs/heads/{branch}")
+    return rc == 0
 
 
 def remove_worktree(base: Path, target: Path,
@@ -348,6 +361,9 @@ class PrSession:
     verified: bool = False
     decision: Optional[str] = None
     parent_run_id: Optional[str] = None
+    # Every run_id that contributed commits to this branch — the original run
+    # plus each corrective ``--continue`` run, in order.
+    contributing_runs: List[str] = field(default_factory=list)
     commits: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:

@@ -38,7 +38,8 @@ def _init_repo(tmp_path) -> Path:
 
 
 def _dispatch(repo, monkeypatch, *, writer=None, verified=False, **kw):
-    """Run a git-pr dispatch with the workflow stubbed out."""
+    """Run a git-pr dispatch with the workflow stubbed out (hermetic RUNS_DIR)."""
+    monkeypatch.setattr(dispatch_mod, "RUNS_DIR", repo.parent / "agentorch_runs")
     captured = {}
 
     async def fake_run_workflow(mode, prompt, **kwargs):
@@ -247,6 +248,7 @@ def _run_with_step_events(repo, monkeypatch, run_id, steps, *, plan_graph=None):
                 }}})
         return "out", types.SimpleNamespace(verified=True)
 
+    monkeypatch.setattr(dispatch_mod, "RUNS_DIR", repo.parent / "agentorch_runs")
     monkeypatch.setattr(dispatch_mod, "_run_workflow", fake)
     return dispatch_mod.dispatch(
         "multi step build", git_pr=True, out_dir=str(repo), run_id=run_id,
@@ -372,3 +374,67 @@ def test_no_remote_stays_local_branch_ready(tmp_path, monkeypatch):
     # branch exists locally with the commit
     assert "f.py" in _git(repo, "ls-tree", "-r", "--name-only",
                           gitpr.branch_name_for_run(result.run_id))
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 — corrective resume (--continue)
+# --------------------------------------------------------------------------- #
+def test_corrective_continue_same_branch_and_pr(tmp_path, monkeypatch, gh_stub):
+    repo = _init_repo(tmp_path)
+    _add_remote(repo, tmp_path)
+    # initial run: draft PR (not verified)
+    r1, _ = _dispatch(
+        repo, monkeypatch, verified=False, run_id="p5-orig",
+        writer=lambda wd: (wd / "a.py").write_text("a\n", encoding="utf-8"))
+    s1 = gitpr.load_session(Path(r1.run_dir))
+    assert s1.status == "awaiting_decision" and s1.pr_number == 77 and s1.draft is True
+    assert s1.contributing_runs == ["p5-orig"]
+
+    # corrective run on the SAME branch, this time verified
+    def _corrective_writer(wd):
+        # the corrective worktree must already hold the prior committed work
+        assert (wd / "a.py").exists(), "corrective run didn't pick up prior work"
+        (wd / "b.py").write_text("b\n", encoding="utf-8")
+
+    r2, cap = _dispatch(
+        repo, monkeypatch, verified=True, run_id="p5-corr",
+        git_pr_continue="p5-orig", writer=_corrective_writer)
+    # canonical session is the ORIGINAL run's, updated in place
+    s2 = gitpr.load_session(Path(r1.run_dir))
+    assert s2.parent_run_id == "p5-orig"
+    assert s2.contributing_runs == ["p5-orig", "p5-corr"]
+    assert s2.draft is False  # corrective verified -> existing PR promoted to ready
+    assert s2.status == "awaiting_decision"
+    # both files live on the one temp branch
+    branch = gitpr.branch_name_for_run("p5-orig")
+    files = _git(repo, "ls-tree", "-r", "--name-only", branch)
+    assert "a.py" in files and "b.py" in files
+    # exactly ONE PR was ever created; the corrective only promoted it
+    calls = _gh_calls(gh_stub)
+    assert len([c for c in calls if c[:2] == ["pr", "create"]]) == 1
+    assert ["pr", "ready", "77"] in calls
+
+
+def test_continue_unknown_run_raises(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    monkeypatch.setattr(dispatch_mod, "RUNS_DIR", repo.parent / "agentorch_runs")
+    with pytest.raises(ValueError, match="no git-pr session"):
+        dispatch_mod.dispatch(
+            "fix it", git_pr_continue="ghost-run", mode="direct",
+            generator_chain=["codex"], fallback=False, telegram_enabled=False,
+            heartbeat_interval=0)
+
+
+def test_continue_deleted_branch_raises(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    r1, _ = _dispatch(
+        repo, monkeypatch, run_id="p5-del",
+        writer=lambda wd: (wd / "a.py").write_text("a\n", encoding="utf-8"))
+    # delete the temp branch out from under the corrective run
+    _git(repo, "branch", "-D", gitpr.branch_name_for_run("p5-del"))
+    monkeypatch.setattr(dispatch_mod, "RUNS_DIR", repo.parent / "agentorch_runs")
+    with pytest.raises(ValueError, match="no longer exists"):
+        dispatch_mod.dispatch(
+            "fix it", git_pr_continue="p5-del", mode="direct",
+            generator_chain=["codex"], fallback=False, telegram_enabled=False,
+            heartbeat_interval=0)
