@@ -338,6 +338,9 @@ class PrSession:
     temp_branch: str
     base_sha: str
     work_dir: str
+    # The operator's real repo (where the remote + PR live, and where corrective
+    # runs re-add a worktree). ``work_dir`` is the throwaway worktree checkout.
+    target_repo: str = ""
     status: str = "running"
     pr_url: Optional[str] = None
     pr_number: Optional[int] = None

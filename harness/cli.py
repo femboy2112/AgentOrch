@@ -679,6 +679,89 @@ def _cmd_show(args) -> int:
     return 0
 
 
+def _load_pr_session(run_id: str):
+    """Load a run's git-pr session (or print an error + return None)."""
+    from harness import gitpr
+    run_dir = RUNS_DIR / run_id
+    sess = gitpr.load_session(run_dir)
+    if sess is None:
+        print(
+            f"{C_RED}no git-pr session for run {run_id} "
+            f"(was it dispatched with --git-pr?){C_RESET}",
+            file=sys.stderr,
+        )
+        return None, None
+    return sess, run_dir
+
+
+def _cmd_pr(args) -> int:
+    """Show a --git-pr run's branch/PR session + commit list."""
+    sess, _ = _load_pr_session(args.run_id)
+    if sess is None:
+        return 1
+    print(f"{C_BOLD}git-pr session {sess.run_id}{C_RESET}")
+    print(f"  status   : {sess.status}")
+    print(f"  base     : {sess.base_branch}")
+    print(f"  branch   : {sess.temp_branch}")
+    print(f"  verified : {sess.verified}")
+    if sess.pr_url:
+        print(f"  PR       : {sess.pr_url} ({'draft' if sess.draft else 'ready'})")
+    print(f"  commits  : {len(sess.commits)}")
+    for c in sess.commits:
+        step = f"step {c['step']}: " if c.get("step") else ""
+        print(f"    {str(c.get('sha', ''))[:9]}  {step}{c.get('title', '')} "
+              f"[{c.get('outcome', '')}]")
+    if sess.status == "awaiting_decision":
+        print(f"\n  decide: {C_BOLD}harness merge {sess.run_id}{C_RESET}  |  "
+              f"harness do \"FIX…\" --continue {sess.run_id}  |  "
+              f"harness abandon {sess.run_id}")
+    return 0
+
+
+def _cmd_merge(args) -> int:
+    """Merge a --git-pr run's PR (gh pr merge) and mark the session merged."""
+    from harness import gitpr
+    sess, run_dir = _load_pr_session(args.run_id)
+    if sess is None:
+        return 1
+    pr_ref = sess.pr_number if sess.pr_number is not None else sess.pr_url
+    if not pr_ref:
+        print(f"{C_RED}run {args.run_id} has no open PR to merge "
+              f"(status={sess.status}){C_RESET}", file=sys.stderr)
+        return 1
+    try:
+        gitpr.merge_pr(sess.target_repo or ".", pr_ref, method=args.method,
+                       delete_branch=args.delete_branch)
+    except gitpr.GitError as exc:
+        print(f"{C_RED}merge failed: {exc}{C_RESET}", file=sys.stderr)
+        return 1
+    sess.status = "merged"
+    sess.decision = "merge"
+    gitpr.save_session(run_dir, sess)
+    print(f"{C_GREEN}merged PR {sess.pr_url or pr_ref} ({args.method}){C_RESET}")
+    return 0
+
+
+def _cmd_abandon(args) -> int:
+    """Close a --git-pr run's PR (if any) and mark the session abandoned."""
+    from harness import gitpr
+    sess, run_dir = _load_pr_session(args.run_id)
+    if sess is None:
+        return 1
+    if sess.pr_number is not None:
+        try:
+            gitpr.close_pr(sess.target_repo or ".", sess.pr_number,
+                           delete_branch=args.delete_branch)
+        except gitpr.GitError as exc:
+            print(f"{C_YELLOW}gh pr close failed ({exc}); marking abandoned "
+                  f"anyway{C_RESET}", file=sys.stderr)
+    sess.status = "abandoned"
+    sess.decision = "abandon"
+    gitpr.save_session(run_dir, sess)
+    print(f"{C_YELLOW}abandoned run {args.run_id} (branch {sess.temp_branch}){C_RESET}")
+    return 0
+
+
 def _cmd_serve(args) -> int:
     """Run the singleton broker in the foreground: bind the IPC socket, honor the
     singleton guard (refuse a rival), and drain the persistent queue with a
@@ -1090,6 +1173,25 @@ def main(argv=None) -> int:
     runs = sub.add_parser("runs", help="List recent runs")
     runs.add_argument("--limit", type=int, default=20)
     runs.set_defaults(func=_cmd_runs)
+
+    pr = sub.add_parser("pr", help="Show a --git-pr run's branch/PR session")
+    pr.add_argument("run_id")
+    pr.set_defaults(func=_cmd_pr)
+
+    merge = sub.add_parser("merge", help="Merge a --git-pr run's PR (gh pr merge)")
+    merge.add_argument("run_id")
+    merge.add_argument("--method", choices=["squash", "merge", "rebase"],
+                       default="squash", help="Merge method (default: squash).")
+    merge.add_argument("--delete-branch", action="store_true",
+                       help="Delete the temp branch after merging.")
+    merge.set_defaults(func=_cmd_merge)
+
+    abandon = sub.add_parser(
+        "abandon", help="Close a --git-pr run's PR and mark it abandoned")
+    abandon.add_argument("run_id")
+    abandon.add_argument("--delete-branch", action="store_true",
+                         help="Also delete the temp branch.")
+    abandon.set_defaults(func=_cmd_abandon)
 
     show = sub.add_parser("show", help="Show a run's diff and metadata")
     show.add_argument("run_id", type=str)

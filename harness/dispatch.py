@@ -1854,6 +1854,7 @@ async def dispatch_async(
             temp_branch=temp_branch,
             base_sha=base_sha or "",
             work_dir=str(git_pr_worktree),
+            target_repo=str(target_repo),
         )
         gitpr.save_session(run_dir, git_pr_session)
         # Repoint the whole run at the worktree: the snapshot scope, worker cwd,
