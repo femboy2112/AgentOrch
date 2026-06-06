@@ -219,8 +219,9 @@ def test_model_unavailable_prunes_and_tries_next_then_caches(monkeypatch):
 
 
 def test_roles_wires_codex_model_fallbacks(monkeypatch):
-    """harness.roles builds a codex model-fallback map from the AVAILABLE_MODELS
-    universe (dynamic; runtime prunes inaccessible), honouring env override/disable."""
+    """harness.roles builds a codex model-fallback map from codex's discovered
+    roster (candidate_models(): cache best-first, static fallback), honouring the
+    env override/disable. Runtime pruning still drops inaccessible models."""
     from harness.roles import _codex_model_fallbacks, _class_for
     from agy_orchestrator.core.agents.codex_agent import CodexAgent
 
@@ -230,20 +231,23 @@ def test_roles_wires_codex_model_fallbacks(monkeypatch):
     monkeypatch.delenv("AGY_CODEX_MODEL_FALLBACKS", raising=False)
     fb = _codex_model_fallbacks(configs)
     assert codex_cls in fb
-    # Universe is AVAILABLE_MODELS minus the walled lead ('standard'->spark alias).
-    expected = [m for m in CodexAgent.AVAILABLE_MODELS
+    # Universe is the discovered roster minus the walled lead ('standard'->spark).
+    expected = [m for m in CodexAgent.candidate_models()
                 if m not in ("standard", "gpt-5.3-codex-spark")]
     assert fb[codex_cls] == expected
     assert "gpt-5.3-codex-spark" not in fb[codex_cls]
-    # Strong models come first so they're tried before the questionable tail.
+    # Codex's own priority order puts the strongest model first.
     assert fb[codex_cls][0] == "gpt-5.5"
 
     monkeypatch.setenv("AGY_CODEX_MODEL_FALLBACKS", "gpt-5.4, gpt-5.2")
     assert _codex_model_fallbacks(configs)[codex_cls] == ["gpt-5.4", "gpt-5.2"]
 
-    # Unknown model names are dropped (a typo can't reach codex).
+    # An explicit operator override is AUTHORITATIVE — names NOT in the discovered
+    # roster pass through unfiltered (model names are advisory per #46; a genuinely
+    # bad one is pruned at runtime when it 400s). Only the env path trusts the
+    # operator like this; the default (roster-sourced) path can't contain typos.
     monkeypatch.setenv("AGY_CODEX_MODEL_FALLBACKS", "gpt-5.4, gpt-9.9-bogus")
-    assert _codex_model_fallbacks(configs)[codex_cls] == ["gpt-5.4"]
+    assert _codex_model_fallbacks(configs)[codex_cls] == ["gpt-5.4", "gpt-9.9-bogus"]
 
     monkeypatch.setenv("AGY_CODEX_MODEL_FALLBACKS", "")
     assert _codex_model_fallbacks(configs) == {}

@@ -4,12 +4,68 @@ import logging
 import math
 import os
 import tempfile
+from pathlib import Path
 from typing import List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.core.model_discovery import discover_models
 
 logger = logging.getLogger(__name__)
+
+
+def _codex_models_cache_path() -> Path:
+    """Path to codex's own server-fetched model roster cache.
+
+    codex writes the account's available models (with a ``priority`` rank and the
+    per-model supported reasoning efforts) to ``~/.codex/models_cache.json`` — the
+    same roster its model picker shows. Reading it is true dynamic detection: it
+    reflects exactly what THIS account can use (e.g. retired/ungranted models like
+    gpt-5.2 simply aren't present), with no hardcoded list and no TUI scraping.
+    Overridable via ``AGY_CODEX_MODELS_CACHE`` (mainly so tests stay hermetic)."""
+    override = os.environ.get("AGY_CODEX_MODELS_CACHE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".codex" / "models_cache.json"
+
+
+def codex_models_from_cache() -> List[str]:
+    """Codex's selectable models, ordered by codex's own ``priority`` (best first).
+
+    Reads :func:`_codex_models_cache_path`. Returns the slugs of models the picker
+    lists (``visibility == "list"``; hidden helpers like ``codex-auto-review`` are
+    excluded), sorted by ascending ``priority``. Returns ``[]`` on ANY failure
+    (missing/corrupt cache, unexpected shape) so callers fall back to the static
+    list — never raises."""
+    try:
+        raw = _codex_models_cache_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return []
+        picked = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            slug = m.get("slug") or m.get("id")
+            if not slug:
+                continue
+            if m.get("visibility") not in (None, "list"):
+                continue  # 'hide' (codex-auto-review) and unknowns are not pickable
+            prio = m.get("priority")
+            picked.append((prio if isinstance(prio, (int, float)) else math.inf, str(slug)))
+        # Stable sort by priority; models without a priority sink to the end.
+        picked.sort(key=lambda t: t[0])
+        # De-dup preserving order.
+        out: List[str] = []
+        for _, slug in picked:
+            if slug not in out:
+                out.append(slug)
+        return out
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # corrupt cache / odd shape — never raise
+        logger.debug("codex models cache unreadable: %s", exc)
+        return []
 
 # A codex usage/quota wall is reported ONLY in the rollout JSONL's token_count
 # event (rate_limits.primary/secondary.used_percent), never on stderr — so the
@@ -174,22 +230,33 @@ class CodexAgent(AgentInstance):
     # Single source of truth for codex model names (used by the async API below
     # and synchronously by harness/effort_overrides.py for --codex-model
     # validation without spinning an event loop).
+    # Last-resort static roster, used ONLY when codex's own models_cache.json is
+    # unreadable (see codex_models_from_cache). Kept account-accurate (priority
+    # order; no gpt-5.2 / bare gpt-5.3-codex — neither is granted on the current
+    # account). The cache is the real source of truth; this is the safety net.
     AVAILABLE_MODELS: List[str] = [
-        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2",
+        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
     ]
 
     @classmethod
+    def candidate_models(cls) -> List[str]:
+        """Codex's selectable models, best-first. Dynamic (codex's own cache) with
+        the static :attr:`AVAILABLE_MODELS` as the never-empty fallback."""
+        return codex_models_from_cache() or list(cls.AVAILABLE_MODELS)
+
+    @classmethod
     async def get_available_models(cls) -> List[str]:
-        # The codex CLI exposes no machine-readable model-list subcommand, so we
-        # don't shell out (``list_argv=None``); AVAILABLE_MODELS is the static
-        # fallback. Routing through discover_models anyway keeps the discovery/
-        # union path uniform across adapters and memoizes the result. If a future
-        # codex build adds e.g. `codex models`, swap in its argv + a parser here.
+        # codex has no model-list subcommand, but it caches its server-fetched
+        # roster to ~/.codex/models_cache.json (priority-ordered, account-accurate).
+        # Read THAT for dynamic detection; the static AVAILABLE_MODELS is the
+        # fallback when the cache is absent. Routed through discover_models
+        # (list_argv=None) to keep the memoized discovery path uniform across
+        # adapters; ``fallback`` is the dynamic-then-static resolved roster.
         return await discover_models(
             "codex",
             list_argv=None,
             parse=lambda _stdout: [],
-            fallback=list(cls.AVAILABLE_MODELS),
+            fallback=cls.candidate_models(),
         )
 
     @classmethod

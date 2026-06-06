@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from agy_orchestrator.core.calibration import research_dir
 from agy_orchestrator.core.agents.agy_agent import AgyAgent
 from agy_orchestrator.core.agents.claude_agent import ClaudeAgent
 from agy_orchestrator.core.agents.codex_agent import CodexAgent
@@ -125,7 +126,7 @@ async def main() -> None:
     ap.add_argument("--grid", nargs="*", default=None,
                     help="combos as worker:model[:effort] (default: built-in grid)")
     ap.add_argument("--timeout", type=int, default=300, help="per-call ceiling (AGY_TIMEOUT)")
-    ap.add_argument("--out", default="/tmp/agentorch_research/sweep_results.jsonl")
+    ap.add_argument("--out", default=str(research_dir() / "sweep_results.jsonl"))
     ap.add_argument("--sequential", action="store_true",
                     help="run tasks ONE AT A TIME (no within-combo concurrency) — for clean "
                          "per-call latency measurement free of self-contention")

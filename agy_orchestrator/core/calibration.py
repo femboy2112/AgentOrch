@@ -60,9 +60,21 @@ DEFAULT_STALL_SECONDS_BY_WORKER = {
     "claude": 180.0,
 }
 
-# Path the calibrate sweep writes to; sweep results in /tmp by default.
+def research_dir() -> Path:
+    """Persistent directory for research/telemetry JSONL (offline calibration
+    sweeps + the live ledger). Repo-relative and gitignored so the measured data
+    SURVIVES across reboots — the prior ``/tmp/agentorch_research`` default got
+    wiped by /tmp cleanup and lost the per-(task,model,effort) sweep results.
+    Override with ``AGY_RESEARCH_DIR``."""
+    override = os.environ.get("AGY_RESEARCH_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parents[2] / "var" / "agentorch_research"
+
+
+# Path the calibrate sweep writes to (persistent, see research_dir()).
 DEFAULT_CALIBRATION_PATH = Path(
-    os.environ.get("AGY_CALIBRATION_JSONL", "/tmp/agentorch_research/calibrate.jsonl")
+    os.environ.get("AGY_CALIBRATION_JSONL") or str(research_dir() / "calibrate.jsonl")
 )
 
 # Live ledger — appended after every verified dispatch by harness/dispatch.py.
@@ -73,7 +85,7 @@ DEFAULT_CALIBRATION_PATH = Path(
 # trajectories outperforms offline-only calibration by ~12% on
 # accuracy-cost frontiers. Disable via AGY_LIVE_LEDGER=off.
 DEFAULT_LIVE_LEDGER_PATH = Path(
-    os.environ.get("AGY_LIVE_LEDGER_JSONL", "/tmp/agentorch_research/live_ledger.jsonl")
+    os.environ.get("AGY_LIVE_LEDGER_JSONL") or str(research_dir() / "live_ledger.jsonl")
 )
 
 

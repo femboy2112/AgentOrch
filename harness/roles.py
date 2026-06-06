@@ -123,18 +123,25 @@ def _codex_model_fallbacks(
     """Per-provider usage-wall model-fallback map for make_fallback_agent.
 
     Only codex gets one today (its multi-model account is the documented case). The
-    candidate universe is ``CodexAgent.AVAILABLE_MODELS`` (strong models first); the
-    currently-configured model and the ``standard``->``-spark`` alias are excluded so
-    a wall never re-picks the same window. Account-validity is NOT decided here —
-    the fallback layer prunes inaccessible models at runtime (dynamic detection).
-    Env AGY_CODEX_MODEL_FALLBACKS overrides the order; an empty value disables it.
-    Any name not in AVAILABLE_MODELS is dropped (a typo can't reach codex)."""
+    candidate universe + ORDER come from codex's own server-fetched roster
+    (``CodexAgent.candidate_models()`` -> ~/.codex/models_cache.json, best-first by
+    codex's ``priority``; static AVAILABLE_MODELS only if the cache is unreadable),
+    so the roll is account-accurate and not a hardcoded guess. The currently-
+    configured model and the ``standard``->``-spark`` alias are excluded so a wall
+    never re-picks the same window. Account-validity is still pruned at RUNTIME (a
+    model that 400s is dropped mid-run). Env AGY_CODEX_MODEL_FALLBACKS overrides the
+    order; an empty value disables it. Any name not in the candidate roster is
+    dropped (a typo can't reach codex)."""
     codex_cls = _class_for("codex")
     if codex_cls not in configs_by_cls:
         return {}
-    valid = list(getattr(CodexAgent, "AVAILABLE_MODELS", []))
+    valid = list(CodexAgent.candidate_models())
     raw = os.environ.get("AGY_CODEX_MODEL_FALLBACKS")
-    if raw is not None:
+    env_override = raw is not None
+    if env_override:
+        # An explicit operator list is AUTHORITATIVE — don't filter it against the
+        # discovered roster (the operator may know about a model the cache hasn't
+        # picked up yet; a genuinely bad name is pruned at runtime when it 400s).
         order = [m.strip() for m in raw.split(",") if m.strip()]
     else:
         order = list(valid)
@@ -145,10 +152,10 @@ def _codex_model_fallbacks(
     for m in order:
         if not m or m in (current, alias) or m in cleaned:
             continue
-        if valid_set and m not in valid_set:
+        if not env_override and valid_set and m not in valid_set:
             logger.warning(
                 "[roles] dropping unknown codex model '%s' from usage-wall "
-                "fallback list (not in CodexAgent.AVAILABLE_MODELS)", m,
+                "fallback list (not in codex's discovered roster)", m,
             )
             continue
         cleaned.append(m)
@@ -379,7 +386,24 @@ def build_role_agent(
                 pass
         return agent  # type: ignore[return-value]
 
-    if not fallback or len(chain) == 1:
+    classes = [_class_for(name) for name in chain]
+    configs_by_cls = _configs_for(chain, codex_config, overrides)
+    # The per-call model=/effort= scalars override the lead's resolved config so a
+    # single-provider wrap (below) carries the same lead identity the direct path
+    # would have used.
+    if classes and (model is not None or effort is not None):
+        configs_by_cls[classes[0]] = dict(lead_cfg)
+    # Intra-provider model fallback (#78): a usage wall / inaccessible model on the
+    # lead should roll to that provider's NEXT-BEST model before giving up — and
+    # that must happen even for a SINGLE-provider chain (e.g. `--generator codex`
+    # in direct/cascade, where codex's default spark is currently usage-walled but
+    # gpt-5.5 is not). So wrap a 1-token chain in the FallbackAgent too whenever the
+    # provider has a non-empty model-fallback list. A 1-token chain for a provider
+    # with NO model-fallback list keeps the cheap direct path (byte-identical).
+    model_fb = _codex_model_fallbacks(configs_by_cls)
+    wrap = fallback and (len(chain) > 1 or bool(model_fb))
+
+    if not wrap:
         cls = _class_for(lead_name)
         agent = cls(prompt=prompt, **lead_cfg)
         _arm_watchdog(
@@ -393,8 +417,6 @@ def build_role_agent(
                 pass
         return agent
 
-    classes = [_class_for(name) for name in chain]
-    configs_by_cls = _configs_for(chain, codex_config, overrides)
     # name_by_cls maps each agent class back to its worker token so the hook can
     # look up the right (worker, model, effort) budget for whichever sub the
     # FallbackAgent instantiates this attempt.
@@ -420,7 +442,7 @@ def build_role_agent(
     fb_cls = make_fallback_agent(
         classes, cycles=cycles, configs=configs_by_cls,
         post_construct_hook=arm_hook,
-        model_fallbacks=_codex_model_fallbacks(configs_by_cls),
+        model_fallbacks=model_fb,
     )
     # Lead config seeds self.model/self.effort; per-provider configs override.
     return fb_cls(prompt=prompt, model=lead_cfg["model"], effort=lead_cfg["effort"])
@@ -453,7 +475,18 @@ def build_master_agent_class(
     if lead_name == COMPUTER_USE_TOKEN:
         # cu not supported in master workflows; return a stub class for graceful fail
         return ComputerUseShim, lead_cfg["model"], lead_cfg["effort"]
-    if not fallback or len(chain) == 1:
+
+    classes = [_class_for(name) for name in chain]
+    configs_by_cls = _configs_for(chain, codex_config, overrides)
+    # Intra-provider model fallback (#78) must reach a SINGLE-provider master/pat
+    # run too: when the lead provider has a model-fallback list (codex), wrap even a
+    # 1-token chain so a usage-walled lead model rolls to the next-best (spark ->
+    # gpt-5.5) before the whole build fails. A provider with no model-fallback list
+    # keeps the cheap HookedLead/bare-class path (byte-identical).
+    model_fb = _codex_model_fallbacks(configs_by_cls)
+    wrap = fallback and (len(chain) > 1 or bool(model_fb))
+
+    if not wrap:
         cls = _class_for(lead_name)
         if post_construct_hook is None:
             return cls, lead_cfg["model"], lead_cfg["effort"]
@@ -468,8 +501,6 @@ def build_master_agent_class(
 
         HookedLead.__name__ = f"Hooked{cls.__name__}"
         return HookedLead, lead_cfg["model"], lead_cfg["effort"]
-    classes = [_class_for(name) for name in chain]
-    configs_by_cls = _configs_for(chain, codex_config, overrides)
     name_by_cls: Dict[Type[AgentInstance], str] = {
         _class_for(name): name for name in chain
     }
@@ -492,7 +523,7 @@ def build_master_agent_class(
     fb_cls = make_fallback_agent(
         classes, cycles=cycles, configs=configs_by_cls,
         post_construct_hook=arm_hook,
-        model_fallbacks=_codex_model_fallbacks(configs_by_cls),
+        model_fallbacks=model_fb,
     )
     return fb_cls, lead_cfg["model"], lead_cfg["effort"]
 

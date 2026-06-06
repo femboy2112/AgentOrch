@@ -54,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from agy_orchestrator.core.calibration import research_dir
 from scripts.cloud_eval import BRUTAL_TASKS, CLOUD_SUFFIX, extract_code, run_test
 from scripts.token_efficiency import label, run_config, scoreboard
 
@@ -164,7 +165,7 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=1,
                     help="Repeats per (model,task); medians reported.")
     ap.add_argument("--timeout", type=int, default=240)
-    ap.add_argument("--out", default="/tmp/agentorch_research/claude_version_sweep.jsonl")
+    ap.add_argument("--out", default=str(research_dir() / "claude_version_sweep.jsonl"))
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the plan + resolved `claude --model` per row; spawn nothing.")
     args = ap.parse_args()

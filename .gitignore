@@ -71,3 +71,6 @@ tgbot/
 .idea/
 .vscode/
 .DS_Store
+
+# Research/telemetry data (calibration sweeps, live ledger) — persistent but machine-specific
+var/

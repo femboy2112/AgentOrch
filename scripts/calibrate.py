@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from agy_orchestrator.core.calibration import research_dir
 from scripts.cloud_eval import CLOUD_SUFFIX
 from scripts.task_synth import synthesize
 from scripts.token_efficiency import run_config
@@ -106,7 +107,7 @@ def main() -> None:
     ap.add_argument("--analyze-only", metavar="JSONL",
                     help="re-print the per-axis analysis from an existing results file")
     ap.add_argument("--timeout", type=int, default=300)
-    ap.add_argument("--out", default="/tmp/agentorch_research/calibrate.jsonl")
+    ap.add_argument("--out", default=str(research_dir() / "calibrate.jsonl"))
     args = ap.parse_args()
 
     if args.analyze_only:

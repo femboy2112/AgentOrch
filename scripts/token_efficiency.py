@@ -38,6 +38,7 @@ from statistics import median
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from agy_orchestrator.core.calibration import research_dir
 from scripts.cloud_eval import BRUTAL_TASKS, CLOUD_SUFFIX, extract_code, run_test
 
 # (worker, model, effort). Focus on the efficiency frontier: cheap/fast configs at
@@ -204,7 +205,7 @@ def main() -> None:
     ap.add_argument("--grid", nargs="*", default=None, help="worker:model[:effort] combos")
     ap.add_argument("--repeats", type=int, default=1, help="repeats per (combo,task); medians reported")
     ap.add_argument("--timeout", type=int, default=240)
-    ap.add_argument("--out", default="/tmp/agentorch_research/token_efficiency.jsonl")
+    ap.add_argument("--out", default=str(research_dir() / "token_efficiency.jsonl"))
     args = ap.parse_args()
 
     if args.grid:
