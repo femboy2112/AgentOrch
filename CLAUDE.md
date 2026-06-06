@@ -36,6 +36,9 @@ python -m harness do "INSTRUCTION" --mode pat --test-cmd "pytest -q"        # tr
 python -m harness do "INSTRUCTION" --web-search      # enable codex web search
 python -m harness do "INSTRUCTION" --test-cmd "pytest -q"   # quality gate
 python -m harness do "INSTRUCTION" --out-dir /path/to/other/repo  # write THERE, not into AgentOrch
+python -m harness do "INSTRUCTION" --git-pr   # run on an isolated worktree+branch -> draft PR (docs/git-pr-mode-design.md)
+python -m harness do "FIX" --continue <run_id>   # corrective resume on the same branch + PR
+python -m harness pr|merge|abandon <run_id>   # inspect / merge / close a --git-pr run's PR
 python -m harness runs                        # list recent runs
 python -m harness show <run_id>               # print a run's diff + meta
 ```

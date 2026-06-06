@@ -41,6 +41,12 @@ orchestration, verification loops, and run bookkeeping in a repeatable way.
   a usage wall on one provider does not automatically terminate the run.
 - Target other repositories safely with `--out-dir`, so workers write into the
   intended project while AgentOrch keeps its own orchestration artifacts local.
+- Review the work as a pull request with `--git-pr`: the dispatch runs on an
+  isolated worktree + temp branch (your checkout never moves), commits each
+  accepted step, and opens a draft PR to your current branch (promoted to ready
+  on verify). Decide later with `harness pr/merge/abandon`, or fire a corrective
+  plan with `harness do "FIX…" --continue <run_id>`. See
+  `docs/git-pr-mode-design.md`.
 
 In practice, this means you can delegate mechanical or high-volume edits,
 preserve your own context for review and design decisions, and still keep a
@@ -118,10 +124,11 @@ agy_orchestrator/            # Multi-agent engine and workflow implementations
   cli.py                     # Standalone orchestrator CLI entrypoint
 
 harness/                     # Operator-facing dispatch/control layer
-  cli.py                     # `harness do|runs|show|dashboard` command interface
+  cli.py                     # `harness do|runs|show|pr|merge|abandon|dashboard` command interface
   dispatch.py                # Prompt build, mode routing, snapshot diffing, run artifact capture
   roles.py                   # Generator/critic chain defaults, worker mapping, watchdog setup
   snapshot.py                # Git-independent before/after filesystem snapshot + diff helpers
+  gitpr.py                   # --git-pr: worktree/branch + draft-PR (git+gh) plumbing, PrSession
 ```
 
 The dashboard package is intentionally separate from this high-level tree and

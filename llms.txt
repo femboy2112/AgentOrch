@@ -12,6 +12,9 @@ AgentOrch runs from your workstation and delegates implementation to existing wo
   - `spec GOAL [-c CONSTRAINT ...]` — FloodSpec: goal+constraints -> design doc.
   - `runs [--limit N]` — list recent runs (default 20).
   - `show RUN_ID` — print a run's diff + metadata.
+  - `pr RUN_ID` — show a `--git-pr` run's branch/PR session + commits.
+  - `merge RUN_ID [--method squash|merge|rebase] [--delete-branch]` — merge a `--git-pr` run's PR.
+  - `abandon RUN_ID [--delete-branch]` — close a `--git-pr` run's PR.
   - `serve [--cap N]` — run the singleton broker (persistent queue, cap-2 drain, IPC socket).
   - `queue` — list the broker's build queue.
   - `dashboard [--port 8765] [--browser]` — local control dashboard (127.0.0.1:8765, no browser by default).
@@ -35,6 +38,10 @@ python -m harness do "INSTRUCTION" --mode <mode> \
 | `pat` | Plan-after-Trial: direct first, escalate to master on fail | **required** |
 | `vote` | K parallel candidates in isolated workspaces, verifier picks winner (`--branches K`) | **required** |
 | `auto` | RoutingPolicy picks the concrete mode | not required |
+
+### Git PR mode (`--git-pr`, opt-in)
+- Runs the dispatch on an isolated git worktree + temp branch (`agentorch/<run_id>`) — your checkout never moves. Commits each accepted step, pushes, and opens a **draft PR** to your current branch (promoted to ready when the run verifies). Requires a clean work tree; degrades to a local branch (no PR) without a remote/`gh`.
+- Decide after: `harness pr/merge/abandon RUN_ID`, or `harness do "FIX…" --continue RUN_ID` (corrective resume on the same branch → same PR). State in `runs/<id>/pr_session.json`; summary in `meta.json` `git_pr`. See `docs/git-pr-mode-design.md`.
 
 ### Workers & default chains
 - Worker tokens: `codex` (openai) · `agy` (google) · `claude` (anthropic) · `grok` (xai) · `computer-use`.

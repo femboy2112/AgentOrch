@@ -79,6 +79,7 @@ python -m harness [-v|--verbose] [--version] <command> [args]
 | `--version` | Print the running build (version + git commit) and exit. |
 
 Subcommands: [`do`](#harness-do), [`spec`](#harness-spec), [`runs`](#harness-runs),
+[`pr`](#harness-pr), [`merge`](#harness-merge), [`abandon`](#harness-abandon),
 [`show`](#harness-show), [`serve`](#harness-serve), [`queue`](#harness-queue),
 [`dashboard`](#harness-dashboard).
 
@@ -205,6 +206,24 @@ these for a mission-critical, invariant-touching build. Effort `max` maps to cod
 | `--mission-critical` | flag | off | Prepend a catastrophic-failure-focused preamble to the critic prompt (adversarial); more exhaustive, severity-prioritized review. Implies `--reconcile` and `fail` disposition unless overridden. |
 | `--out-dir` | `PATH` | AgentOrch repo root | Directory the worker writes into (its cwd). Set when invoking AgentOrch from another repo. The snapshot diff and changed-files list follow this path. |
 
+### Git PR mode
+
+Opt-in. A `--git-pr` dispatch runs on an **isolated git worktree + temp branch**
+(`agentorch/<run_id>`) instead of writing into your checkout — your own checkout is
+never moved. It commits one accepted step at a time, then pushes the branch and
+opens a **draft PR** to your current (base) branch, promoting it to ready-for-review
+when the run verifies. State is persisted to `runs/<id>/pr_session.json` and
+summarised in `meta.json` under `git_pr`. Decide later with
+[`pr`](#harness-pr) / [`merge`](#harness-merge) / [`abandon`](#harness-abandon), or
+fire a corrective plan with `--continue`. Requires a clean git work tree (refuses a
+dirty / detached / non-repo tree); degrades to a local branch (no PR) without a
+remote or `gh`. See [`docs/git-pr-mode-design.md`](../git-pr-mode-design.md).
+
+| Flag | Type / metavar | Default | Meaning |
+|---|---|---|---|
+| `--git-pr` | flag | off | Run on an isolated worktree + temp branch, commit each accepted step, and open a draft PR to the base branch. |
+| `--continue` | `RUN_ID` | `None` | Corrective resume: re-attach to a prior `--git-pr` run's temp branch and run THIS instruction on top, updating the **same** branch + PR (no second PR; promoted again when it verifies). Implies `--git-pr`. The corrective run gets its own `run_id` but updates the original run's `pr_session.json`. Repeatable. |
+
 ### Computer-use flags
 
 These take effect only when the generator chain leads with `computer-use`.
@@ -267,6 +286,13 @@ python -m harness do "add endpoint" --out-dir /path/to/app \
 # K-candidate vote in isolated workspaces
 python -m harness do "optimize the hot loop" --mode vote --branches 4 \
     --test-cmd "pytest -q" --candidate-setup "python -m venv .venv && .venv/bin/pip install -e ."
+
+# Git PR mode: build on an isolated branch, open a draft PR, then decide
+python -m harness do "build feature Z" --mode master --test-cmd "pytest -q" \
+    --git-pr --out-dir /path/to/app
+python -m harness pr <run_id>                       # review branch / PR / commits
+python -m harness do "also handle empty input" --continue <run_id>   # corrective
+python -m harness merge <run_id> --method squash --delete-branch
 ```
 
 ---
@@ -317,6 +343,51 @@ python -m harness show <run_id>
 ```
 
 **Positional:** `run_id` — the run directory name under `runs/`.
+
+---
+
+## `harness pr`
+
+Show a [`--git-pr`](#git-pr-mode) run's session: status, base/temp branch, PR url
+(draft|ready), and the per-step commit list. When the run is `awaiting_decision`,
+prints the merge / corrective / abandon next-step commands.
+
+```
+python -m harness pr <run_id>
+```
+
+**Positional:** `run_id` — the original `--git-pr` run's id.
+
+---
+
+## `harness merge`
+
+Merge a [`--git-pr`](#git-pr-mode) run's PR (`gh pr merge`) and mark the session
+`merged`. Errors if the run has no open PR.
+
+```
+python -m harness merge <run_id> [--method squash|merge|rebase] [--delete-branch]
+```
+
+| Flag | Choices | Default | Meaning |
+|---|---|---|---|
+| `--method` | `squash`,`merge`,`rebase` | `squash` | Merge method passed to `gh pr merge`. |
+| `--delete-branch` | flag | off | Delete the temp branch after merging. |
+
+---
+
+## `harness abandon`
+
+Close a [`--git-pr`](#git-pr-mode) run's PR (if any, via `gh pr close`) and mark the
+session `abandoned`. A `gh` failure is reported but the session is still marked.
+
+```
+python -m harness abandon <run_id> [--delete-branch]
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--delete-branch` | off | Also delete the temp branch. |
 
 ---
 
