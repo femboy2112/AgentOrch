@@ -41,17 +41,48 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agy_orchestrator.core.calibration import research_dir
 from scripts.cloud_eval import BRUTAL_TASKS, CLOUD_SUFFIX, extract_code, run_test
 
-# (worker, model, effort). Focus on the efficiency frontier: cheap/fast configs at
-# low effort (since quality is saturated, the question is how few tokens still pass),
-# plus a couple of strong configs for contrast.
+# (worker, model, effort). ALL currently-valid codex+claude combos (the only two
+# workers that expose token telemetry) so a from-scratch run maps the full
+# token/cost-vs-effort curve per model. Narrow with --grid to bound cost. Kept in
+# sync with the live rosters (codex ~/.codex/models_cache.json; claude --effort):
+#   codex  : gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark x low/medium/
+#            high/xhigh. ("minimal" is NOT in supported_reasoning_levels anymore.)
+#   claude : haiku / sonnet / opus x low/medium/high/xhigh/max (server gates the
+#            top tiers per model; unsupported pairs record a failed row).
 DEFAULT_GRID = [
-    ("codex", "gpt-5.4-mini", "minimal"),
-    ("codex", "gpt-5.4-mini", "low"),
+    # codex
     ("codex", "gpt-5.5", "low"),
+    ("codex", "gpt-5.5", "medium"),
+    ("codex", "gpt-5.5", "high"),
+    ("codex", "gpt-5.5", "xhigh"),
+    ("codex", "gpt-5.4", "low"),
+    ("codex", "gpt-5.4", "medium"),
+    ("codex", "gpt-5.4", "high"),
+    ("codex", "gpt-5.4", "xhigh"),
+    ("codex", "gpt-5.4-mini", "low"),
+    ("codex", "gpt-5.4-mini", "medium"),
+    ("codex", "gpt-5.4-mini", "high"),
+    ("codex", "gpt-5.4-mini", "xhigh"),
     ("codex", "gpt-5.3-codex-spark", "low"),
+    ("codex", "gpt-5.3-codex-spark", "medium"),
+    ("codex", "gpt-5.3-codex-spark", "high"),
+    ("codex", "gpt-5.3-codex-spark", "xhigh"),
+    # claude
     ("claude", "haiku", "low"),
+    ("claude", "haiku", "medium"),
+    ("claude", "haiku", "high"),
+    ("claude", "haiku", "xhigh"),
+    ("claude", "haiku", "max"),
     ("claude", "sonnet", "low"),
+    ("claude", "sonnet", "medium"),
+    ("claude", "sonnet", "high"),
+    ("claude", "sonnet", "xhigh"),
+    ("claude", "sonnet", "max"),
+    ("claude", "opus", "low"),
+    ("claude", "opus", "medium"),
     ("claude", "opus", "high"),
+    ("claude", "opus", "xhigh"),
+    ("claude", "opus", "max"),
 ]
 
 # Bench aliases pin bare names to a dated model for reproducibility. Full version

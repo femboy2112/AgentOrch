@@ -45,22 +45,64 @@ from scripts.cloud_eval import (
 
 ALL_TASKS = {**EASY_TASKS, **HARD_TASKS, **BRUTAL_TASKS}
 
-# Default sweep grid (worker, model, effort). Kept modest to bound cost; expand
-# via --grid. Models/efforts are the empirically-verified ones (verified_models.md).
+# Default sweep grid: ALL currently-valid (worker, model, effort) combos, so a
+# from-scratch run regenerates the full measured table. Narrow with --grid/--tasks
+# to bound cost. Kept in sync with the live rosters:
+#   codex  : ~/.codex/models_cache.json -> gpt-5.5 / gpt-5.4 / gpt-5.4-mini /
+#            gpt-5.3-codex-spark, each supporting low/medium/high/xhigh
+#            (gpt-5.2 / bare gpt-5.3-codex are ungranted -> excluded).
+#   claude : haiku / sonnet / opus x low/medium/high/xhigh/max — the CLI accepts
+#            all five (`claude --effort`); the server gates which model honours the
+#            top tiers, so an unsupported (model,effort) pair just records a failed
+#            row here (run_one catches it) and can then be pruned.
+#   agy    : Pro x low/high · Flash x low/medium/high · Opus/Sonnet/GPT-OSS
+#            (effort is baked into the picker display name -> None) (agy_agent.py).
+#   grok   : grok-build rejects reasoningEffort -> no effort (grok_agent.py).
 DEFAULT_GRID = [
+    # codex (full effort range, all granted models)
     ("codex", "gpt-5.5", "low"),
+    ("codex", "gpt-5.5", "medium"),
     ("codex", "gpt-5.5", "high"),
-    ("codex", "gpt-5.3-codex-spark", "medium"),
+    ("codex", "gpt-5.5", "xhigh"),
+    ("codex", "gpt-5.4", "low"),
+    ("codex", "gpt-5.4", "medium"),
+    ("codex", "gpt-5.4", "high"),
+    ("codex", "gpt-5.4", "xhigh"),
     ("codex", "gpt-5.4-mini", "low"),
+    ("codex", "gpt-5.4-mini", "medium"),
+    ("codex", "gpt-5.4-mini", "high"),
+    ("codex", "gpt-5.4-mini", "xhigh"),
+    ("codex", "gpt-5.3-codex-spark", "low"),
+    ("codex", "gpt-5.3-codex-spark", "medium"),
+    ("codex", "gpt-5.3-codex-spark", "high"),
+    ("codex", "gpt-5.3-codex-spark", "xhigh"),
+    # claude (full effort ladder; top tiers may not be honoured on every model)
     ("claude", "haiku", "low"),
+    ("claude", "haiku", "medium"),
+    ("claude", "haiku", "high"),
+    ("claude", "haiku", "xhigh"),
+    ("claude", "haiku", "max"),
     ("claude", "sonnet", "low"),
+    ("claude", "sonnet", "medium"),
     ("claude", "sonnet", "high"),
+    ("claude", "sonnet", "xhigh"),
+    ("claude", "sonnet", "max"),
+    ("claude", "opus", "low"),
+    ("claude", "opus", "medium"),
     ("claude", "opus", "high"),
-    ("grok", "grok-build", None),
+    ("claude", "opus", "xhigh"),
+    ("claude", "opus", "max"),
+    # agy (effort encoded in the picker display name; Pro has no medium)
+    ("agy", "pro", "low"),
+    ("agy", "pro", "high"),
     ("agy", "flash", "low"),
     ("agy", "flash", "medium"),
-    ("agy", "pro", "high"),
+    ("agy", "flash", "high"),
     ("agy", "opus", None),
+    ("agy", "sonnet", None),
+    ("agy", "gpt-oss", None),
+    # grok (no effort)
+    ("grok", "grok-build", None),
 ]
 
 DEFAULT_TASKS = ["roman_to_int", "balanced", "merge_intervals", "eval_expr"]
