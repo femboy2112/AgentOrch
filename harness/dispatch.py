@@ -1843,6 +1843,44 @@ async def dispatch_async(
 
     EVENT_BUS.add_sink(run_id, _sink)
 
+    # --git-pr per-accepted-step commits (Phase 2): for a LINEAR master/pat run,
+    # commit the worktree each time a step finishes verified/approved, so the temp
+    # branch grows one reviewable commit per accepted step. Master already emits
+    # the step-completed orchestration event through the bus, so this needs no
+    # workflow changes — it just listens. Graph (DAG) runs write via post-merge
+    # into the live tree at a DIFFERENT boundary (a node's step-completed fires
+    # before its writes are merged), so they are deliberately NOT committed
+    # per-step here; their merged result is captured by the single finalize commit
+    # below. (Per-node graph commits are a documented follow-up — design §8.)
+    if git_pr and git_pr_session is not None and plan_graph is None:
+        from harness import gitpr as _gitpr_step
+
+        def _git_pr_step_commit(event: dict) -> None:
+            try:
+                data = event.get("data") or {}
+                if data.get("event") != "orchestration_transition":
+                    return
+                orch = data.get("orchestration") or {}
+                if orch.get("phase") != "step" or orch.get("action") != "completed":
+                    return
+                outcome = orch.get("outcome")
+                if outcome not in ("verified", "approved"):
+                    return
+                idx = orch.get("step_index")
+                total = orch.get("step_total")
+                title = (orch.get("step_title") or "").strip()
+                msg = f"step {idx}/{total}: {title} [{outcome}]".strip()
+                sha = _gitpr_step.commit(git_pr_worktree, msg)
+                if sha:
+                    git_pr_session.commits.append(
+                        {"step": idx, "sha": sha, "outcome": outcome, "title": title}
+                    )
+                    _gitpr_step.save_session(run_dir, git_pr_session)
+            except Exception as exc:  # a commit hiccup must never break the stream
+                logger.debug("git-pr step commit skipped: %s", exc)
+
+        EVENT_BUS.add_sink(run_id, _git_pr_step_commit)
+
     # Telegram build-progress sink (best-effort; fully exception-isolated). Any
     # telegram error here is swallowed (debug log) and never affects dispatch.
     telegram_notifier = _build_telegram_notifier(

@@ -1,6 +1,8 @@
 # Git PR Mode (`--git-pr`) — design
 
-**Status:** design / not yet built. Opt-in. Owner: operator + Claude session.
+**Status:** building. ✅ Phase 0 (`harness/gitpr.py`), ✅ Phase 1 (preflight +
+worktree setup), ✅ Phase 2 (per-accepted-step commits) landed on `main`
+(a60bd88 + follow-up). Phases 3–6 pending. Opt-in. Owner: operator + Claude session.
 **One line:** a dispatch runs on an isolated temp git branch, commits each accepted
 step, opens a **draft PR** to the clean base branch (promoted to ready when
 verification passes), and persists a session so the operator can later **merge** or

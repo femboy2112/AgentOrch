@@ -175,3 +175,85 @@ def test_without_flag_no_session_no_branch(tmp_path, monkeypatch):
     branches = _git(repo, "branch", "--list", "agentorch/*")
     assert branches.strip() == ""
     assert (repo / "inplace.py").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — per-accepted-step commits (linear master) + graph gate
+# --------------------------------------------------------------------------- #
+def _run_with_step_events(repo, monkeypatch, run_id, steps, *, plan_graph=None):
+    """Stub a master-like run: write each step's file, then emit its
+    step-completed orchestration event through the bus (which the git-pr per-step
+    sink listens to). ``steps`` = list of (filename, outcome)."""
+    async def fake(mode, prompt, **kwargs):
+        wd = Path(kwargs["working_directory"])
+        pub = dispatch_mod.EVENT_BUS.publisher_for(
+            run_id, worker="codex", model="m", effort="hi")
+        total = len(steps)
+        for i, (fname, outcome) in enumerate(steps, start=1):
+            (wd / fname).write_text(f"# {fname}\n", encoding="utf-8")
+            pub({"kind": "lifecycle", "data": {
+                "event": "orchestration_transition",
+                "orchestration": {
+                    "workflow": "master", "phase": "step", "action": "completed",
+                    "step_index": i, "step_total": total,
+                    "step_title": f"do {fname}", "outcome": outcome,
+                }}})
+        return "out", types.SimpleNamespace(verified=True)
+
+    monkeypatch.setattr(dispatch_mod, "_run_workflow", fake)
+    return dispatch_mod.dispatch(
+        "multi step build", git_pr=True, out_dir=str(repo), run_id=run_id,
+        mode="master", generator_chain=["codex"], fallback=False,
+        telegram_enabled=False, heartbeat_interval=0, plan_graph=plan_graph,
+    )
+
+
+def test_linear_per_step_commits(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    result = _run_with_step_events(
+        repo, monkeypatch, "p2-linear",
+        [("a.py", "verified"), ("b.py", "approved")])
+    branch = gitpr.branch_name_for_run("p2-linear")
+    subjects = _git(repo, "log", "--format=%s", branch).splitlines()
+    assert "step 1/2: do a.py [verified]" in subjects
+    assert "step 2/2: do b.py [approved]" in subjects
+    sess = gitpr.load_session(Path(result.run_dir))
+    assert [c["step"] for c in sess.commits] == [1, 2]
+    assert [c["outcome"] for c in sess.commits] == ["verified", "approved"]
+    # each step's commit holds exactly that step's file
+    f1 = _git(repo, "show", "--name-only", "--format=", sess.commits[0]["sha"])
+    assert "a.py" in f1 and "b.py" not in f1
+    # nothing left over -> the finalize sweep added no extra commit
+    assert len(sess.commits) == 2
+
+
+def test_unaccepted_step_swept_not_committed_per_step(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    result = _run_with_step_events(
+        repo, monkeypatch, "p2-stall",
+        [("a.py", "verified"), ("b.py", "stalled")])
+    sess = gitpr.load_session(Path(result.run_dir))
+    step_commits = [c for c in sess.commits if "step" in c]
+    assert len(step_commits) == 1 and step_commits[0]["step"] == 1
+    # b.py (the non-accepted step's output) still reaches the branch via the
+    # finalize sweep — work is never lost, it's just not a per-step commit.
+    branch = gitpr.branch_name_for_run("p2-stall")
+    assert "b.py" in _git(repo, "ls-tree", "-r", "--name-only", branch)
+    assert len(sess.commits) == 2  # 1 step commit + 1 sweep commit
+
+
+def test_graph_run_uses_single_finalize_commit(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    from agy_orchestrator.execution.graph_plan import GraphPlan, PlanNode
+    gp = GraphPlan(nodes=[PlanNode(id="n1", task="t1"),
+                          PlanNode(id="n2", task="t2")])
+    result = _run_with_step_events(
+        repo, monkeypatch, "p2-graph",
+        [("a.py", "verified"), ("b.py", "verified")], plan_graph=gp)
+    sess = gitpr.load_session(Path(result.run_dir))
+    # Graph gate: no per-step commits; the merged result is one finalize commit.
+    assert all("step" not in c for c in sess.commits)
+    assert len(sess.commits) == 1
+    branch = gitpr.branch_name_for_run("p2-graph")
+    files = _git(repo, "ls-tree", "-r", "--name-only", branch)
+    assert "a.py" in files and "b.py" in files
