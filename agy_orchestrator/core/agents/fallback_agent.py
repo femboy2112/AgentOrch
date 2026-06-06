@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Type
 from agy_orchestrator.core.agent import (
     WATCHDOG_MARKER,
     WATCHDOG_TRANSPORT_STALL,
+    WATCHDOG_VERBOSE,
     AgentInstance,
     is_context_overflow,
     is_model_unavailable,
@@ -667,6 +668,25 @@ def make_fallback_agent(
                             respliced += 1
                             last_error = exc
                             continue
+                    # Issue #83 — LOUD, DISTINCT signal when the operator's chosen
+                    # PRIMARY/lead generator (attempts == 1) is killed by the verbose
+                    # BYTE-budget watchdog (NOT a hang or usage wall) and the chain is
+                    # about to advance off it. The generic per-reroute line below is too
+                    # easy to miss; this names the primary-override + the byte-budget
+                    # remedy so a read-heavy generator silently demoted to a fallback is
+                    # visible. Scoped to lead+verbose: non-lead or non-verbose unchanged.
+                    if attempts == 1 and reason == WATCHDOG_VERBOSE:
+                        logger.warning(
+                            "[Fallback] PRIMARY generator %s was SIGKILLed by the verbose "
+                            "BYTE-budget watchdog (watchdog:verbose) and the chain is being "
+                            "rerouted to a FALLBACK worker — your chosen primary generator "
+                            "selection was OVERRIDDEN by a byte-budget kill, not a hang or "
+                            "usage wall. If %s was legitimately reading a design doc / "
+                            "multiple modules, raise the byte budget with "
+                            "--watchdog-max-bytes (or env AGY_WATCHDOG_MAX_BYTES) to keep it "
+                            "on your primary (issue #83).",
+                            label, label,
+                        )
                     if reason and reason in self._watchdog_rules and reroute_budget > 0:
                         targets = self._watchdog_rules[reason]
                         # Splice rule-based re-route targets to the FRONT of pending,

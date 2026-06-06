@@ -41,14 +41,16 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _print_result(result) -> None:
-    ok = f"{C_GREEN}OK{C_RESET}" if result.success else f"{C_RED}FAILED{C_RESET}"
-    print(f"\n{C_BOLD}── dispatch {result.run_id} [{ok}] ──{C_RESET}")
-    print(f"  mode      : {result.mode}")
-    print(f"  generator : {result.generator}")
-    if result.critic:
+    # Defensive attribute reads: a real DispatchResult always carries these (so
+    # output is byte-identical), but tolerate a minimal result object too.
+    ok = f"{C_GREEN}OK{C_RESET}" if getattr(result, "success", False) else f"{C_RED}FAILED{C_RESET}"
+    print(f"\n{C_BOLD}── dispatch {getattr(result, 'run_id', None)} [{ok}] ──{C_RESET}")
+    print(f"  mode      : {getattr(result, 'mode', None)}")
+    print(f"  generator : {getattr(result, 'generator', None)}")
+    if getattr(result, "critic", None):
         print(f"  critic    : {result.critic}")
-    print(f"  duration  : {result.duration_s}s")
-    if result.quality:
+    print(f"  duration  : {getattr(result, 'duration_s', None)}s")
+    if getattr(result, "quality", None):
         conf = result.quality.get("confidence", "?")
         col = C_GREEN if conf == "verified" else (C_YELLOW if conf in ("approved", "unverified") else C_RED)
         iters = result.quality.get("iterations_used")
@@ -102,23 +104,23 @@ def _print_result(result) -> None:
             print(f"    {C_RED}⚠ {f.get('name')} [{f.get('sub_kind')}] {loc}{C_RESET}")
     if getattr(result, "run_outcome", None):
         print(f"  {C_RED}outcome   : {result.run_outcome} (run watchdog){C_RESET}")
-    if result.error:
+    if getattr(result, "error", None):
         print(f"  {C_RED}error     : {result.error}{C_RESET}")
     if getattr(result, "protect_violations", None):
         print(f"  {C_RED}path policy: {len(result.protect_violations)} violation(s){C_RESET}")
         for v in result.protect_violations:
             print(f"    {C_RED}✗ {v['path']} — {v['reason']}{C_RESET}")
-    if result.changed_files:
+    if getattr(result, "changed_files", None):
         print(f"  {C_BOLD}changed   : {len(result.changed_files)} file(s){C_RESET}")
-        for f in result.added:
+        for f in getattr(result, "added", None) or []:
             print(f"    {C_GREEN}+ {f}{C_RESET}")
-        for f in result.modified:
+        for f in getattr(result, "modified", None) or []:
             print(f"    {C_YELLOW}~ {f}{C_RESET}")
-        for f in result.deleted:
+        for f in getattr(result, "deleted", None) or []:
             print(f"    {C_RED}- {f}{C_RESET}")
     else:
         print(f"  {C_YELLOW}changed   : (no files changed on disk){C_RESET}")
-    print(f"  artifacts : {result.run_dir}/")
+    print(f"  artifacts : {getattr(result, 'run_dir', None)}/")
     print("              prompt.txt  stdout.log  stderr.log  changed-files.diff  meta.json")
 
 
@@ -464,6 +466,22 @@ def _cmd_do(args) -> int:
             print(f"{C_RED}bad --computer-use-budgets JSON: {e}{C_RESET}", file=sys.stderr)
             return 1
 
+    # Issue #83 — fail fast on a non-positive absolute watchdog override. These
+    # REPLACE (not scale) the calibrated budget, so a <=0 value would arm a
+    # nonsensical budget; refuse before any worker runs.
+    if args.watchdog_max_bytes is not None and args.watchdog_max_bytes <= 0:
+        print(
+            f"{C_RED}--watchdog-max-bytes must be > 0, got {args.watchdog_max_bytes}{C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.watchdog_stall is not None and args.watchdog_stall <= 0:
+        print(
+            f"{C_RED}--watchdog-stall must be > 0, got {args.watchdog_stall}{C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+
     # Build the dispatch kwargs ONCE. The local path forwards them verbatim to
     # dispatch() (byte-identical to today); the broker path forwards a json-safe
     # projection to dispatch_async() in the broker process. Constructing this dict
@@ -507,6 +525,8 @@ def _cmd_do(args) -> int:
         model_map=args.model_map,
         effort_profile=args.effort_profile,
         watchdog_scale=args.watchdog_scale,
+        watchdog_max_bytes=args.watchdog_max_bytes,
+        watchdog_stall=args.watchdog_stall,
         max_parallel_workers=args.max_parallel_workers,
         worker_mem_max=args.worker_mem_max,
         baseline_gate=args.baseline_gate,
@@ -916,6 +936,19 @@ def main(argv=None) -> int:
                      help="Multiply the streaming-watchdog stall/byte budgets (>1.0) for "
                           "known-heavy tiers so a long xhigh run isn't truncated mid-flight "
                           "(env AGY_WATCHDOG_SCALE).")
+    eff.add_argument("--watchdog-max-bytes", type=int, default=None, metavar="BYTES",
+                     help="Absolute verbose BYTE budget (issue #83), applied AFTER "
+                          "--watchdog-scale: REPLACES the byte budget alone, leaving the "
+                          "stall budget calibrated+scaled. DECOUPLES bytes from stall so a "
+                          "read-heavy primary generator that legitimately reads a design doc "
+                          "+ modules isn't SIGKILLed as runaway:verbose and silently demoted "
+                          "to a fallback worker. Must be > 0 (env AGY_WATCHDOG_MAX_BYTES).")
+    eff.add_argument("--watchdog-stall", type=float, default=None, metavar="SEC",
+                     help="Absolute per-worker STALL budget in seconds (issue #83), applied "
+                          "AFTER --watchdog-scale: REPLACES the stall budget alone, leaving "
+                          "the byte budget calibrated+scaled. DECOUPLES stall from bytes so "
+                          "raising one failure-mode's tolerance doesn't inflate the other. "
+                          "Must be > 0 (env AGY_WATCHDOG_STALL).")
     eff.add_argument("--max-parallel-workers", type=int, default=None, metavar="N",
                      help="Cap how many candidates run end-to-end at once in vote mode "
                           "(host-safety for --branches>1; env AGY_MAX_PARALLEL_WORKERS).")

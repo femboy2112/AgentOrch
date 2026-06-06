@@ -63,7 +63,9 @@ python -m harness do "INSTRUCTION" --mode <mode> \
 | Var | Gloss |
 |---|---|
 | `AGY_WATCHDOG` | `off` disables streaming watchdog |
-| `AGY_WATCHDOG_SCALE` | multiply byte/stall budgets |
+| `AGY_WATCHDOG_SCALE` | multiply byte/stall budgets (both together) |
+| `AGY_WATCHDOG_MAX_BYTES` | absolute verbose byte budget; replaces it alone, leaves stall calibrated+scaled (issue #83; CLI `--watchdog-max-bytes`) |
+| `AGY_WATCHDOG_STALL` | absolute per-worker stall budget; replaces it alone, leaves bytes calibrated+scaled (issue #83; CLI `--watchdog-stall`) |
 | `AGY_LIVE_LEDGER` | `off` disables live calibration ledger |
 | `AGY_CALIBRATION_JSONL` | offline calibration table path |
 | `AGY_STALL_SECONDS` | per-worker stall budget |

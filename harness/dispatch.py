@@ -230,8 +230,11 @@ class DispatchResult:
     run_outcome: Optional[str] = None
     # Resolved per-agent (model, effort) after CLI override + profile resolution
     # (#42): ``{"generator": {provider: {model, effort}}, "critic": {...},
-    # "watchdog_scale": float}``. Persisted so "what did this run actually use"
-    # is answerable from meta.json, not just the live event stream.
+    # "watchdog_scale": float, "watchdog_max_bytes": int|None,
+    # "watchdog_stall": float|None}``. The last two are the issue #83 absolute,
+    # independent budget overrides actually used (None = calibrated+scaled stood).
+    # Persisted so "what did this run actually use" is answerable from meta.json,
+    # not just the live event stream.
     resolved_config: Optional[Dict[str, Any]] = None
     # Reconciliation / Integration-Skeptic verdict (#43), when --reconcile ran:
     # the distinct goal-vs-runtime status (reconciled bool + per-mechanism
@@ -769,13 +772,16 @@ def _build_role_agent_compat(
     post_construct_hook: Optional[roles.RolePostConstructHook],
     overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
 ) -> AgentInstance:
     """Call roles.build_role_agent while staying compatible with patched tests.
 
     Some unit tests monkeypatch ``roles.build_role_agent`` with a legacy
     signature that predates ``computer_use_config`` / ``overrides`` /
-    ``watchdog_scale``. Pass each of those kwargs only when the callee can
-    accept it (named param or ``**kwargs``).
+    ``watchdog_scale`` / ``watchdog_max_bytes`` / ``watchdog_stall`` (issue #83).
+    Pass each of those kwargs only when the callee can accept it (named param or
+    ``**kwargs``).
     """
     kwargs: Dict[str, Any] = {
         "prompt": prompt,
@@ -802,6 +808,10 @@ def _build_role_agent_compat(
         kwargs["overrides"] = overrides
     if watchdog_scale != 1.0 and _accepts("watchdog_scale"):
         kwargs["watchdog_scale"] = watchdog_scale
+    if watchdog_max_bytes is not None and _accepts("watchdog_max_bytes"):
+        kwargs["watchdog_max_bytes"] = watchdog_max_bytes
+    if watchdog_stall is not None and _accepts("watchdog_stall"):
+        kwargs["watchdog_stall"] = watchdog_stall
     return roles.build_role_agent(chain, **kwargs)
 
 
@@ -813,6 +823,8 @@ def _build_merge_reconciler_factory(
     codex_config: Optional[List[str]],
     critic_overrides: Optional[Dict[str, Dict[str, str]]],
     watchdog_scale: float,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     post_construct_hook: Optional[roles.RolePostConstructHook],
 ):
     """Build the per-node reconciler factory for the ``reconcile`` merge policy (M4).
@@ -862,6 +874,8 @@ def _build_merge_reconciler_factory(
                     post_construct_hook=post_construct_hook,
                     overrides=critic_overrides,
                     watchdog_scale=watchdog_scale,
+                    watchdog_max_bytes=watchdog_max_bytes,
+                    watchdog_stall=watchdog_stall,
                 )
                 merged = await agent.run_async()
             except Exception as exc:
@@ -906,6 +920,8 @@ async def _run_workflow(
     gen_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     critic_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     critic_requirement: Optional[str] = None,
     workflow_sink: Optional[List[Any]] = None,
@@ -940,6 +956,8 @@ async def _run_workflow(
             codex_config=codex_config,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
             post_construct_hook=post_construct_hook,
         )
         wf = MasterWorkflow(
@@ -970,6 +988,8 @@ async def _run_workflow(
             post_construct_hook=post_construct_hook,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
         )
         return await gen.run_async(), None
 
@@ -984,6 +1004,8 @@ async def _run_workflow(
             post_construct_hook=post_construct_hook,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
         )
         critic = _build_role_agent_compat(
             critic_chain,
@@ -995,6 +1017,8 @@ async def _run_workflow(
             post_construct_hook=post_construct_hook,
             overrides=critic_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
         )
         model = str(getattr(gen, "model", None) or "n/a")
         effort = str(getattr(gen, "effort", None) or "n/a")
@@ -1026,6 +1050,8 @@ async def _run_workflow(
             post_construct_hook=post_construct_hook,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
         )
         wf = TestFeedbackWorkflow(gen, verifier, max_iterations=max_iterations,
                                   working_directory=working_directory)
@@ -1048,6 +1074,8 @@ async def _run_workflow(
                 post_construct_hook=post_construct_hook,
                 overrides=gen_overrides,
                 watchdog_scale=watchdog_scale,
+                watchdog_max_bytes=watchdog_max_bytes,
+                watchdog_stall=watchdog_stall,
             )
             for token in generator_chain
         ]
@@ -1061,6 +1089,8 @@ async def _run_workflow(
             codex_config=codex_config,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
             post_construct_hook=post_construct_hook,
         )
         # #70: build a DISTINCT critic agent class from the critic chain so the
@@ -1073,6 +1103,8 @@ async def _run_workflow(
             codex_config=codex_config,
             overrides=critic_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
             post_construct_hook=post_construct_hook,
         )
         wf = MasterWorkflow(
@@ -1102,7 +1134,9 @@ async def _run_workflow(
             reconcile_station_factory=_build_merge_reconciler_factory(
                 critic_chain=critic_chain, fallback=fallback, cycles=cycles,
                 codex_config=codex_config, critic_overrides=critic_overrides,
-                watchdog_scale=watchdog_scale, post_construct_hook=post_construct_hook,
+                watchdog_scale=watchdog_scale,
+                watchdog_max_bytes=watchdog_max_bytes, watchdog_stall=watchdog_stall,
+                post_construct_hook=post_construct_hook,
             ),
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
@@ -1140,6 +1174,8 @@ async def _run_workflow(
                 post_construct_hook=post_construct_hook,
                 overrides=gen_overrides,
                 watchdog_scale=watchdog_scale,
+                watchdog_max_bytes=watchdog_max_bytes,
+                watchdog_stall=watchdog_stall,
             )
             vote_generators.append(slot_agent)
         wf = VoteWorkflow(
@@ -1174,12 +1210,16 @@ async def _run_workflow(
             post_construct_hook=post_construct_hook,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
         )
         agent_class, model, effort = roles.build_master_agent_class(
             generator_chain, fallback=fallback, cycles=cycles,
             codex_config=codex_config,
             overrides=gen_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
             post_construct_hook=post_construct_hook,
         )
         # #70: distinct critic agent for pat's escalated master (cross-family).
@@ -1188,6 +1228,8 @@ async def _run_workflow(
             codex_config=codex_config,
             overrides=critic_overrides,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
             post_construct_hook=post_construct_hook,
         )
         master_wf = MasterWorkflow(
@@ -1211,7 +1253,9 @@ async def _run_workflow(
             reconcile_station_factory=_build_merge_reconciler_factory(
                 critic_chain=critic_chain, fallback=fallback, cycles=cycles,
                 codex_config=codex_config, critic_overrides=critic_overrides,
-                watchdog_scale=watchdog_scale, post_construct_hook=post_construct_hook,
+                watchdog_scale=watchdog_scale,
+                watchdog_max_bytes=watchdog_max_bytes, watchdog_stall=watchdog_stall,
+                post_construct_hook=post_construct_hook,
             ),
             event_callback=EVENT_BUS.publisher_for(
                 run_id,
@@ -1277,6 +1321,8 @@ async def _run_reconciliation(
     codex_config: Optional[List[str]],
     critic_overrides: Optional[Dict[str, Dict[str, str]]],
     watchdog_scale: float,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     post_construct_hook: Optional[roles.RolePostConstructHook],
     working_directory: str,
     disposition: str,
@@ -1300,6 +1346,8 @@ async def _run_reconciliation(
         post_construct_hook=post_construct_hook,
         overrides=critic_overrides,
         watchdog_scale=watchdog_scale,
+        watchdog_max_bytes=watchdog_max_bytes,
+        watchdog_stall=watchdog_stall,
     )
     station = ReconciliationReview(
         agent=recon_agent,
@@ -1457,6 +1505,12 @@ async def dispatch_async(
     model_map: Optional[str] = None,
     effort_profile: Optional[str] = None,
     watchdog_scale: Optional[float] = None,
+    # Issue #83 — ABSOLUTE, INDEPENDENT watchdog budget overrides that decouple
+    # the verbose byte budget from the per-worker stall budget (which
+    # --watchdog-scale couples). Each replaces exactly one dimension; env mirrors
+    # are AGY_WATCHDOG_MAX_BYTES / AGY_WATCHDOG_STALL (read in roles._arm_watchdog).
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     worker_mem_max: Optional[str] = None,
     # Pre-run baseline verifier gate (single-run speed: skip the full --test-cmd
@@ -1557,6 +1611,10 @@ async def dispatch_async(
         "generator": effective_config(generator_chain, gen_overrides, roles.AGENT_DEFAULTS),
         "critic": effective_config(critic_chain, critic_overrides, roles.AGENT_DEFAULTS),
         "watchdog_scale": eff_watchdog_scale,
+        # Issue #83 — absolute, independent overrides actually used by this run
+        # (None = no override; the calibrated+scaled budget stood for that dimension).
+        "watchdog_max_bytes": watchdog_max_bytes,
+        "watchdog_stall": watchdog_stall,
     }
     for _note in resolved.notes:
         logger.warning("override: %s", _note)
@@ -1908,6 +1966,8 @@ async def dispatch_async(
                 gen_overrides=gen_overrides,
                 critic_overrides=critic_overrides,
                 watchdog_scale=eff_watchdog_scale,
+                watchdog_max_bytes=watchdog_max_bytes,
+                watchdog_stall=watchdog_stall,
                 max_parallel_workers=max_parallel_workers,
                 critic_requirement=critic_requirement,
                 workflow_sink=workflow_sink,
@@ -1934,6 +1994,8 @@ async def dispatch_async(
                         codex_config=codex_config,
                         critic_overrides=critic_overrides,
                         watchdog_scale=eff_watchdog_scale,
+                        watchdog_max_bytes=watchdog_max_bytes,
+                        watchdog_stall=watchdog_stall,
                         post_construct_hook=_post_construct_hook,
                         working_directory=str(work_dir),
                         disposition=recon_disposition,
@@ -2375,6 +2437,9 @@ def dispatch(
     model_map: Optional[str] = None,
     effort_profile: Optional[str] = None,
     watchdog_scale: Optional[float] = None,
+    # Issue #83 — absolute, independent watchdog budget overrides (see dispatch_async)
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     max_parallel_workers: Optional[int] = None,
     worker_mem_max: Optional[str] = None,
     baseline_gate: bool = False,
@@ -2442,6 +2507,8 @@ def dispatch(
             model_map=model_map,
             effort_profile=effort_profile,
             watchdog_scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes,
+            watchdog_stall=watchdog_stall,
             max_parallel_workers=max_parallel_workers,
             worker_mem_max=worker_mem_max,
             baseline_gate=baseline_gate,

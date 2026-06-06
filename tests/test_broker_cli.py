@@ -154,6 +154,8 @@ def _expected_default_kwargs():
         model_map=None,
         effort_profile=None,
         watchdog_scale=None,
+        watchdog_max_bytes=None,
+        watchdog_stall=None,
         max_parallel_workers=None,
         worker_mem_max=None,
         baseline_gate=False,

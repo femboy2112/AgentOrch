@@ -177,8 +177,34 @@ def _reset_calibration() -> None:
     _CALIBRATION = None
 
 
+def _resolve_abs_override(arg_val, env_var, *, cast):
+    """Resolve an absolute watchdog override (issue #83) from an explicit arg or
+    its env var. The arg wins when set/positive; otherwise the env var is read,
+    tolerant of bad values (non-numeric -> ValueError -> ignore). Returns the
+    resolved positive value, or ``None`` to mean "no override — keep calibrated"."""
+    if arg_val is not None:
+        try:
+            v = cast(arg_val)
+        except (TypeError, ValueError):
+            v = None
+        else:
+            if v > 0:
+                return v
+    raw = os.environ.get(env_var, "")
+    if raw:
+        try:
+            v = cast(raw)
+        except (TypeError, ValueError):
+            return None
+        if v > 0:
+            return v
+    return None
+
+
 def _arm_watchdog(
     agent: AgentInstance, worker: str, cfg: Dict[str, object], *, scale: float = 1.0,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
 ) -> None:
     """Arm the streaming watchdog from the calibration table.
 
@@ -193,7 +219,20 @@ def _arm_watchdog(
     we (a) already fall back to the CONSERVATIVE per-worker defaults — never the
     tighter calibrated budget — and (b) let the operator widen them further via
     ``--watchdog-scale`` so a known-heavy run can't be truncated mid-flight.
-    Scale resolves from the explicit arg or the ``AGY_WATCHDOG_SCALE`` env var."""
+    Scale resolves from the explicit arg or the ``AGY_WATCHDOG_SCALE`` env var.
+
+    Issue #83 — DECOUPLE the byte budget from the stall budget. Because ``scale``
+    multiplies BOTH dimensions, a read-heavy generator that legitimately blows the
+    verbose byte budget could only be rescued by inflating the stall timeout as
+    collateral. The two ABSOLUTE, INDEPENDENT overrides below let the operator
+    replace exactly one dimension: ``watchdog_max_bytes`` (arg or env
+    ``AGY_WATCHDOG_MAX_BYTES``) REPLACES the byte budget; ``watchdog_stall`` (arg
+    or env ``AGY_WATCHDOG_STALL``) REPLACES the stall budget. Each is applied
+    AFTER scale, so the absolute override WINS over scale for its dimension while
+    the other dimension still reflects the calibrated+scaled value. Bad env
+    values (non-numeric / non-positive) are ignored. These are a finer lever than
+    — and orthogonal to — the legacy AGY_MAX_OUTPUT_BYTES / AGY_STALL_SECONDS
+    early-return short-circuit (#28/#49), which is left untouched below."""
     if os.environ.get("AGY_WATCHDOG", "").lower() == "off":
         return
     if agent.max_output_bytes > 0 or agent.stall_seconds > 0:
@@ -221,6 +260,28 @@ def _arm_watchdog(
         logger.info(
             "watchdog: scaled budgets x%.2f for (%s, %s, %s) -> max_bytes=%d, stall=%.0fs",
             eff_scale, worker, model, effort, max_bytes, stall,
+        )
+    # Issue #83 — ABSOLUTE, INDEPENDENT overrides applied AFTER scale. Each wins
+    # over scale for ITS dimension; the other dimension is left as calibrated+scaled.
+    bytes_override = _resolve_abs_override(
+        watchdog_max_bytes, "AGY_WATCHDOG_MAX_BYTES", cast=int,
+    )
+    stall_override = _resolve_abs_override(
+        watchdog_stall, "AGY_WATCHDOG_STALL", cast=float,
+    )
+    if bytes_override is not None:
+        max_bytes = bytes_override
+        logger.info(
+            "watchdog: byte budget overridden (issue #83) -> max_bytes=%d "
+            "(stall=%.0fs left calibrated+scaled) for (%s, %s, %s)",
+            max_bytes, stall, worker, model, effort,
+        )
+    if stall_override is not None:
+        stall = stall_override
+        logger.info(
+            "watchdog: stall budget overridden (issue #83) -> stall=%.0fs "
+            "(max_bytes=%d left calibrated+scaled) for (%s, %s, %s)",
+            stall, max_bytes, worker, model, effort,
         )
     agent.max_output_bytes = max_bytes
     agent.stall_seconds = stall
@@ -280,6 +341,8 @@ def build_role_agent(
     codex_config: Optional[List[str]] = None,
     overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     computer_use_config: Optional[Dict[str, Any]] = None,
     post_construct_hook: Optional[RolePostConstructHook] = None,
 ) -> AgentInstance:
@@ -319,7 +382,10 @@ def build_role_agent(
     if not fallback or len(chain) == 1:
         cls = _class_for(lead_name)
         agent = cls(prompt=prompt, **lead_cfg)
-        _arm_watchdog(agent, lead_name, lead_cfg, scale=watchdog_scale)
+        _arm_watchdog(
+            agent, lead_name, lead_cfg, scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes, watchdog_stall=watchdog_stall,
+        )
         if post_construct_hook is not None:
             try:
                 post_construct_hook(agent, lead_name, lead_cfg)
@@ -341,7 +407,10 @@ def build_role_agent(
         if worker is None:
             return
         cfg = configs_by_cls.get(agent_cls, {})
-        _arm_watchdog(sub, worker, cfg, scale=watchdog_scale)
+        _arm_watchdog(
+            sub, worker, cfg, scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes, watchdog_stall=watchdog_stall,
+        )
         if post_construct_hook is not None:
             try:
                 post_construct_hook(sub, worker, cfg)
@@ -362,6 +431,8 @@ def build_master_agent_class(
     codex_config: Optional[List[str]] = None,
     overrides: Optional[Dict[str, Dict[str, str]]] = None,
     watchdog_scale: float = 1.0,
+    watchdog_max_bytes: Optional[int] = None,
+    watchdog_stall: Optional[float] = None,
     post_construct_hook: Optional[RolePostConstructHook] = None,
 ):
     """Return ``(agent_class, model, effort)`` for MasterWorkflow.
@@ -408,7 +479,10 @@ def build_master_agent_class(
         if worker is None:
             return
         cfg = configs_by_cls.get(agent_cls, {})
-        _arm_watchdog(sub, worker, cfg, scale=watchdog_scale)
+        _arm_watchdog(
+            sub, worker, cfg, scale=watchdog_scale,
+            watchdog_max_bytes=watchdog_max_bytes, watchdog_stall=watchdog_stall,
+        )
         if post_construct_hook is not None:
             try:
                 post_construct_hook(sub, worker, cfg)
