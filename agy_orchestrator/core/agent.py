@@ -12,6 +12,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Tuple
 
+from agy_orchestrator.core import reaper
+
 logger = logging.getLogger(__name__)
 
 # Watchdog trip reasons exposed via AgentInstance._watchdog_reason after run_async
@@ -66,16 +68,20 @@ CONTEXT_OVERFLOW_MARKERS = (
 # in-process code at all, and a default SIGTERM (`kill`/`pkill`) terminates with
 # no handler installed — in both cases the worker (spawned start_new_session, so
 # in its OWN session, NOT the orchestrator's group) is orphaned, reparents to
-# init, and keeps burning CPU/quota. Two complementary layers close this:
+# init, and keeps burning CPU/quota. Three complementary layers close this:
 #
 #   Layer A (kernel, survives even SIGKILL of the orchestrator):
 #     PR_SET_PDEATHSIG in the worker preexec_fn asks the kernel to SIGKILL the
-#     worker the instant THIS process dies, however it dies.
+#     direct worker the instant THIS process dies, however it dies.
 #   Layer B (orderly, common `kill`/`pkill` case, full group):
 #     install_process_cleanup_handlers() arms SIGTERM/SIGHUP + atexit hooks that
 #     killpg every registered LIVE worker group, reaping the whole tree.
+#   Layer C (kernel cgroup + detached trigger, survives SIGKILL):
+#     core.reaper holds the whole worker subtree in a cgroup-v2 umbrella and a
+#     detached helper writes cgroup.kill on orchestrator pipe EOF.
 #
-# Both ONLY ever touch groups WE spawned — never another orchestrator instance.
+# These layers ONLY ever touch workers WE spawned — never another orchestrator
+# instance.
 # --------------------------------------------------------------------------- #
 
 PR_SET_PDEATHSIG = 1  # from <sys/prctl.h>
@@ -102,24 +108,33 @@ def _pdeathsig_enabled() -> bool:
     return os.environ.get("AGY_WORKER_PDEATHSIG", "1").strip().lower() not in {"0", "false", "no"}
 
 
-def _worker_preexec() -> None:
+def _worker_preexec_impl(enable_pdeathsig: bool) -> None:
     """Run in the forked worker child, AFTER setsid (start_new_session) and BEFORE
-    execve. (1) Ask the kernel to SIGKILL this worker the moment the orchestrator
-    dies — even on an un-catchable SIGKILL no Python handler could react to.
-    (2) Close the fork/exec race: if the orchestrator ALREADY died before we got
-    here, getppid() reads 1 (reparented to init) and the death signal will never
-    arrive, so exit now. Best-effort — any failure just leaves the pre-existing
-    in-process killpg teardown as the reaper, exactly as before."""
+    execve. Join the cgroup umbrella when active. When PDEATHSIG is selected,
+    (1) ask the kernel to SIGKILL this worker the moment the orchestrator dies,
+    and (2) close the fork/exec race: if the orchestrator ALREADY died before we
+    got here, getppid() reads 1 (reparented to init) and the death signal will
+    never arrive, so exit now. Best-effort — any failure leaves the remaining
+    cleanup layers as the reaper."""
+    reaper.join_reap_cgroup_in_child()
     try:
-        if _PRCTL is not None:
+        if enable_pdeathsig and _PRCTL is not None:
             _PRCTL(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
     except Exception:
         pass
     try:
-        if os.getppid() == 1:
+        if enable_pdeathsig and os.getppid() == 1:
             os._exit(0)
     except Exception:
         pass
+
+
+def _worker_preexec() -> None:
+    _worker_preexec_impl(True)
+
+
+def _worker_cgroup_preexec() -> None:
+    _worker_preexec_impl(False)
 
 
 def _build_worker_preexec():
@@ -127,6 +142,8 @@ def _build_worker_preexec():
     — None preserves the prior spawn behavior byte-for-byte."""
     if _PRCTL is not None and _pdeathsig_enabled():
         return _worker_preexec
+    if reaper.reap_cgroup_path() is not None:
+        return _worker_cgroup_preexec
     return None
 
 
@@ -166,6 +183,7 @@ def kill_all_live_workers(sig: int = signal.SIGKILL) -> int:
             os.killpg(pgid, sig)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+    reaper.reap_created_cgroup()
     return len(pgids)
 
 

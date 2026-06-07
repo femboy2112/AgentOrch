@@ -291,6 +291,8 @@ class QualityVerifier:
             start = time.monotonic()
             argv = self._exec_argv(cmd)
             if argv is not None:
+                # #84: this systemd-scoped mem-cap path relies on its own scope
+                # cgroup lifecycle; the plain path below uses our worker cgroup.
                 process = await asyncio.create_subprocess_exec(
                     *argv,
                     cwd=working_directory,
