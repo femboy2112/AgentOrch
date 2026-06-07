@@ -1003,13 +1003,14 @@ def main(argv=None) -> int:
     eff.add_argument("--gen-effort", type=str, default=None, metavar="TIER",
                      help="Generator effort tier (low|medium|high|max); applies to "
                           "every effort-capable provider in the generator chain "
-                          "(grok no-ops). 'max' -> codex reasoning_effort=xhigh.")
+                          "(grok no-ops); overridden by --architect-effort in "
+                          "master/pat. 'max' -> codex reasoning_effort=xhigh.")
     eff.add_argument("--critic-effort", type=str, default=None, metavar="TIER",
                      help="Critic effort tier (low|medium|high|max); applies to every "
                           "effort-capable provider in the critic chain.")
     eff.add_argument("--architect-effort", type=str, default=None, metavar="TIER",
                      help="Effort tier for the master/pat architect chain (alias of "
-                          "--gen-effort for those modes).")
+                          "--gen-effort that overrides it; conflicting pairs warn).")
     eff.add_argument("--gen-model", type=str, default=None, metavar="NAME",
                      help="Model for the generator chain lead (provider-specific).")
     eff.add_argument("--critic-model", type=str, default=None, metavar="NAME",

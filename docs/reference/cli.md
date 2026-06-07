@@ -171,12 +171,16 @@ non-linear deps requires `--mode master`.
 The default tier (codex `gpt-5.3-codex-spark` / `high`) suits routine work; crank
 these for a mission-critical, invariant-touching build. Effort `max` maps to codex
 `reasoning_effort=xhigh`. Explicit flags override `--effort-profile`.
+In master/pat, the planner always runs at `high`; `--gen-effort` controls
+step/draft code-generation effort. `--architect-effort` is an alias that overrides
+`--gen-effort` in master/pat, so set `--gen-effort medium` without also passing
+`--architect-effort` to get medium code-gen; conflicting pairs emit a warning.
 
 | Flag | Type / metavar | Default | Meaning |
 |---|---|---|---|
 | `--gen-effort` | `TIER` (`low\|medium\|high\|max`) | `None` | Generator effort tier; applies to every effort-capable provider in the generator chain (grok no-ops). |
 | `--critic-effort` | `TIER` | `None` | Critic effort tier across the critic chain. |
-| `--architect-effort` | `TIER` | `None` | Effort tier for the master/pat architect chain (alias of `--gen-effort` for those modes). |
+| `--architect-effort` | `TIER` | `None` | Effort tier for master/pat code generation (alias of `--gen-effort` that overrides it; conflicting pairs warn). |
 | `--gen-model` | `NAME` | `None` | Model for the generator chain lead (provider-specific). |
 | `--critic-model` | `NAME` | `None` | Model for the critic chain lead. |
 | `--architect-model` | `NAME` | `None` | Model for the master/pat architect chain lead. |

@@ -167,6 +167,49 @@ def test_architect_alias_only_in_master():
     assert any("architect" in n.lower() for n in r_direct.notes)
 
 
+def test_architect_effort_conflict_warns_and_wins_in_master():
+    r = resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
+                          mode="master", gen_effort="medium",
+                          architect_effort="high")
+    assert r.generator["codex"]["effort"] == "high"
+    assert any("--gen-effort" in n and "--architect-effort" in n
+               for n in r.notes)
+
+
+def test_architect_effort_same_value_does_not_warn():
+    r = resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
+                          mode="master", gen_effort="high",
+                          architect_effort="high")
+    assert r.generator["codex"]["effort"] == "high"
+    assert not any("--gen-effort" in n and "--architect-effort" in n
+                   for n in r.notes)
+
+
+def test_architect_effort_without_gen_does_not_warn():
+    r = resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
+                          mode="master", architect_effort="high")
+    assert r.generator["codex"]["effort"] == "high"
+    assert not any("--gen-effort" in n and "--architect-effort" in n
+                   for n in r.notes)
+
+
+def test_architect_model_conflict_warns_and_wins_in_master():
+    r = resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
+                          mode="master", gen_model="gpt-5.4-mini",
+                          architect_model="gpt-5.5")
+    assert r.generator["codex"]["model"] == "gpt-5.5"
+    assert any("--gen-model" in n and "--architect-model" in n
+               for n in r.notes)
+
+
+def test_architect_flags_outside_master_still_emit_ignored_note():
+    r = resolve_overrides(generator_chain=["codex"], critic_chain=["codex"],
+                          mode="direct", architect_effort="high",
+                          architect_model="gpt-5.5")
+    assert "codex" not in r.generator
+    assert any("only apply to --mode master/pat" in n for n in r.notes)
+
+
 # --- threading into roles.py ----------------------------------------------- #
 
 def test_overrides_reach_single_provider_agent(monkeypatch):

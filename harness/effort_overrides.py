@@ -280,8 +280,20 @@ def resolve_overrides(
     mod_gen = gen_model
     if mode in ("master", "pat"):
         if architect_effort is not None:
+            if gen_effort is not None and architect_effort != gen_effort:
+                notes.append(
+                    f"--architect-effort {architect_effort!r} overrides "
+                    f"--gen-effort {gen_effort!r} in master/pat (same role; "
+                    "--gen-effort is dropped)"
+                )
             eff_gen = architect_effort
         if architect_model is not None:
+            if gen_model is not None and architect_model != gen_model:
+                notes.append(
+                    f"--architect-model {architect_model!r} overrides "
+                    f"--gen-model {gen_model!r} in master/pat (same role; "
+                    "--gen-model is dropped)"
+                )
             mod_gen = architect_model
     elif architect_effort is not None or architect_model is not None:
         notes.append("--architect-effort/--architect-model only apply to "
