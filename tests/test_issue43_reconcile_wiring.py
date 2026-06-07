@@ -36,7 +36,7 @@ def _canned(disposition="warn", *, dead=False):
     # mechanism and finds it load-bearing; a dead build also traces it but flags it.
     findings = [MechanismFinding(
         name="learner", classification="load_bearing", location="world.py:10",
-        witness=Witness(value=2.0, description="ablation dropped the live score"),
+        witness=Witness(value=2.0, description="ablation dropped the live score", measured=True),
         evidence="learner.step() called on the real loop",
     )]
     if dead:

@@ -314,6 +314,39 @@ def _decide_reconcile_status(
     return "run"
 
 
+_RECONCILE_UNMEASURED_QUALIFIER = (
+    " (load-bearing witnesses inferred, not ablated — pass --ablation-cmd to measure)"
+)
+_RECONCILE_MOCK_HIDDEN_QUALIFIER = (
+    " (a load-bearing mechanism is only mock-covered in tests, never exercised for "
+    "real — load-bearing claim unproven; #86)"
+)
+
+
+def _apply_reconcile_honesty_note(
+    reconciliation: Optional[Dict[str, Any]],
+    quality: Optional[Dict[str, Any]],
+) -> None:
+    """Add the #86 unmeasured-witness / mock-hidden qualifiers to reconcile/ledger notes.
+
+    These never change the ``confidence`` LABEL or the ``reconciled`` verdict — they
+    only stop a ``verified + reconciled`` run from *overstating* readiness when its
+    load-bearing witnesses were never measured or were only mock-covered.
+    """
+    if not reconciliation or "verdict" not in reconciliation:
+        return
+    qualifiers = ""
+    if reconciliation.get("witnesses_unmeasured"):
+        qualifiers += _RECONCILE_UNMEASURED_QUALIFIER
+    if reconciliation.get("mock_hidden_load_bearing"):
+        qualifiers += _RECONCILE_MOCK_HIDDEN_QUALIFIER
+    if not qualifiers:
+        return
+    reconciliation["verdict"] += qualifiers
+    if quality is not None and "note" in quality:
+        quality["note"] += qualifiers
+
+
 def _resolve_reconcile_disposition(
     reconcile_disposition: Optional[str],
     mission_critical: bool,
@@ -2501,6 +2534,8 @@ async def dispatch_async(
     reconciliation: Optional[Dict[str, Any]] = None
     if reconciliation_result is not None:
         reconciliation = reconciliation_result.to_dict()
+        _apply_reconcile_honesty_note(reconciliation, quality)
+
         # Encoding-safe + atomic: a surrogate from a reconcile finding (ensure_ascii
         # =False keeps raw non-ASCII) must not crash the artifact tail. See
         # _atomic_write_text.

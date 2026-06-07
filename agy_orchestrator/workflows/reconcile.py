@@ -171,6 +171,7 @@ class MechanismFinding:
     # BY DESIGN, not dead wiring (#81). The slug is ``"test_module"``. An excused
     # finding is kept in the trace for transparency but is NOT counted as runtime-dead.
     excused: Optional[str] = None
+    mock_hides_implementation: Optional[bool] = None
 
     @property
     def is_dead(self) -> bool:
@@ -302,8 +303,16 @@ class ReconciliationResult:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for the durable ``runs/<id>/reconcile.json`` artifact."""
+        load_bearing = sum(1 for f in self.findings_list if f.classification == "load_bearing")
+        measured = sum(1 for f in self.findings_list if f.classification == "load_bearing" and f.witness.measured)
+        unmeasured = sum(1 for f in self.findings_list if f.classification == "load_bearing" and not f.witness.measured)
+        witnesses_unmeasured = (load_bearing > 0 and measured == 0)
+        mock_hidden_load_bearing = any(f.mock_hides_implementation for f in self.findings_list)
+
         return {
             "reconciled": self.reconciled,
+            "witnesses_unmeasured": witnesses_unmeasured,
+            "mock_hidden_load_bearing": mock_hidden_load_bearing,
             "verdict": self.verdict,
             "disposition": self.disposition,
             "parse_error": self.parse_error,
@@ -313,6 +322,11 @@ class ReconciliationResult:
             "substantive": self.is_substantive,
             "substance_status": self.substance_status(),
             "starved_reason": self.starved_reason,
+            "measured_coverage": {
+                "load_bearing": load_bearing,
+                "measured": measured,
+                "unmeasured": unmeasured,
+            },
             "findings": [
                 {
                     "name": f.name,
@@ -326,6 +340,7 @@ class ReconciliationResult:
                         "measured": f.witness.measured,
                     },
                     "evidence": f.evidence,
+                    **({"mock_hides_implementation": f.mock_hides_implementation} if f.mock_hides_implementation is not None else {})
                 }
                 for f in self.findings_list
             ],
@@ -1014,6 +1029,259 @@ class ReconciliationReview:
             )
         return result
 
+    def _flag_mock_hidden_findings(
+        self, result: ReconciliationResult
+    ) -> ReconciliationResult:
+        """Post-parse pass (Issue #86): flag mock-hides-implementation findings."""
+        import ast
+        import os
+
+        if os.environ.get("AGY_RECONCILE_MOCK_CHECK", "1").strip().lower() in ("0", "false", "no", "off"):
+            return result
+
+        unmeasured_load_bearing = [
+            f for f in result.findings_list
+            if f.classification == "load_bearing" and not f.witness.measured
+        ]
+        if not unmeasured_load_bearing:
+            return result
+
+        if not os.path.isdir(self.working_directory):
+            return result
+
+        def _symbol_from_name(name: str) -> Optional[str]:
+            pieces = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", name or "")
+            return pieces[-1] if pieces else None
+
+        def _line_from_location(location: Optional[str]) -> Optional[int]:
+            if not location:
+                return None
+            loc = str(location).split("::", 1)[0]
+            m = re.match(r"^.*?\.py:(\d+)", loc, re.IGNORECASE)
+            if not m:
+                return None
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+
+        def _symbol_from_location(location: Optional[str]) -> Optional[str]:
+            rel = _location_path(location)
+            line = _line_from_location(location)
+            if not rel or line is None:
+                return None
+            path = os.path.join(self.working_directory, rel)
+            try:
+                with open(path, "r", encoding="utf-8") as f_obj:
+                    tree = ast.parse(f_obj.read(), filename=path)
+            except Exception:
+                return None
+
+            # Pick the INNERMOST def/class whose span contains the line — ast.walk is
+            # breadth-first, so a method inside a class would otherwise resolve to the
+            # enclosing ClassDef (returning the wrong symbol and missing the corpse).
+            enclosing = []  # (start, name) for defs whose span contains the line
+            before = []     # (start, name) for defs starting at/above the line
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                start = getattr(node, "lineno", None)
+                end = getattr(node, "end_lineno", None) or start
+                if start is None:
+                    continue
+                if start <= line <= end:
+                    enclosing.append((start, node.name))
+                elif start <= line:
+                    before.append((start, node.name))
+            if enclosing:
+                enclosing.sort()  # largest start = innermost
+                return enclosing[-1][1]
+            if before:
+                before.sort()
+                return before[-1][1]
+            return None
+
+        finding_symbols = {}
+        for finding in unmeasured_load_bearing:
+            symbol = _symbol_from_location(finding.location) or _symbol_from_name(finding.name)
+            if symbol:
+                finding_symbols[id(finding)] = symbol
+        if not finding_symbols:
+            return result
+
+        target_symbols = set(finding_symbols.values())
+
+        def _call_name(node: ast.Call) -> Optional[str]:
+            if isinstance(node.func, ast.Name):
+                return node.func.id
+            if isinstance(node.func, ast.Attribute):
+                return node.func.attr
+            return None
+
+        def _const_str(node) -> Optional[str]:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            return None
+
+        def _is_patch_attr_call(node: ast.Call, attr: str) -> bool:
+            # Matches ``patch.<attr>(...)`` / ``mock.patch.<attr>(...)`` etc.
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != attr:
+                return False
+            value = node.func.value
+            if isinstance(value, ast.Name):
+                return value.id == "patch"
+            if isinstance(value, ast.Attribute):
+                return value.attr == "patch"
+            return False
+
+        def _is_mock_value(node) -> bool:
+            return isinstance(node, ast.Call) and _call_name(node) in (
+                "Mock", "MagicMock", "AsyncMock", "PropertyMock",
+                "NonCallableMock", "NonCallableMagicMock",
+            )
+
+        def _mock_target_symbols(node: ast.Call) -> set:
+            """Every symbol this call mock-REPLACES (unqualified names)."""
+            out: set = set()
+            func_name = _call_name(node)
+            # patch("a.b.sym") / @patch("a.b.sym") / mock.patch("a.b.sym")
+            if func_name == "patch" and node.args:
+                s = _const_str(node.args[0])
+                if s:
+                    out.add(s.split(".")[-1])
+            # patch.object(obj, "sym")
+            if _is_patch_attr_call(node, "object") and len(node.args) >= 2:
+                s = _const_str(node.args[1])
+                if s:
+                    out.add(s)
+            # patch.multiple(target, sym1=..., sym2=...)
+            if _is_patch_attr_call(node, "multiple"):
+                for kw in node.keywords:
+                    if kw.arg:
+                        out.add(kw.arg)
+            # monkeypatch.setattr(...) / mocker.setattr(...): either
+            #   setattr("pkg.mod.sym", value)  or  setattr(mod, "sym", value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "setattr":
+                for arg in node.args[:2]:
+                    s = _const_str(arg)
+                    if s:
+                        out.add(s.split(".")[-1])
+            # builtin setattr(obj, "sym", Mock()) — require a mock-family value so a
+            # legitimate setattr(obj, "attr", real_value) is not treated as a mock.
+            elif isinstance(node.func, ast.Name) and node.func.id == "setattr":
+                if len(node.args) >= 3 and _is_mock_value(node.args[2]):
+                    s = _const_str(node.args[1])
+                    if s:
+                        out.add(s)
+            return out
+
+        def _is_test_source(path: str) -> bool:
+            rel = os.path.relpath(path, self.working_directory).replace("\\", "/")
+            return rel.startswith("tests/") or "/tests/" in rel or _is_test_path(rel)
+
+        # We only need the TEST suite here. The question is NOT "does production call
+        # this symbol" — a load_bearing mechanism ALWAYS has a production call site
+        # (that is precisely why it was traced load_bearing), so counting production
+        # calls would make this gate hollow: it could never fire on the real #86
+        # corpse (collect_d1e_cert DOES call _d1e_world_unit in production; the only
+        # TEST mock-replaces it). The decidable question is: does any TEST mock-patch
+        # the symbol, and does any TEST invoke its REAL implementation directly?
+        mocked_in_tests = set()
+        real_test_calls = set()
+        test_file_scanned = False
+        parse_failed = False
+
+        for root, dirs, files in os.walk(self.working_directory):
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".")
+                and d not in ("venv", ".venv", "__pycache__", "node_modules")
+            ]
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                path = os.path.join(root, fname)
+                if not _is_test_source(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as f_obj:
+                        tree = ast.parse(f_obj.read(), filename=path)
+                except Exception:
+                    # A test file we cannot parse means we cannot trust the real-call
+                    # census — do nothing (under-suppress, never over-suppress; #81).
+                    parse_failed = True
+                    break
+
+                test_file_scanned = True
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        matched = _mock_target_symbols(node) & target_symbols
+                        if matched:
+                            mocked_in_tests.update(matched)
+                        else:
+                            callee_name = _call_name(node)
+                            if callee_name in target_symbols:
+                                real_test_calls.add(callee_name)
+                    elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                        val = node.value
+                        if _is_mock_value(val):
+                            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                            for t in targets:
+                                if isinstance(t, ast.Attribute) and t.attr in target_symbols:
+                                    mocked_in_tests.add(t.attr)
+
+            if parse_failed:
+                break
+
+        if parse_failed or not test_file_scanned:
+            return result
+
+        # Default: FLAG only (honest downgrade, never over-suppresses a legit run —
+        # a symbol mocked in a unit test can still be exercised for real transitively
+        # through an integration test, which static analysis cannot see). Operators who
+        # want the corpse to hard-FAIL can opt in with AGY_RECONCILE_MOCK_STRICT=1,
+        # which flips it to dead wiring under the 'fail' disposition.
+        strict = os.environ.get("AGY_RECONCILE_MOCK_STRICT", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        flip = strict and result.disposition == "fail"
+
+        changed = False
+        for f in unmeasured_load_bearing:
+            symbol = finding_symbols.get(id(f))
+            if symbol not in mocked_in_tests or symbol in real_test_calls:
+                continue
+            # The only test coverage for this load-bearing symbol mock-REPLACES it,
+            # and no test exercises the real implementation directly. Mock-replaced
+            # coverage is not load-bearing evidence (#86).
+            f.mock_hides_implementation = True
+            note = (
+                "mock-hides-implementation (#86): only mock-patched in tests, never "
+                "exercised for real — load-bearing claim is unproven"
+            )
+            f.evidence = f"{f.evidence}; {note}" if f.evidence else note
+            logger.warning(
+                "reconcile: load-bearing mechanism %r is only mock-covered in the test "
+                "suite and its witness was never measured — load-bearing claim unproven "
+                "(#86)%s",
+                symbol,
+                " [strict: flipping to dead wiring]" if flip else "",
+            )
+            if flip:
+                f.classification = "exists_not_load_bearing"
+                f.sub_kind = "mocked_none"
+                f.witness.value = 0.0
+            changed = True
+
+        if changed and flip:
+            result.reconciled = (
+                not result.is_starved
+                and bool(result.findings_list)
+                and not any(f.is_dead for f in result.findings_list)
+            )
+
+        return result
+
     async def _cycle_providers_for_verdict(self) -> Optional[ReconciliationResult]:
         """#79: rotate the fallback chain's LEAD through every remaining provider,
         re-asking (JSON-only) until one returns a parseable verdict.
@@ -1145,6 +1413,12 @@ class ReconciliationReview:
             result = self._excuse_test_exercised_findings(result)
         except Exception as exc:  # best-effort: never fail a build on the excusal pass
             logger.warning("Reconciliation test-exercise excusal raised (continuing): %s", exc)
+
+        # Part B: mock-hides-implementation static pass
+        try:
+            result = self._flag_mock_hidden_findings(result)
+        except Exception as exc:
+            logger.warning("Reconciliation mock-hides-implementation pass raised (continuing): %s", exc)
 
         self.result = result
         self.reconciled = result.reconciled
