@@ -166,6 +166,7 @@ def _expected_default_kwargs():
         ablation_cmd=None,
         web_search=False,
         mission_critical=False,
+        optimize_complexity=False,
         spec=None,
         out_dir=None,
         computer_use_mode=None,

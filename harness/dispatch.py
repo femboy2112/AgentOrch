@@ -36,6 +36,7 @@ from agy_orchestrator.execution.ledger import build_ledger
 from agy_orchestrator.execution.verifier import QualityVerifier, VerifierResult
 from agy_orchestrator.workflows.adversarial import (
     CATASTROPHIC_FOCUS_PREAMBLE,
+    COMPLEXITY_FOCUS_PREAMBLE,
     AdversarialReview,
 )
 from agy_orchestrator.workflows.cascade import CascadeWorkflow
@@ -67,6 +68,17 @@ RUNS_DIR = PROJECT_ROOT / "runs"
 # of restarting. Under runs/ (gitignored), separate from per-run runs/<id>/ logs so
 # the path is stable across run_ids.
 CHECKPOINT_DIR = RUNS_DIR / ".checkpoints"
+
+COMPLEXITY_MANDATE = (
+    "\n\nEFFICIENCY MANDATE: Use the asymptotically optimal algorithm and data "
+    "structures for this task. Choose the lowest time-complexity class that still meets "
+    "the requirement (prefer a hash map / set / single sort over nested scans; one pass "
+    "over repeated passes; memoization over recomputation). Do NOT ship an "
+    "O(n^2)-or-worse approach when a better class is standard. State the time and space "
+    "complexity in a brief docstring or comment. Correctness, clarity, and required "
+    "behavior come FIRST — match the optimal big-O, then keep the code readable; never "
+    "micro-optimize at their expense."
+)
 
 logger = logging.getLogger("harness")
 EVENT_BUS = EventBus()
@@ -1076,6 +1088,7 @@ async def _run_workflow(
     post_construct_hook: Optional[roles.RolePostConstructHook] = None,
     working_directory: str = ".",
     mission_critical: bool = False,
+    optimize_complexity: bool = False,
     baseline_result: Optional[VerifierResult] = None,
     candidate_setup: Optional[str] = None,
     resume_policy: str = "auto",
@@ -1190,9 +1203,14 @@ async def _run_workflow(
         )
         model = str(getattr(gen, "model", None) or "n/a")
         effort = str(getattr(gen, "effort", None) or "n/a")
+        critic_preamble = ""
+        if optimize_complexity:
+            critic_preamble += COMPLEXITY_FOCUS_PREAMBLE
+        if mission_critical:
+            critic_preamble += CATASTROPHIC_FOCUS_PREAMBLE
         wf = AdversarialReview(gen, critic, verifier, max_iterations=max_iterations,
                                working_directory=working_directory,
-                               critic_preamble=(CATASTROPHIC_FOCUS_PREAMBLE if mission_critical else ""),
+                               critic_preamble=critic_preamble,
                                critic_requirement=critic_requirement,
                                event_callback=EVENT_BUS.publisher_for(
                                    run_id,
@@ -1624,6 +1642,7 @@ async def dispatch_async(
     verifier_mem_max: Optional[str] = None,
     web_search: bool = False,
     mission_critical: bool = False,
+    optimize_complexity: bool = False,
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
@@ -1978,6 +1997,8 @@ async def dispatch_async(
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     prompt = _build_prompt(instruction, context, spec)
+    if optimize_complexity:
+        prompt += COMPLEXITY_MANDATE
     # Preamble-stripped view for the adversarial critic's "Original Requirement"
     # (win 4): same goal/spec/context, minus the worker process-discipline boilerplate.
     critic_requirement = _build_prompt(instruction, context, spec, include_preamble=False)
@@ -2284,6 +2305,7 @@ async def dispatch_async(
                 post_construct_hook=_post_construct_hook,
                 working_directory=str(work_dir),
                 mission_critical=mission_critical,
+                optimize_complexity=optimize_complexity,
                 baseline_result=baseline_result,
                 candidate_setup=candidate_setup,
                 resume_policy=resume_policy,
@@ -2781,6 +2803,7 @@ def dispatch(
     verifier_mem_max: Optional[str] = None,
     web_search: bool = False,
     mission_critical: bool = False,
+    optimize_complexity: bool = False,
     spec: Optional[str] = None,
     dashboard_stream_json: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
@@ -2854,6 +2877,7 @@ def dispatch(
             verifier_mem_max=verifier_mem_max,
             web_search=web_search,
             mission_critical=mission_critical,
+            optimize_complexity=optimize_complexity,
             spec=spec,
             dashboard_stream_json=dashboard_stream_json,
             out_dir=out_dir,

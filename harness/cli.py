@@ -484,9 +484,9 @@ def _cmd_do(args) -> int:
         return 1
 
     # Build the dispatch kwargs ONCE. The local path forwards them verbatim to
-    # dispatch() (byte-identical to today); the broker path forwards a json-safe
-    # projection to dispatch_async() in the broker process. Constructing this dict
-    # does NOT change the local call's arguments.
+    # dispatch(); the broker path forwards a json-safe projection to
+    # dispatch_async() in the broker process. Constructing this dict does NOT
+    # change the local call's arguments beyond explicitly threaded options.
     dispatch_kwargs = dict(
         mode=args.mode,
         context=args.context,
@@ -536,6 +536,7 @@ def _cmd_do(args) -> int:
         ablation_cmd=getattr(args, "ablation_cmd", None),
         web_search=args.web_search,
         mission_critical=args.mission_critical,
+        optimize_complexity=args.optimize_complexity,
         spec=spec_text,
         out_dir=args.out_dir,
         git_pr=getattr(args, "git_pr", False),
@@ -1091,6 +1092,10 @@ def main(argv=None) -> int:
                          "critic prompt (adversarial mode). Opt-in: more exhaustive, "
                          "severity-prioritized review for code whose failure could "
                          "exhaust resources or crash/hang the host. Off by default.")
+    do.add_argument("--optimize-complexity", action="store_true",
+                    help="Append an algorithmic-efficiency mandate to the generator "
+                         "prompt and add a complexity-focused critic preamble "
+                         "(adversarial mode). Opt-in; off by default.")
     do.add_argument("--out-dir", type=str, default=None, metavar="PATH",
                     help="Directory the worker should write files into (its cwd). "
                          "Default: AgentOrch's own repo root. Set when invoking AgentOrch "

@@ -21,6 +21,19 @@ CATASTROPHIC_FOCUS_PREAMBLE = (
     "unremarked; default to flagging.\n\n"
 )
 
+COMPLEXITY_FOCUS_PREAMBLE = (
+    "Scrutinize the ALGORITHMIC EFFICIENCY of this output as a first-class concern. "
+    "Determine the time and space complexity of the submitted solution and the best "
+    "complexity reasonably achievable for this problem. If the solution is in a worse "
+    "complexity class than is standard (e.g. O(n^2) where O(n log n) or O(n) is "
+    "achievable, repeated work that should be memoized or precomputed, an accidental "
+    "quadratic from building a string/list by repeated concatenation in a loop, a "
+    "linear scan where a dict/set gives O(1) lookup), you MUST NOT approve: name the "
+    "asymptotic class, the input that exhibits it, and the better algorithm. Do NOT "
+    "demand micro-optimizations that don't change the complexity class, and never trade "
+    "away correctness, clarity, or required behavior for speed.\n\n"
+)
+
 
 def _is_approved(feedback: str) -> bool:
     """True only when the critic genuinely approves.
