@@ -34,19 +34,26 @@ similar) can't OOM the host and take the orchestrator down with it.
 | `AGY_WORKER_PYTEST_MARKERS` | `agy_orchestrator/core/agent.py:259` | Marker expression folded into the worker's `PYTEST_ADDOPTS` (e.g. `not slow`); loses to an explicit `-m` in the command. | unset (no marker injected) | pytest marker expression string. |
 | `AGY_WORKER_DRAIN_GRACE` | `agy_orchestrator/core/agent.py:202` | Seconds to keep draining a worker's pipe after the process exits before abandoning it. | `5` | Float seconds. |
 | `AGY_WORKER_CMD_TIMEOUT` | `agy_orchestrator/core/agent.py:321` | Per-call wall-clock kill for a worker command, **even with active output** (folded into the tightest-of-set absolute cap). | `0` (disabled) | Float seconds; `0` = off. |
-| `AGY_WORKER_PDEATHSIG` | `agy_orchestrator/core/agent.py` | Parent-death-signal hardening: the kernel SIGKILLs a spawned worker/verifier tree the instant the orchestrator process dies — the only thing that survives an un-catchable `kill -9`/`pkill -9` of the orchestrator (no `__del__`/`atexit`/handler can run then). | `1` (on, Linux) | Off when value (lowercased, stripped) is `0`/`false`/`no`; silent no-op where `prctl` is unavailable (non-Linux). |
+| `AGY_WORKER_PDEATHSIG` | `agy_orchestrator/core/agent.py:110` | Parent-death-signal hardening: the kernel SIGKILLs the **direct** worker/verifier child the instant the orchestrator process dies — survives an un-catchable `kill -9`/`pkill -9` (no `__del__`/`atexit`/handler can run then), but does not reach a grandchild that escaped into its own session. See `AGY_WORKER_CGROUP_REAP` for the subtree case. | `1` (on, Linux) | Off when value (lowercased, stripped) is `0`/`false`/`no`; silent no-op where `prctl` is unavailable (non-Linux). |
+| `AGY_WORKER_CGROUP_REAP` | `agy_orchestrator/core/reaper.py:23` | Cgroup-v2 hard-kill reaper: holds the whole worker subtree in a cgroup umbrella; a detached helper writes `cgroup.kill` on orchestrator pipe EOF, SIGKILLing every member (**including setsid-escaped grandchildren** that PDEATHSIG misses) when the orchestrator dies by any signal, incl. `kill -9`. | `1` (on, Linux) | Off when value (lowercased, stripped) is `0`/`false`/`no`/`off`; silent no-op on non-Linux or where cgroup-v2 delegation is unavailable. |
 
-> **External kill of the orchestrator.** Two complementary layers stop a
+> **External kill of the orchestrator.** Three complementary layers stop a
 > `kill`/`pkill` of the orchestrator from orphaning its worker (and verifier)
 > trees — each spawned in its own session, so it would otherwise reparent to
 > `init` and keep burning CPU/quota:
-> - **Kernel (`AGY_WORKER_PDEATHSIG`, above):** survives even `SIGKILL` of the
->   orchestrator.
-> - **In-process hooks (always on):** `SIGTERM`/`SIGHUP`/`atexit` `killpg` every
->   live worker group for an orderly full-tree reap on the common `kill`/`pkill`
+> - **Layer A — kernel PDEATHSIG (`AGY_WORKER_PDEATHSIG`, above):** survives even
+>   `SIGKILL` of the orchestrator, but reaps only the **direct** worker child.
+> - **Layer B — in-process hooks (always on):** `SIGTERM`/`SIGHUP`/`atexit` `killpg`
+>   every live worker group for an orderly full-tree reap on the common `kill`/`pkill`
 >   (default `SIGTERM`) path. `SIGINT`/Ctrl-C already reaps via the run-loop
->   `finally` blocks. Both layers only ever signal groups the orchestrator itself
->   spawned — never another orchestrator instance or unrelated process.
+>   `finally` blocks.
+> - **Layer C — cgroup-v2 reaper (`AGY_WORKER_CGROUP_REAP`, above; Linux):** a
+>   detached helper `cgroup.kill`s the entire worker subtree — **including
+>   setsid-escaped grandchildren** — on orchestrator pipe EOF, surviving `kill -9`
+>   and closing the gap Layer A leaves.
+>
+> All three layers only ever signal groups the orchestrator itself spawned —
+> never another orchestrator instance or unrelated process.
 
 ---
 

@@ -80,7 +80,8 @@ python -m harness do "INSTRUCTION" --mode <mode> \
 | `AGY_WORKER_CMD_TIMEOUT` | per-call wall-clock kill |
 | `AGY_ABSOLUTE_TIMEOUT` | hard per-worker cap |
 | `AGY_WORKER_RESOURCE_BOUND` | `0` opts out of worker thread/mem pinning |
-| `AGY_WORKER_PDEATHSIG` | `0` opts out of kernel SIGKILL of worker/verifier trees when the orchestrator is killed from outside (Linux; survives `kill -9`) |
+| `AGY_WORKER_PDEATHSIG` | `0` opts out of kernel SIGKILL of the **direct** worker/verifier child when the orchestrator is killed from outside (Linux; survives `kill -9`) |
+| `AGY_WORKER_CGROUP_REAP` | `0` opts out of the cgroup-v2 hard-kill reaper that SIGKILLs the **whole** worker subtree, incl. setsid-escaped grandchildren, on orchestrator death (Linux cgroup-v2; survives `kill -9`) |
 | `AGY_CODEX_MODEL_FALLBACKS` | override codex intra-provider model order |
 | `AGY_CRITIC_FAMILY_CHECK` | `off` silences cross-family critic warning |
 | `AGY_PARALLELISM_CHECK` | `off` silences agy-parallel warning |
