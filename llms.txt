@@ -86,6 +86,8 @@ python -m harness do "INSTRUCTION" --mode <mode> \
 | `AGY_CRITIC_FAMILY_CHECK` | `off` silences cross-family critic warning |
 | `AGY_PARALLELISM_CHECK` | `off` silences agy-parallel warning |
 | `AGY_RECONCILE` | toggle reconciliation station |
+| `AGY_RECONCILE_MOCK_CHECK` | `0` disables reconcile's mock-hides-implementation flag (#86: load-bearing symbol only mock-covered, never really exercised) |
+| `AGY_RECONCILE_MOCK_STRICT` | `1` makes a mock-hidden finding hard-FAIL under the `fail` disposition (default: flag only) |
 | `AGY_VERIFIER_MEM_MAX` | verifier memory cap (systemd-scope) |
 | `AGY_STREAM` | worker stream mode |
 | `TELEGRAM_BOT_KEY` | Telegram bot token (env only, never committed) |

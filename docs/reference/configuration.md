@@ -180,6 +180,8 @@ traffic. Default paths are under `/tmp` and can be redirected.
 | Variable | Reads at | Controls | Default | Values |
 |---|---|---|---|---|
 | `AGY_RECONCILE` | `harness/dispatch.py:1575` | Enables the reconcile (integration-skeptic) station for a dispatch. | off | Enabled when value (lowercased) is `1`, `true`, or `on`. |
+| `AGY_RECONCILE_MOCK_CHECK` | `agy_orchestrator/workflows/reconcile.py` | Reconcile's mock-hides-implementation pass (#86): flags a `load_bearing`+`measured:false` finding whose symbol is only mock-patched in tests, never exercised for real. | on | `0`/`false`/`no`/`off` disables the pass. |
+| `AGY_RECONCILE_MOCK_STRICT` | `agy_orchestrator/workflows/reconcile.py` | When on AND the reconcile disposition is `fail` (e.g. under `--mission-critical`), a mock-hidden finding FLIPS to `exists_not_load_bearing:mocked_none` so the run hard-fails. Off ⇒ flag only (honest verdict downgrade, never over-suppresses). | off | `1`/`true`/`yes`/`on` enables the flip. |
 | `AGY_HEARTBEAT_SECONDS` | `harness/dispatch.py:1762` | Interval between run-level heartbeat events. | `30` | Float seconds. |
 | `AGY_NOTIFY` | `harness/cli.py:494` | Default notify target when `--notify` is not passed. | unset (no notify) | Notify target string (overridden by `--notify`). |
 | `AGY_MISSION_CRITICAL_RUN_STALL` | `harness/dispatch.py:367` | Overrides the mission-critical run-level stall backstop. Only consulted when `--mission-critical` is set and `--run-stall-abort` is unspecified. | `1800.0` (`MISSION_CRITICAL_RUN_STALL_DEFAULT`) | Float seconds; `<=0` disables the backstop; malformed → default. |
