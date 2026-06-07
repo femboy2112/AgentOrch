@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -353,6 +354,159 @@ BRUTAL_TASKS = {
 ALL_TASKS = {**EASY_TASKS, **HARD_TASKS, **BRUTAL_TASKS}
 EASY = set(EASY_TASKS)
 BRUTAL = set(BRUTAL_TASKS)
+
+COMPLEXITY_BUDGETS = {
+    # balanced-brackets: O(n) stack vs the naive O(n^2) repeated-replace/slice.
+    "balanced": {"symbol": "is_balanced",
+                 "gen": lambda n: ("()" * n,),
+                 "sizes": [2000, 4000, 8000, 16000, 32000], "budget_exponent": 1.2},
+    # decode-ways: O(n) DP vs naive O(2^n) recursion.
+    "decode_ways": {"symbol": "num_decodings",
+                    "gen": lambda n: ("1" * n,),
+                    "sizes": [200, 400, 800, 1600, 3200], "budget_exponent": 1.3},
+    # min-window: O(n) sliding window vs O(n^2)/O(n^3) rescans.
+    "min_window": {"symbol": "min_window",
+                   "gen": lambda n: ("ab" * n, "ab"),
+                   "sizes": [1000, 2000, 4000, 8000, 16000], "budget_exponent": 1.35},
+    # merge-intervals: O(n log n) sort vs O(n^2). Allow n log n.
+    "merge_intervals": {"symbol": "merge_intervals",
+                        "gen": lambda n: ([[i, i + 1] for i in range(0, 2 * n, 2)],),
+                        "sizes": [2000, 4000, 8000, 16000, 32000], "budget_exponent": 1.4},
+}
+
+
+def _complexity_driver(task: str, soln_dir: str) -> None:
+    """Import a temp solution, measure scaling, and print one JSON result."""
+    import importlib
+
+    result = {
+        "ok_import": False,
+        "within_budget": None,
+        "label": "error",
+        "exponent": None,
+        "r2": None,
+        "timed_out": False,
+        "notes": "",
+        "samples-count": 0,
+        "samples_count": 0,
+    }
+    try:
+        budget = dict(COMPLEXITY_BUDGETS[task])
+        override_raw = os.environ.get("AGY_COMPLEXITY_BUDGET_OVERRIDE")
+        if override_raw:
+            override = json.loads(override_raw)
+            budget["sizes"] = override.get("sizes", budget["sizes"])
+            budget["budget_exponent"] = override.get("budget_exponent", budget["budget_exponent"])
+
+        sys.path.insert(0, soln_dir)
+        try:
+            module = importlib.import_module("solution")
+            fn = getattr(module, budget["symbol"])
+        except Exception as exc:
+            result["notes"] = f"{type(exc).__name__}: {exc}"
+            print(json.dumps(result), flush=True)
+            return
+
+        from agy_orchestrator.execution import complexity_probe
+
+        per_call_timeout = max(0.05, float(os.environ.get("AGY_COMPLEXITY_PER_CALL_TIMEOUT", "1")))
+        measured = complexity_probe.measure_scaling(
+            fn,
+            budget["gen"],
+            budget["sizes"],
+            budget_exponent=budget["budget_exponent"],
+            per_call_timeout=per_call_timeout,
+        )
+        result.update({
+            "ok_import": True,
+            "within_budget": measured.within_budget,
+            "label": measured.label,
+            "exponent": measured.exponent,
+            "r2": measured.r2,
+            "notes": measured.notes,
+            "samples-count": len(measured.samples),
+            "samples_count": len(measured.samples),
+        })
+    except Exception as exc:
+        result["notes"] = f"{type(exc).__name__}: {exc}"
+    print(json.dumps(result), flush=True)
+
+
+def grade_complexity(code: str, task: str, *, hard_timeout: float = 30) -> dict:
+    """Grade algorithmic efficiency in a subprocess. Never hangs and never raises."""
+    if task not in COMPLEXITY_BUDGETS:
+        return {
+            "applicable": False,
+            "ok_import": False,
+            "within_budget": None,
+            "label": "not-applicable",
+            "exponent": None,
+            "timed_out": False,
+            "notes": f"no complexity budget for task {task!r}",
+        }
+
+    base = {
+        "applicable": True,
+        "ok_import": False,
+        "within_budget": None,
+        "label": "error",
+        "exponent": None,
+        "timed_out": False,
+        "notes": "",
+    }
+    try:
+        budget = COMPLEXITY_BUDGETS[task]
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "solution.py").write_text(code, encoding="utf-8")
+            env = os.environ.copy()
+            root = str(Path(__file__).resolve().parents[1])
+            env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            env["AGY_COMPLEXITY_BUDGET_OVERRIDE"] = json.dumps({
+                "sizes": budget["sizes"],
+                "budget_exponent": budget["budget_exponent"],
+            })
+            env["AGY_COMPLEXITY_PER_CALL_TIMEOUT"] = str(
+                max(0.05, float(hard_timeout) / max(len(budget["sizes"]), 1))
+            )
+            cmd = [
+                sys.executable,
+                "-c",
+                "from scripts.cloud_eval import _complexity_driver; "
+                "import sys; _complexity_driver(sys.argv[1], sys.argv[2])",
+                task,
+                d,
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=d,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=hard_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return {
+                    **base,
+                    "ok_import": True,
+                    "within_budget": False,
+                    "label": "non-terminating-or-superlinear",
+                    "timed_out": True,
+                    "notes": f"complexity probe exceeded hard timeout of {hard_timeout}s",
+                }
+
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        return {
+            **base,
+            "ok_import": bool(payload.get("ok_import")),
+            "within_budget": payload.get("within_budget"),
+            "label": str(payload.get("label") or "error"),
+            "exponent": payload.get("exponent"),
+            "timed_out": False,
+            "notes": str(payload.get("notes") or ""),
+        }
+    except Exception as exc:
+        return {**base, "notes": f"{type(exc).__name__}: {exc}"}
 
 # Cloud workers are agentic (they default to editing files / running tools). For
 # a pure generation bench we forbid that and demand a single fenced block.
