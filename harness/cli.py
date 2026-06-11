@@ -34,6 +34,9 @@ C_RESET, C_BOLD, C_GREEN, C_RED, C_YELLOW, C_CYAN = (
     "\033[0m", "\033[1m", "\033[32m", "\033[31m", "\033[33m", "\033[36m"
 )
 
+_PASSTHROUGH_PROVIDERS = {"codex", "agy", "grok", "claude"}
+_TELEGRAM_MSG_CAP = 4096
+
 
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
@@ -198,6 +201,338 @@ def _print_broker_result(job: dict) -> int:
     if res.get("error"):
         print(f"  {C_RED}error     : {res['error']}{C_RESET}")
     return 0 if success else 1
+
+
+def _parse_passthrough_provider_chain(value: str) -> list[str]:
+    chain = [p.strip().lower() for p in str(value or "").split(",") if p.strip()]
+    if not chain:
+        raise ValueError("provider chain must not be empty")
+    bad = [p for p in chain if p not in _PASSTHROUGH_PROVIDERS]
+    if bad:
+        allowed = ",".join(sorted(_PASSTHROUGH_PROVIDERS))
+        raise ValueError(f"unknown provider(s): {','.join(bad)} (allowed: {allowed})")
+    return chain
+
+
+def _passthrough_telegram_error(prefix: str, error: object) -> str:
+    """Short user-facing failure notice for Telegram passthrough replies."""
+    detail = " ".join(
+        line.strip()
+        for line in str(error or "").splitlines()
+        if line.strip()
+        and not line.lstrip().startswith("Traceback")
+        and not line.lstrip().startswith("File ")
+    )
+    if len(detail) > 300:
+        detail = f"{detail[:297]}..."
+    return f"⚠️ {prefix} failed." + (f"\n{detail}" if detail else "")
+
+
+def _passthrough_telegram_client():
+    """Construct the Telegram client lazily so CLI imports stay network-inert."""
+    from harness.telegram import TelegramClient
+
+    return TelegramClient()
+
+
+def _make_passthrough_telegram_client():
+    try:
+        return _passthrough_telegram_client()
+    except Exception:
+        return None
+
+
+def _send_passthrough_telegram(chat_id: str, text: str, *, client=None) -> None:
+    """Best-effort delivery for `harness ask --telegram`.
+
+    Keep this local to the CLI so importing `harness.passthrough` remains network
+    inert. TelegramClient itself is best-effort and never raises on send failure.
+    """
+    import html
+
+    def _html_chunks(raw: str, *, cap: int = _TELEGRAM_MSG_CAP) -> list[str]:
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for ch in raw:
+            escaped_ch = html.escape(ch, quote=False)
+            if current and current_len + len(escaped_ch) > cap:
+                chunks.append("".join(current))
+                current = []
+                current_len = 0
+            current.append(escaped_ch)
+            current_len += len(escaped_ch)
+        if current:
+            chunks.append("".join(current))
+        return chunks or ["(empty reply)"]
+
+    client = client or _make_passthrough_telegram_client()
+    if client is None:
+        return
+    for chunk in _html_chunks(text if text else "(empty reply)"):
+        client.send_message(chat_id, chunk)
+
+
+def _cmd_ask(args) -> int:
+    import asyncio
+    import time as _time
+
+    from harness import passthrough
+
+    try:
+        provider_chain = _parse_passthrough_provider_chain(args.provider)
+    except ValueError as exc:
+        print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+        return 1
+
+    if args.telegram and not args.telegram_chat:
+        print(f"{C_RED}--telegram requires --telegram-chat ID{C_RESET}", file=sys.stderr)
+        return 1
+
+    session = None
+    if args.session:
+        try:
+            session_path = passthrough.SessionStore.session_file(args.session)
+        except ValueError as exc:
+            print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+            return 1
+        session = passthrough.SessionStore.load_session(args.session)
+        if session is None:
+            now = _time.time()
+            session = passthrough.PassthroughSession(
+                session_id=session_path.stem,
+                provider=provider_chain[0],
+                provider_chain=list(provider_chain),
+                model=args.model,
+                effort=args.effort,
+                provider_session_id=None,
+                turns=[],
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            session.provider_chain = list(provider_chain)
+            session.model = args.model
+            session.effort = args.effort
+
+    try:
+        result = asyncio.run(
+            passthrough.run_turn(
+                args.prompt,
+                provider_chain=provider_chain,
+                model=args.model,
+                effort=args.effort,
+                session=session,
+                fallback=not args.no_fallback,
+                web_search=args.web_search,
+                out_dir=args.out_dir,
+                capture=not args.no_capture,
+            )
+        )
+    except Exception as exc:
+        result = passthrough.PassthroughResult(
+            reply="",
+            provider_used=provider_chain[0],
+            session_id=session.session_id if session else None,
+            error=str(exc),
+        )
+
+    telegram_client = _make_passthrough_telegram_client() if args.telegram else None
+
+    if result.error:
+        print(f"{C_RED}ask failed: {result.error}{C_RESET}", file=sys.stderr)
+        if args.telegram and telegram_client is not None:
+            try:
+                _send_passthrough_telegram(
+                    args.telegram_chat,
+                    _passthrough_telegram_error("Ask", result.error),
+                    client=telegram_client,
+                )
+            except Exception:
+                pass
+        return 1
+
+    print(result.reply)
+    if args.telegram and telegram_client is not None:
+        try:
+            _send_passthrough_telegram(
+                args.telegram_chat, result.reply, client=telegram_client
+            )
+        except Exception:
+            pass
+    return 0
+
+
+def _cmd_chat(args) -> int:
+    import asyncio
+    import time as _time
+
+    from harness import passthrough
+
+    try:
+        session_path = passthrough.SessionStore.session_file(args.session)
+    except ValueError as exc:
+        print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+        return 1
+
+    session = passthrough.SessionStore.load_session(args.session)
+    provider_value = args.provider
+    try:
+        if provider_value is None and session is not None and session.provider_chain:
+            provider_chain = _parse_passthrough_provider_chain(",".join(session.provider_chain))
+        elif provider_value is None and session is not None and session.provider:
+            provider_chain = _parse_passthrough_provider_chain(session.provider)
+        else:
+            provider_chain = _parse_passthrough_provider_chain(provider_value or "codex")
+    except ValueError as exc:
+        print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+        return 1
+
+    model = args.model if args.model is not None else (session.model if session else None)
+    effort = args.effort if args.effort is not None else (session.effort if session else None)
+
+    if session is None:
+        now = _time.time()
+        session = passthrough.PassthroughSession(
+            session_id=session_path.stem,
+            provider=provider_chain[0],
+            provider_chain=list(provider_chain),
+            model=model,
+            effort=effort,
+            provider_session_id=None,
+            turns=[],
+            created_at=now,
+            updated_at=now,
+        )
+    else:
+        session.session_id = session_path.stem
+        if session.provider != provider_chain[0]:
+            session.provider = provider_chain[0]
+            session.provider_session_id = None
+        session.provider_chain = list(provider_chain)
+        session.model = model
+        session.effort = effort
+    try:
+        passthrough.SessionStore.save_session(session)
+    except Exception as exc:
+        print(f"{C_RED}session save failed: {exc}{C_RESET}", file=sys.stderr)
+        return 1
+
+    for raw_line in sys.stdin:
+        prompt = raw_line.rstrip("\r\n")
+        command = prompt.strip().lower()
+        if command in {"/exit", "/quit"}:
+            break
+        if command.startswith("/reset"):
+            now = _time.time()
+            session.provider = provider_chain[0]
+            session.provider_chain = list(provider_chain)
+            session.model = model
+            session.effort = effort
+            session.provider_session_id = None
+            session.turns = []
+            session.created_at = now
+            session.updated_at = now
+            try:
+                passthrough.SessionStore.save_session(session)
+            except Exception as exc:
+                print(f"{C_RED}session reset failed: {exc}{C_RESET}", file=sys.stderr)
+                return 1
+            print("session reset", file=sys.stderr)
+            continue
+        if prompt == "":
+            continue
+
+        try:
+            result = asyncio.run(
+                passthrough.run_turn(
+                    prompt,
+                    provider_chain=provider_chain,
+                    model=model,
+                    effort=effort,
+                    session=session,
+                    fallback=True,
+                    web_search=False,
+                    out_dir=None,
+                    capture=True,
+                )
+            )
+        except Exception as exc:
+            result = passthrough.PassthroughResult(
+                reply="",
+                provider_used=provider_chain[0],
+                session_id=session.session_id,
+                error=str(exc),
+            )
+        if result.error:
+            print(f"{C_RED}chat failed: {result.error}{C_RESET}", file=sys.stderr)
+            return 1
+        print(result.reply, flush=True)
+
+    return 0
+
+
+def _cmd_sessions(args) -> int:
+    from harness import passthrough
+
+    def _updated_at(value) -> str:
+        from datetime import datetime
+
+        try:
+            return datetime.fromtimestamp(float(value)).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return "-"
+
+    def _render_stored_transcript(session) -> str:
+        lines: list[str] = []
+        for turn in session.turns or []:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "")).lower()
+            text = str(turn.get("text", ""))
+            if role == "user":
+                lines.append(f"User: {text}")
+            elif role == "assistant":
+                lines.append(f"Assistant: {text}")
+        return "\n".join(lines)
+
+    action = args.sessions_action
+    if action == "list":
+        for session in passthrough.SessionStore.list_sessions():
+            provider = session.provider or "-"
+            model = session.model or "-"
+            turns = len(session.turns or [])
+            print(
+                f"{session.session_id}\tprovider={provider}\tmodel={model}\t"
+                f"turns={turns}\tupdated-at={_updated_at(session.updated_at)}"
+            )
+        return 0
+
+    try:
+        session_path = passthrough.SessionStore.session_file(args.name)
+    except ValueError as exc:
+        print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+        return 1
+
+    if action == "show":
+        session = passthrough.SessionStore.load_session(args.name)
+        if session is None:
+            print(f"{C_RED}session not found: {session_path.stem}{C_RESET}", file=sys.stderr)
+            return 1
+        transcript = _render_stored_transcript(session)
+        if transcript:
+            print(transcript)
+        return 0
+
+    if action == "rm":
+        if not session_path.exists():
+            print(f"{C_RED}session not found: {session_path.stem}{C_RESET}", file=sys.stderr)
+            return 1
+        passthrough.SessionStore.delete_session(args.name)
+        return 0
+
+    print(f"{C_RED}unknown sessions action: {action}{C_RESET}", file=sys.stderr)
+    return 1
 
 
 def _wait_for_job(job_id: str, *, poll: float = 0.5):
@@ -858,6 +1193,53 @@ def main(argv=None) -> int:
         help="Print the running build (version + git commit) and exit",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    ask = sub.add_parser("ask", help="Ask one passthrough worker prompt")
+    ask.add_argument("prompt", type=str, help="Prompt to send directly to the worker")
+    ask.add_argument("--provider", type=str, default="codex",
+                     help="Comma-separated provider chain (default: codex)")
+    ask.add_argument("--model", type=str, default=None,
+                     help="Lead provider model override")
+    ask.add_argument("--effort", choices=["low", "medium", "high", "max"], default=None,
+                     help="Lead provider effort override")
+    ask.add_argument("--session", type=str, default=None,
+                     help="Resume or create a passthrough session")
+    ask.add_argument("--web-search", action="store_true",
+                     help="Enable codex web search (-c tools.web_search=true)")
+    ask.add_argument("--no-fallback", action="store_true",
+                     help="Disable provider/model fallback wrapping")
+    ask.add_argument("--no-capture", action="store_true",
+                     help="Skip the lightweight runs/<id> ask record")
+    ask.add_argument("--out-dir", type=str, default=None, metavar="PATH",
+                     help="Worker cwd (default: AgentOrch's repo root)")
+    ask.add_argument("--telegram", action="store_true",
+                     help="Deliver the final reply to a Telegram chat")
+    ask.add_argument("--telegram-chat", type=str, default=None, metavar="ID",
+                     help="Telegram chat id for --telegram delivery")
+    ask.set_defaults(func=_cmd_ask)
+
+    chat = sub.add_parser("chat", help="Open a passthrough chat REPL")
+    chat.add_argument("--session", type=str, default="default",
+                      help="Passthrough session name (default: default)")
+    chat.add_argument("--provider", type=str, default=None,
+                      help="Comma-separated provider chain (default: previous session provider or codex)")
+    chat.add_argument("--model", type=str, default=None,
+                      help="Lead provider model override")
+    chat.add_argument("--effort", choices=["low", "medium", "high", "max"], default=None,
+                      help="Lead provider effort override")
+    chat.set_defaults(func=_cmd_chat)
+
+    sessions = sub.add_parser("sessions", help="Manage passthrough chat sessions")
+    sessions_sub = sessions.add_subparsers(dest="sessions_action")
+    sessions_list = sessions_sub.add_parser("list", help="List passthrough sessions")
+    sessions_list.set_defaults(func=_cmd_sessions, sessions_action="list")
+    sessions_show = sessions_sub.add_parser("show", help="Show a passthrough session transcript")
+    sessions_show.add_argument("name", type=str, help="Session name")
+    sessions_show.set_defaults(func=_cmd_sessions, sessions_action="show")
+    sessions_rm = sessions_sub.add_parser("rm", help="Remove a passthrough session")
+    sessions_rm.add_argument("name", type=str, help="Session name")
+    sessions_rm.set_defaults(func=_cmd_sessions, sessions_action="rm")
+    sessions.set_defaults(func=_cmd_sessions, sessions_action="list")
 
     do = sub.add_parser("do", help="Dispatch one coding instruction to a worker")
     do.add_argument("instruction", type=str, help="The instruction for the worker")

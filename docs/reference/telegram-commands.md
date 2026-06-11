@@ -44,6 +44,8 @@ never hardcoded or stored in the repo.
 | Command | Args | Purpose | Kind |
 | --- | --- | --- | --- |
 | `/build` | `<instruction> [--mode m] [--test-cmd c] [--mission-critical] [--web-search]` | Launch a build and auto-track it | ACTION |
+| `/ask` | `[--provider p] <prompt>` | One-shot prompt to a model; reply delivered to the chat | ACTION |
+| `/chat` | `[--provider p] <prompt>` \| `new`/`reset` | Continue this chat's model session (per-chat `tg-<chat_id>`) | ACTION |
 | `/cancel` | `[latest \| <run_id>]` | Abort a running dispatch (SIGTERM) | ACTION |
 | `/retry` | `[latest \| <run_id>]` | Re-dispatch a finished run's instruction | ACTION |
 | `/run` | `[latest \| <id>] [summary \| why \| files \| diff]` | Recap facets for a run (default `summary`) | READ |
@@ -108,6 +110,27 @@ are inert. Only the allowlisted flags below are honoured; anything else (or a ba
 ```
 /build add a --version flag to both CLIs --mode pat --test-cmd "pytest -q"
 ```
+
+### `/ask` and `/chat` — talk to a model from the phone
+
+```
+/ask  [--provider codex|agy|grok|claude] <prompt>
+/chat [--provider codex|agy|grok|claude] <prompt>     (or:  /chat new | /chat reset)
+```
+
+Both spawn a **detached** `python -m harness ask … --telegram --telegram-chat <id>`
+through the same `_spawn_dispatch` seam as `/build` (argv **list**, never a shell
+string) so a slow model call never blocks the poll loop; the reply is delivered
+back to the asking chat when it finishes. The provider is validated against the
+`{codex, agy, grok, claude}` allowlist (default from `AGY_PASSTHROUGH_PROVIDER`,
+else `codex`); the prompt is always a single argv element, so it cannot inject
+extra flags or redirect the reply to another chat.
+
+- `/ask` is **stateless** (one-shot).
+- `/chat` is **session-backed** per chat (`tg-<chat_id>`); the chosen provider is
+  remembered per chat. `/chat new` (or `/chat reset`) clears the session.
+
+The `from.id` whitelist is the only gate, the same boundary that authorises `/build`.
 
 ### `/cancel` — abort a running dispatch
 

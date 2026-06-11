@@ -347,6 +347,8 @@ def build_role_agent(
     cycles: int = 2,
     codex_config: Optional[List[str]] = None,
     overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    session_id: Optional[str] = None,
+    fork_session: bool = False,
     watchdog_scale: float = 1.0,
     watchdog_max_bytes: Optional[int] = None,
     watchdog_stall: Optional[float] = None,
@@ -405,7 +407,13 @@ def build_role_agent(
 
     if not wrap:
         cls = _class_for(lead_name)
-        agent = cls(prompt=prompt, **lead_cfg)
+        if session_id is not None and lead_name in ("claude", "grok"):
+            agent = cls(
+                prompt=prompt, **lead_cfg,
+                session_id=session_id, fork_session=fork_session,
+            )
+        else:
+            agent = cls(prompt=prompt, **lead_cfg)
         _arm_watchdog(
             agent, lead_name, lead_cfg, scale=watchdog_scale,
             watchdog_max_bytes=watchdog_max_bytes, watchdog_stall=watchdog_stall,
@@ -445,6 +453,14 @@ def build_role_agent(
         model_fallbacks=model_fb,
     )
     # Lead config seeds self.model/self.effort; per-provider configs override.
+    if session_id is not None and lead_name in ("claude", "grok"):
+        agent = fb_cls(prompt=prompt, model=lead_cfg["model"], effort=lead_cfg["effort"])
+        setattr(agent, "session_id", session_id)
+        setattr(agent, "fork_session", fork_session)
+        setattr(agent, "_session_owner", classes[0])
+        # The wrapper accepts arbitrary attributes for session resumption; stash
+        # them before first run so _make_sub can reuse a warm native session.
+        return agent
     return fb_cls(prompt=prompt, model=lead_cfg["model"], effort=lead_cfg["effort"])
 
 

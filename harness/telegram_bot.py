@@ -75,6 +75,8 @@ logger = logging.getLogger(__name__)
 # in sync with handle_command + HELP_TEXT.
 BOT_COMMANDS: List[Dict[str, str]] = [
     {"command": "build", "description": "launch a build: /build <instruction> [--mode m]"},
+    {"command": "ask", "description": "one-shot prompt to a model: /ask <prompt>"},
+    {"command": "chat", "description": "continue this chat's session: /chat <prompt>"},
     {"command": "cancel", "description": "abort a run (latest | <run_id>)"},
     {"command": "retry", "description": "re-run a finished run (latest | <run_id>)"},
     {"command": "run", "description": "facets: [id] summary|why|files|diff"},
@@ -779,6 +781,8 @@ HELP_TEXT = (
     "<b>Actions</b>\n"
     "/build &lt;instruction&gt; [--mode m] [--test-cmd c] [--mission-critical] "
     "[--web-search] — launch a build\n"
+    "/ask [--provider p] &lt;prompt&gt; — one-shot prompt to a model\n"
+    "/chat [--provider p] &lt;prompt&gt; — continue this chat's model session\n"
     "/cancel [latest|&lt;run_id&gt;] — abort a running dispatch\n"
     "/retry [latest|&lt;run_id&gt;] — re-run a finished run's instruction\n"
     "<b>Inspect</b>\n"
@@ -1125,7 +1129,7 @@ def _handle_diff_command(run_id: str, *, max_lines: int = 60) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# A. Action commands — DRIVE builds from the phone (/build, /cancel, /retry)
+# A. Action commands — DRIVE work from the phone (/build, /ask, /chat, /cancel, /retry)
 #
 # Every spawn goes through the _spawn_dispatch seam (argv LIST, never a shell
 # string), and every signal through the _killpg / _kill seams, so tests stub
@@ -1153,6 +1157,7 @@ _BUILD_RECOGNISED_FLAGS = set(_BUILD_BOOL_FLAGS) | set(_BUILD_VALUE_FLAGS)
 # never actually sleep.
 _BUILD_DISCOVER_ATTEMPTS = 25
 _BUILD_DISCOVER_INTERVAL = 0.2
+_PASSTHROUGH_PROVIDERS = {"codex", "agy", "grok", "claude"}
 
 
 def _sleep(seconds: float) -> None:
@@ -1170,7 +1175,7 @@ def _project_root() -> Path:
 
 
 def _spawn_dispatch(argv: List[str]) -> int:
-    """Spawn a detached ``python -m harness do …`` and return its pid.
+    """Spawn a detached ``python -m harness …`` child and return its pid.
 
     DETACHED + its own process group (``start_new_session=True``) so the child's
     recorded ``run.pid`` is killpg-able by /cancel. argv is a LIST — never
@@ -1275,6 +1280,78 @@ def _build_dispatch_argv(instruction: str, flags: List[str]) -> List[str]:
     return [sys.executable, "-m", "harness", "do", instruction, *list(flags)]
 
 
+def _default_passthrough_provider() -> str:
+    provider = os.environ.get("AGY_PASSTHROUGH_PROVIDER", "codex").strip().lower()
+    return provider if provider in _PASSTHROUGH_PROVIDERS else "codex"
+
+
+def _parse_passthrough_message(
+    words: List[str], *, default_provider: str
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """Parse optional leading ``--provider P`` and return (provider, prompt, error).
+
+    Only the provider flag is accepted here. The prompt remains one downstream argv
+    element, and an invalid provider is rejected instead of passed through.
+    """
+    toks = [str(w) for w in words]
+    provider = (default_provider or "codex").strip().lower()
+    if provider not in _PASSTHROUGH_PROVIDERS:
+        provider = "codex"
+    if toks and toks[0] == "--provider":
+        if len(toks) < 2:
+            return None, "", "⚠️ Missing provider. Choose: codex, agy, grok, claude."
+        candidate = toks[1].strip().lower()
+        if candidate not in _PASSTHROUGH_PROVIDERS:
+            return None, "", (
+                f"⚠️ Unknown provider <code>{_e(candidate)}</code>. "
+                "Choose: codex, agy, grok, claude."
+            )
+        provider = candidate
+        toks = toks[2:]
+    return provider, " ".join(toks).strip(), None
+
+
+def _build_passthrough_argv(
+    prompt: str, *, provider: str, chat_id: Any, session: Optional[str] = None
+) -> List[str]:
+    """Construct a detached ``harness ask`` argv list for Telegram delivery."""
+    argv = [
+        sys.executable,
+        "-m",
+        "harness",
+        "ask",
+        prompt,
+        "--provider",
+        provider,
+        "--telegram",
+        "--telegram-chat",
+        str(chat_id),
+    ]
+    if session:
+        argv.extend(["--session", session])
+    return argv
+
+
+def _build_passthrough_chat_argv(
+    prompt: str, *, provider: str, session: str, chat_id: Any
+) -> List[str]:
+    """Construct a detached one-turn session-backed ``harness ask`` argv list."""
+    return [
+        sys.executable,
+        "-m",
+        "harness",
+        "ask",
+        prompt,
+        "--provider",
+        provider,
+        "--session",
+        session,
+        "--telegram",
+        "--telegram-chat",
+        str(chat_id),
+    ]
+
+
 def _discover_new_run(before: set) -> Optional[str]:
     """Poll briefly+bounded for a run dir that did not exist in ``before``.
 
@@ -1349,6 +1426,72 @@ def _handle_build(
     return _launch_and_track(
         argv, state=state, chat_id=chat_id, state_file=state_file
     )
+
+
+def _handle_ask(
+    args: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """/ask [--provider p] <prompt> — detached one-shot passthrough."""
+    if chat_id is None:
+        return "⚠️ Chat id unavailable."
+    provider, prompt, error = _parse_passthrough_message(
+        args, default_provider=_default_passthrough_provider()
+    )
+    if error:
+        return error
+    if not prompt or not provider:
+        return "⚙️ <b>/ask</b> [--provider codex|agy|grok|claude] &lt;prompt&gt;"
+    argv = _build_passthrough_argv(prompt, provider=provider, chat_id=chat_id)
+    try:
+        _spawn_dispatch(argv)
+    except Exception as exc:
+        logger.debug("telegram ask spawn failed: %s", exc)
+        return "⚠️ Could not launch the model request."
+    return f"🤔 asking {_e(provider)}…"
+
+
+def _handle_chat(
+    args: List[str], *, state: dict, chat_id: Any, state_file: Optional[str]
+) -> str:
+    """/chat [--provider p] <prompt> — detached per-chat passthrough session."""
+    if chat_id is None:
+        return "⚠️ Chat id unavailable."
+    session = f"tg-{chat_id}"
+    first = (args[0].strip().lower() if args else "")
+    if first in ("new", "reset"):
+        try:
+            from harness.passthrough import SessionStore
+
+            SessionStore.delete_session(session)
+        except Exception as exc:
+            logger.debug("telegram chat reset failed: %s", exc)
+        return "🧹 Chat session reset."
+
+    prefs = _chat_prefs(state, chat_id)
+    stored_provider = str(prefs.get("passthrough_provider") or "").strip().lower()
+    default_provider = (
+        stored_provider
+        if stored_provider in _PASSTHROUGH_PROVIDERS
+        else _default_passthrough_provider()
+    )
+    provider, prompt, error = _parse_passthrough_message(
+        args, default_provider=default_provider
+    )
+    if error:
+        return error
+    if not prompt or not provider:
+        return "⚙️ <b>/chat</b> [--provider codex|agy|grok|claude] &lt;prompt&gt;"
+    prefs["passthrough_provider"] = provider
+    save_state(state, state_file)
+    argv = _build_passthrough_chat_argv(
+        prompt, provider=provider, session=session, chat_id=chat_id
+    )
+    try:
+        _spawn_dispatch(argv)
+    except Exception as exc:
+        logger.debug("telegram chat spawn failed: %s", exc)
+        return "⚠️ Could not launch the model request."
+    return f"🤔 asking {_e(provider)}…"
 
 
 def _resolve_target_dir(target: str) -> Optional[Path]:
@@ -1570,6 +1713,10 @@ def handle_command(
     # ---- A. action verbs (drive builds from the phone) ----
     if cmd == "/build":
         return _handle_build(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/ask":
+        return _handle_ask(args, state=state, chat_id=chat_id, state_file=state_file)
+    if cmd == "/chat":
+        return _handle_chat(args, state=state, chat_id=chat_id, state_file=state_file)
     if cmd == "/cancel":
         return _handle_cancel(args, state=state, chat_id=chat_id, state_file=state_file)
     if cmd == "/retry":

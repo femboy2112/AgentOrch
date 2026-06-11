@@ -9,6 +9,9 @@ AgentOrch runs from your workstation and delegates implementation to existing wo
 ### CLI entrypoints
 - `python -m harness <cmd>` — operator layer (primary interface).
   - `do "INSTRUCTION"` — dispatch one instruction (see modes below).
+  - `ask "PROMPT" [--provider chain] [--session NAME]` — lightweight passthrough: one prompt to a worker model, reply printed (multi-turn sessions, fallback chain, optional Telegram delivery). No verifier/snapshot/reconcile.
+  - `chat [--session NAME] [--provider chain]` — interactive passthrough REPL (one stdin line per turn; `/exit`, `/reset`).
+  - `sessions list|show NAME|rm NAME` — manage passthrough chat sessions (stored under `runs/.sessions/`).
   - `spec GOAL [-c CONSTRAINT ...]` — FloodSpec: goal+constraints -> design doc.
   - `runs [--limit N]` — list recent runs (default 20).
   - `show RUN_ID` — print a run's diff + metadata.
@@ -88,6 +91,7 @@ python -m harness do "INSTRUCTION" --mode <mode> \
 | `AGY_RECONCILE` | toggle reconciliation station |
 | `AGY_RECONCILE_MOCK_CHECK` | `0` disables reconcile's mock-hides-implementation flag (#86: load-bearing symbol only mock-covered, never really exercised) |
 | `AGY_RECONCILE_MOCK_STRICT` | `1` makes a mock-hidden finding hard-FAIL under the `fail` disposition (default: flag only) |
+| `AGY_PASSTHROUGH_PROVIDER` | default provider for the Telegram `/ask`/`/chat` passthrough commands (codex/agy/grok/claude; default codex) |
 | `AGY_VERIFIER_MEM_MAX` | verifier memory cap (systemd-scope) |
 | `AGY_STREAM` | worker stream mode |
 | `TELEGRAM_BOT_KEY` | Telegram bot token (env only, never committed) |

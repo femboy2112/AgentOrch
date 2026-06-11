@@ -301,6 +301,67 @@ python -m harness merge <run_id> --method squash --delete-branch
 
 ---
 
+## `harness ask`
+
+A **lightweight passthrough**: send one prompt directly to a worker model and
+print the reply — no snapshot diff, no verifier, no reconcile, no plan. The
+agent is built through the same fallback-wrapped chain as a generator, so
+usage-wall rollover and codex intra-provider model fallback still apply.
+
+```bash
+python -m harness ask "PROMPT" [flags]
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--provider` | `codex` | Comma-separated provider chain (`codex,agy,grok,claude`), fallback-wrapped. |
+| `--model` | `None` | Lead-provider model override. |
+| `--effort` | `None` | Lead-provider effort tier (`low\|medium\|high\|max`). |
+| `--session NAME` | `None` | Make this turn part of a multi-turn session (create if absent, else resume). |
+| `--web-search` | off | Enable codex web search (`-c tools.web_search=true`). |
+| `--no-fallback` | off | Disable provider/model fallback wrapping. |
+| `--no-capture` | off | Skip the lightweight `runs/<id>/` ask record (default: capture a minimal `meta.json`). |
+| `--out-dir PATH` | repo root | Worker cwd. |
+| `--telegram` + `--telegram-chat ID` | off | Deliver the final reply to a Telegram chat (used by the bot's `/ask`/`/chat`). |
+
+**Sessions** are hybrid: claude/grok resume natively (warm server-side context via
+their `--resume <id>`); codex/agy have no native resume, so prior turns are replayed
+as a bounded transcript preamble. State lives in `runs/.sessions/<slug>.json`
+(gitignored), written atomically. Session names are normalized to `[a-z0-9_-]`
+(lowercased; other chars → `-`); a name with no alphanumeric is rejected.
+
+```bash
+# One-shot to a specific model
+python -m harness ask "explain this stack trace" --provider codex
+
+# Multi-turn session (resume by name), cross-provider fallback
+python -m harness ask "and what causes it?" --provider codex,agy --session debug1
+```
+
+## `harness chat`
+
+Interactive REPL over the same core: one stdin line per turn, each printed reply,
+until EOF / `/exit` / `/quit`. `/reset` clears the session transcript.
+
+```bash
+python -m harness chat [--session NAME] [--provider …] [--model …] [--effort …]
+```
+
+`--session` defaults to `default`; `--provider` defaults to the session's previous
+provider (else `codex`).
+
+## `harness sessions`
+
+Manage passthrough sessions.
+
+```bash
+python -m harness sessions list           # name, provider, model, #turns, updated-at
+python -m harness sessions show NAME       # print the stored transcript
+python -m harness sessions rm NAME         # delete the session file
+```
+
+---
+
 ## `harness spec`
 
 FloodSpec: turn a short goal + constraints into a complete design doc. Writes

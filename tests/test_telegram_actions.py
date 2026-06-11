@@ -27,6 +27,7 @@ import pytest
 
 from harness import telegram as tg
 from harness import telegram_bot as bot
+from harness import passthrough
 
 
 FAKE_TOKEN = "123456:FAKE-TEST-TOKEN-not-real"
@@ -40,6 +41,16 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("AGY_TELEGRAM_STATE", str(tmp_path / "state.json"))
     monkeypatch.setenv("AGY_TELEGRAM_USERS", str(tmp_path / "users.json"))
     monkeypatch.setenv("TELEGRAM_BOT_KEY", FAKE_TOKEN)
+    monkeypatch.setenv("AGY_BENCH_MOCK", "1")
+    monkeypatch.setenv("AGY_BENCH_MOCK_SLEEP", "0")
+    monkeypatch.setenv("AGY_BENCH_MOCK_OUTPUT", "mock passthrough reply")
+
+    def forbidden_popen(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("telegram action tests must not spawn real subprocesses")
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
 
 
 @pytest.fixture
@@ -200,6 +211,182 @@ def test_build_seam_is_only_spawn_path(monkeypatch, runs_dir, no_sleep, state):
     monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: 9)
     reply = bot.handle_command("/build x", state=state, chat_id=FAKE_CHAT_ID)
     assert isinstance(reply, str) and reply
+
+
+# =========================================================================== #
+# A. /ask
+# =========================================================================== #
+def test_ask_builds_detached_argv_list_with_default_provider(monkeypatch, state):
+    calls = []
+    monkeypatch.delenv("AGY_PASSTHROUGH_PROVIDER", raising=False)
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command(
+        "/ask summarize the latest run", state=state, chat_id=FAKE_CHAT_ID
+    )
+
+    assert calls, "ask must spawn through the detached spawn seam"
+    argv = calls[0]
+    assert isinstance(argv, list)
+    assert argv[1:4] == ["-m", "harness", "ask"]
+    assert argv[4] == "summarize the latest run"
+    assert argv[5:] == [
+        "--provider",
+        "codex",
+        "--telegram",
+        "--telegram-chat",
+        str(FAKE_CHAT_ID),
+    ]
+    assert reply == "🤔 asking codex…"
+
+
+def test_ask_honors_env_default_provider(monkeypatch, state):
+    calls = []
+    monkeypatch.setenv("AGY_PASSTHROUGH_PROVIDER", "grok")
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command("/ask hello there", state=state, chat_id=FAKE_CHAT_ID)
+
+    assert calls[0][calls[0].index("--provider") + 1] == "grok"
+    assert reply == "🤔 asking grok…"
+
+
+def test_ask_leading_provider_overrides_default(monkeypatch, state):
+    calls = []
+    monkeypatch.setenv("AGY_PASSTHROUGH_PROVIDER", "grok")
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command(
+        "/ask --provider agy compare options", state=state, chat_id=FAKE_CHAT_ID
+    )
+
+    argv = calls[0]
+    assert argv[4] == "compare options"
+    assert argv[argv.index("--provider") + 1] == "agy"
+    assert reply == "🤔 asking agy…"
+
+
+def test_ask_rejects_invalid_provider_without_spawning(monkeypatch, state):
+    calls = []
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command(
+        "/ask --provider nope prompt", state=state, chat_id=FAKE_CHAT_ID
+    )
+
+    assert calls == []
+    assert reply and "Unknown provider" in reply
+
+
+def test_ask_never_raises_when_spawn_fails(monkeypatch, state):
+    def boom(argv):
+        raise RuntimeError("popen exploded")
+
+    monkeypatch.setattr(bot, "_spawn_dispatch", boom)
+    reply = bot.handle_command("/ask anything", state=state, chat_id=FAKE_CHAT_ID)
+    assert reply == "⚠️ Could not launch the model request."
+
+
+# =========================================================================== #
+# A. /chat
+# =========================================================================== #
+def test_chat_builds_detached_ask_argv_and_persists_provider(monkeypatch, state):
+    calls = []
+    state["chats"] = {
+        str(FAKE_CHAT_ID): {
+            "mute_until": "on",
+            "quiet_window": "23:00-07:00",
+        }
+    }
+    monkeypatch.delenv("AGY_PASSTHROUGH_PROVIDER", raising=False)
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command(
+        "/chat --provider grok remember this", state=state, chat_id=FAKE_CHAT_ID
+    )
+
+    assert calls, "chat must spawn through the detached spawn seam"
+    argv = calls[0]
+    assert isinstance(argv, list)
+    assert argv[1:4] == ["-m", "harness", "ask"]
+    assert argv[4] == "remember this"
+    assert argv[argv.index("--provider") + 1] == "grok"
+    assert argv[argv.index("--session") + 1] == f"tg-{FAKE_CHAT_ID}"
+    assert argv[argv.index("--telegram-chat") + 1] == str(FAKE_CHAT_ID)
+    assert "--telegram" in argv
+    prefs = state["chats"][str(FAKE_CHAT_ID)]
+    assert prefs["passthrough_provider"] == "grok"
+    assert prefs["mute_until"] == "on"
+    assert prefs["quiet_window"] == "23:00-07:00"
+    persisted = bot.load_state()
+    persisted_prefs = persisted["chats"][str(FAKE_CHAT_ID)]
+    assert persisted_prefs["passthrough_provider"] == "grok"
+    assert persisted_prefs["mute_until"] == "on"
+    assert persisted_prefs["quiet_window"] == "23:00-07:00"
+    assert reply == "🤔 asking grok…"
+
+
+def test_chat_reuses_persisted_provider(monkeypatch, state):
+    calls = []
+    state["chats"] = {str(FAKE_CHAT_ID): {"passthrough_provider": "agy"}}
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command("/chat continue please", state=state, chat_id=FAKE_CHAT_ID)
+
+    argv = calls[0]
+    assert argv[1:4] == ["-m", "harness", "ask"]
+    assert argv[4] == "continue please"
+    assert argv[argv.index("--provider") + 1] == "agy"
+    assert argv[argv.index("--session") + 1] == f"tg-{FAKE_CHAT_ID}"
+    assert argv[argv.index("--telegram-chat") + 1] == str(FAKE_CHAT_ID)
+    assert state["chats"][str(FAKE_CHAT_ID)]["passthrough_provider"] == "agy"
+    assert reply == "🤔 asking agy…"
+
+
+def test_chat_reset_deletes_session_without_spawning(monkeypatch, state):
+    calls = []
+    deleted = []
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+    monkeypatch.setattr(
+        passthrough.SessionStore,
+        "delete_session",
+        staticmethod(lambda session_id: deleted.append(session_id)),
+    )
+
+    reply = bot.handle_command("/chat reset", state=state, chat_id=FAKE_CHAT_ID)
+
+    assert calls == []
+    assert deleted == [f"tg-{FAKE_CHAT_ID}"]
+    assert reply == "🧹 Chat session reset."
+
+
+def test_chat_new_deletes_session_without_spawning(monkeypatch, state):
+    calls = []
+    deleted = []
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+    monkeypatch.setattr(
+        passthrough.SessionStore,
+        "delete_session",
+        staticmethod(lambda session_id: deleted.append(session_id)),
+    )
+
+    reply = bot.handle_command("/chat new", state=state, chat_id=FAKE_CHAT_ID)
+
+    assert calls == []
+    assert deleted == [f"tg-{FAKE_CHAT_ID}"]
+    assert reply == "🧹 Chat session reset."
+
+
+def test_chat_rejects_invalid_provider_without_spawning(monkeypatch, state):
+    calls = []
+    monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: calls.append(list(argv)) or 123)
+
+    reply = bot.handle_command(
+        "/chat --provider nope prompt", state=state, chat_id=FAKE_CHAT_ID
+    )
+
+    assert calls == []
+    assert reply and "Unknown provider" in reply
 
 
 # =========================================================================== #
@@ -546,6 +733,7 @@ def test_gate_callback_non_whitelisted_no_write(monkeypatch, runs_dir, users_fil
 @pytest.mark.parametrize("cmd", [
     "/build", "/build x", "/cancel", "/cancel latest", "/cancel weird",
     "/retry", "/retry latest", "/run", "/run x y z", "/notify", "/notify x",
+    "/ask", "/chat", "/chat new",
 ])
 def test_new_commands_never_raise(monkeypatch, runs_dir, no_sleep, cmd, state):
     monkeypatch.setattr(bot, "_spawn_dispatch", lambda argv: 1)

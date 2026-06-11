@@ -186,6 +186,7 @@ traffic. Default paths are under `/tmp` and can be redirected.
 | `AGY_NOTIFY` | `harness/cli.py:494` | Default notify target when `--notify` is not passed. | unset (no notify) | Notify target string (overridden by `--notify`). |
 | `AGY_MISSION_CRITICAL_RUN_STALL` | `harness/dispatch.py:367` | Overrides the mission-critical run-level stall backstop. Only consulted when `--mission-critical` is set and `--run-stall-abort` is unspecified. | `1800.0` (`MISSION_CRITICAL_RUN_STALL_DEFAULT`) | Float seconds; `<=0` disables the backstop; malformed → default. |
 | `AGY_BROKER_POOL_WAIT` | `harness/broker.py:60` | Anti-deadlock wait for a worker slot in the broker pool (explicit arg > env > default). | `5.0` | Float seconds (clamped `>=0`); non-numeric → warn + default. |
+| `AGY_PASSTHROUGH_PROVIDER` | `harness/telegram_bot.py` | Default provider for the Telegram `/ask`/`/chat` passthrough commands when no `--provider` is given. | `codex` | One of `codex`/`agy`/`grok`/`claude`; an unknown value falls back to `codex`. |
 
 ---
 
