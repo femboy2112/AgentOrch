@@ -414,6 +414,15 @@ byte-budget watchdog (or hit a usage wall) and the chain fell back, the line is 
 `⚠ lead demoted` and a `WARNING` naming `--watchdog-scale` / `--watchdog-max-bytes` is logged — so a
 runner-up authoring the contract is never silent.
 
+**Incremental persistence (#90).** Each architect draft is flushed to `runs/<id>/spec.md` (and the
+`-o` copy) the moment it is produced, so an interrupted run — a wrapping `timeout`/SIGTERM, or
+`Ctrl-C` — still leaves the **most-recent complete draft** on disk instead of zero bytes (a long
+`--effort-profile max` run is slow enough that this matters). On a *catchable* interrupt (`Ctrl-C`,
+asyncio cancel) `meta.json` is also finalized with `partial=true, success=false`. A hard external
+SIGTERM hard-exits after reaping workers, so it can't finalize `meta.json`, but `spec.md` is already
+saved. (A `--resume <run_id>` that re-feeds the partial draft to the architect is a deferred
+follow-up.)
+
 ---
 
 ## `harness runs`

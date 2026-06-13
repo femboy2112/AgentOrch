@@ -38,7 +38,7 @@ Kit's plan/spec templates, and standard RFC/design-doc practice.
 """
 import logging
 import re
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from agy_orchestrator.core.agent import AgentInstance
 from agy_orchestrator.workflows.adversarial import _THINK_RE, _is_approved
@@ -187,6 +187,7 @@ class SpecWorkflow:
         critic_instance: AgentInstance,
         max_iterations: int = 3,
         sections: Optional[List[str]] = None,
+        draft_callback: Optional[Callable[[str, int], None]] = None,
     ):
         self.architect = architect_instance
         self.critic = critic_instance
@@ -198,6 +199,20 @@ class SpecWorkflow:
         self.iterations_used = 0
         self.approved = False
         self.stalled = False
+        # Issue #90: invoked with (draft, iterations_used) after EVERY architect
+        # turn so the caller can flush the current complete draft to disk
+        # incrementally — a SIGTERM / timeout mid-run then leaves the most-recent
+        # draft persisted instead of zero bytes. Best-effort; never affects the loop.
+        self._draft_callback = draft_callback
+
+    def _emit_draft(self, draft: str) -> None:
+        cb = self._draft_callback
+        if cb is None:
+            return
+        try:
+            cb(draft, self.iterations_used)
+        except Exception:  # a persistence error must never break authoring
+            logger.debug("FloodSpec draft_callback raised", exc_info=True)
 
     async def execute(self, goal: str, constraints: Optional[List[str]] = None) -> str:
         draft = ""
@@ -206,6 +221,7 @@ class SpecWorkflow:
         # Round 1: author the first complete draft from the goal + constraints.
         self.architect.prompt = build_architect_prompt(goal, constraints, self.sections)
         draft = await self.architect.run_async()
+        self._emit_draft(draft)
 
         for iteration in range(self.max_iterations):
             self.iterations_used = iteration + 1
@@ -240,6 +256,7 @@ class SpecWorkflow:
             logger.info("Critic requested changes. Revising spec...")
             self.architect.prompt = build_revise_prompt(draft, critique, self.sections)
             draft = await self.architect.run_async()
+            self._emit_draft(draft)
 
         logger.warning(
             "FloodSpec reached max iterations (%d) without explicit approval.",

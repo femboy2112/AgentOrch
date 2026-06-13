@@ -59,6 +59,10 @@ class SpecResult:
     quality: Optional[dict] = None
     architect_author: Optional[str] = None
     architect_demoted: bool = False
+    # Issue #90: True when the run was interrupted (SIGTERM/timeout/cancel) before
+    # the critic loop converged. spec.md still holds the most-recent architect
+    # draft (flushed incrementally); meta.json records the partial state honestly.
+    partial: bool = False
 
 
 async def generate_spec_async(
@@ -152,7 +156,30 @@ async def generate_spec_async(
         post_construct_hook=_post_construct_hook,
     )
 
-    wf = SpecWorkflow(architect, critic, max_iterations=max_iterations)
+    spec_path = run_dir / "spec.md"
+    # Issue #90: a SIGTERM / timeout that cancels wf.execute() mid-await used to
+    # discard every completed iteration (spec.md was only written AFTER the
+    # workflow returned). Flush each architect draft to disk the moment it is
+    # produced so an interrupted run still leaves the most-recent complete draft.
+    # ``last_draft`` also lets the finalizer below recover the doc when the await
+    # was cancelled before returning.
+    last_draft = {"text": ""}
+
+    def _persist_draft(draft: str, iteration: int) -> None:
+        last_draft["text"] = draft or ""
+        try:
+            spec_path.write_text(draft or "", encoding="utf-8")
+            if output_path and draft:
+                out = Path(output_path).expanduser().resolve()
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(draft, encoding="utf-8")
+        except Exception as exc:  # persistence is best-effort, never fatal
+            logger.debug("FloodSpec %s incremental persist failed: %s", run_id, exc)
+
+    wf = SpecWorkflow(
+        architect, critic, max_iterations=max_iterations,
+        draft_callback=_persist_draft,
+    )
 
     # Persist inputs. prompt.txt carries a ``## Instruction`` block so the
     # dashboard's instruction preview (Live + Runs) renders the goal, plus the
@@ -196,6 +223,7 @@ async def generate_spec_async(
 
     started = time.monotonic()
     success = True
+    partial = False
     error: Optional[str] = None
     doc = ""
     architect_author = architect_chain[0]
@@ -216,7 +244,7 @@ async def generate_spec_async(
     try:
         doc = await wf.execute(goal, constraints)
         architect_author = _author_token(architect, architect_chain)
-        architect_demoted = bool(success and architect_author != architect_chain[0])
+        architect_demoted = bool(architect_author != architect_chain[0])
         if architect_demoted:
             logger.warning(
                 "FloodSpec %s: lead architect '%s' did NOT author the doc — it was written by '%s'. "
@@ -225,78 +253,112 @@ async def generate_spec_async(
                 "See runs/%s/events.jsonl.",
                 run_id, architect_chain[0], architect_author, run_id,
             )
-    except Exception as exc:  # graceful: capture, never crash the operator shell
+    except Exception as exc:  # graceful: a genuine failure, captured (not an interrupt)
         success = False
         error = f"{type(exc).__name__}: {exc}"
         logger.error("FloodSpec %s failed: %s", run_id, error)
+    except BaseException as exc:  # noqa: BLE001 — SIGTERM/cancel/KeyboardInterrupt (#90)
+        # An external SIGTERM (a wrapping `timeout`, the operator) cancels the
+        # await as CancelledError; a Ctrl-C is KeyboardInterrupt. Both bypass the
+        # `except Exception` above. Record the partial state, then RE-RAISE so the
+        # process still exits as the signal intended — but the `finally` below has
+        # already flushed spec.md + an honest partial meta.json first.
+        success = False
+        partial = True
+        error = (f"interrupted ({type(exc).__name__}) at iteration "
+                 f"{int(getattr(wf, 'iterations_used', 0))} — partial draft saved")
+        logger.error("FloodSpec %s interrupted: %s", run_id, error)
+        raise
     finally:
         duration = time.monotonic() - started
-        dispatch_pub({
-            "kind": "lifecycle",
-            "data": {
-                "event": "dispatch_finished",
-                "detail": {"success": success, "duration_s": round(duration, 1)},
-            },
-        })
+        try:
+            dispatch_pub({
+                "kind": "lifecycle",
+                "data": {
+                    "event": "dispatch_finished",
+                    "detail": {"success": success, "partial": partial,
+                               "duration_s": round(duration, 1)},
+                },
+            })
+        except Exception:
+            pass
+
+        # Finalize deliverable + artifacts + meta.json (runs on the interrupt path
+        # too — that is the whole point of #90). On a cancelled await, ``doc`` is
+        # empty, so fall back to the last draft the architect actually produced.
+        final_doc = doc if doc else last_draft["text"]
+        try:
+            spec_path.write_text(final_doc or "(no document produced)\n", encoding="utf-8")
+            # stdout.log mirrors the doc so the dashboard Stdout tab shows the
+            # deliverable (spec.md is not one of the fixed artifact tabs).
+            (run_dir / "stdout.log").write_text(final_doc or "", encoding="utf-8")
+            # No file changes in a spec run; keep the Diff tab honest.
+            (run_dir / "changed-files.diff").write_text(
+                "(spec run — no file changes)\n", encoding="utf-8"
+            )
+            # Optional convenience copy into a caller-chosen location (e.g. the
+            # target repo's DESIGN.md). The runs/ artifact is always canonical.
+            if output_path and final_doc:
+                out = Path(output_path).expanduser().resolve()
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(final_doc, encoding="utf-8")
+        except Exception as exc:
+            logger.debug("FloodSpec %s artifact finalize failed: %s", run_id, exc)
+
+        approved = bool(getattr(wf, "approved", False))
+        stalled = bool(getattr(wf, "stalled", False))
+        if partial:
+            confidence = "unverified"
+            note = (f"interrupted before convergence — partial draft saved "
+                    f"(iteration {int(getattr(wf, 'iterations_used', 0))})")
+        elif approved:
+            confidence = "approved"
+            note = "critic approved"
+        else:
+            confidence = "unverified"
+            note = ("critique stalled (gap set converged)" if stalled
+                    else "max iterations reached without approval")
+
+        result = SpecResult(
+            run_id=run_id,
+            run_dir=str(run_dir),
+            spec_path=str(spec_path),
+            mode="spec",
+            generator=arch_desc,
+            critic=crit_desc,
+            success=success,
+            duration_s=round(duration, 1),
+            approved=approved,
+            stalled=stalled,
+            iterations_used=int(getattr(wf, "iterations_used", 0)),
+            chars=len(final_doc or ""),
+            error=error,
+            constraints=constraints,
+            quality={"confidence": confidence, "note": note},
+            architect_author=architect_author,
+            architect_demoted=architect_demoted,
+            partial=partial,
+        )
+        try:
+            (run_dir / "meta.json").write_text(
+                json.dumps(asdict(result), indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.debug("FloodSpec %s meta.json write failed: %s", run_id, exc)
+
+        # Close the bus + detach the log handler AFTER artifacts so finalize-time
+        # logging still lands in stderr.log.
         EVENT_BUS.close(run_id)
         EVENT_BUS.sinks.pop(run_id, None)
         root_logger.removeHandler(file_handler)
         file_handler.close()
 
-    spec_path = run_dir / "spec.md"
-    spec_path.write_text(doc or "(no document produced)\n", encoding="utf-8")
-    # stdout.log mirrors the doc so the dashboard Stdout tab shows the deliverable
-    # (spec.md is not one of the fixed artifact tabs).
-    (run_dir / "stdout.log").write_text(doc or "", encoding="utf-8")
-    # No file changes in a spec run; keep the Diff tab honest.
-    (run_dir / "changed-files.diff").write_text(
-        "(spec run — no file changes)\n", encoding="utf-8"
-    )
-    # Optional convenience copy into a caller-chosen location (e.g. the target
-    # repo's DESIGN.md). The runs/ artifact is always the canonical one.
-    if output_path and doc:
-        out = Path(output_path).expanduser().resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(doc, encoding="utf-8")
+        if telegram_notifier is not None:
+            try:
+                telegram_notifier.finished(asdict(result))
+            except Exception as exc:
+                logger.debug("spec telegram finish summary failed: %s", exc)
 
-    approved = bool(getattr(wf, "approved", False))
-    stalled = bool(getattr(wf, "stalled", False))
-    confidence = "approved" if approved else "unverified"
-
-    result = SpecResult(
-        run_id=run_id,
-        run_dir=str(run_dir),
-        spec_path=str(spec_path),
-        mode="spec",
-        generator=arch_desc,
-        critic=crit_desc,
-        success=success,
-        duration_s=round(duration, 1),
-        approved=approved,
-        stalled=stalled,
-        iterations_used=int(getattr(wf, "iterations_used", 0)),
-        chars=len(doc or ""),
-        error=error,
-        constraints=constraints,
-        quality={
-            "confidence": confidence,
-            "note": (
-                "critic approved" if approved
-                else ("critique stalled (gap set converged)" if stalled
-                      else "max iterations reached without approval")
-            ),
-        },
-        architect_author=architect_author,
-        architect_demoted=architect_demoted,
-    )
-    (run_dir / "meta.json").write_text(
-        json.dumps(asdict(result), indent=2), encoding="utf-8"
-    )
-    if telegram_notifier is not None:
-        try:
-            telegram_notifier.finished(asdict(result))
-        except Exception as exc:
-            logger.debug("spec telegram finish summary failed: %s", exc)
     return result
 
 
