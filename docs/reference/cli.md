@@ -383,6 +383,37 @@ python -m harness spec "GOAL" [flags]
 | `--max-iterations` | int | `3` | Max architect/critic refinement rounds. |
 | `-o`, `--output` | path | `None` | Also write the doc here (e.g. a target repo's `DESIGN.md`). The `runs/<id>/spec.md` artifact is always written. |
 
+**Effort/model overrides (#42 — parity with [`harness do`](#effortmodel-overrides-42)).** The
+architect chain plays the "generator" role here, so `--gen-effort`/`--gen-model` are accepted as
+aliases of the architect flags.
+
+| Flag | Type | Default | Meaning |
+|---|---|---|---|
+| `--architect-effort`, `--gen-effort` | str (`low\|medium\|high\|max`) | `None` | Effort tier for the architect chain (every effort-capable provider; grok no-ops; `max` → codex `xhigh`). |
+| `--critic-effort` | str (tier) | `None` | Effort tier for the critic chain. |
+| `--architect-model`, `--gen-model` | str | `None` | Model for the architect chain **lead** (provider-specific). |
+| `--critic-model` | str | `None` | Model for the critic chain **lead**. |
+| `--codex-model` | str | `None` | Set the codex model anywhere it appears in either chain. |
+| `--effort` | map | `None` | Per-provider effort map, e.g. `codex=max,agy=high`. |
+| `--model` | map | `None` | Per-provider model map, e.g. `codex=gpt-5.5`. |
+| `--effort-profile` | `low\|balanced\|max` | `None` | One-switch preset; `max` cranks codex `gpt-5.5`/`xhigh`. Explicit flags override the profile. |
+| `--watchdog-scale` | float | `None` | Multiply the streaming-watchdog stall/byte budgets for heavy tiers (env `AGY_WATCHDOG_SCALE`). |
+| `--watchdog-max-bytes` | int | `None` | Absolute verbose BYTE budget; must be `> 0` (issue #83/#89; env `AGY_WATCHDOG_MAX_BYTES`). Use this when a read-heavy architect (large `-c` reference list) is being SIGKILLed by the verbose watchdog and silently demoted to a fallback. |
+
+**Telegram (parity with `do`).** Auto-on when `TELEGRAM_BOT_KEY` is set **and** the whitelist is
+non-empty; a spec run streams the same run-start/iteration/finish messages as a dispatch.
+
+| Flag | Type | Default | Meaning |
+|---|---|---|---|
+| `--telegram` / `--no-telegram` | tri-state | auto | Force-enable / disable Telegram notifications for this spec run. |
+| `--telegram-verbosity` | `quiet\|normal\|verbose\|debug` | env / `normal` | Telegram message verbosity. |
+
+**Authored-by surfacing (#89).** The finish output (and the Telegram finish card) names the worker
+that actually authored the doc. If a read-heavy lead architect is SIGKILLed by the verbose
+byte-budget watchdog (or hit a usage wall) and the chain fell back, the line is flagged
+`⚠ lead demoted` and a `WARNING` naming `--watchdog-scale` / `--watchdog-max-bytes` is logged — so a
+runner-up authoring the contract is never silent.
+
 ---
 
 ## `harness runs`

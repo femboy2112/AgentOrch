@@ -1547,6 +1547,20 @@ class TelegramNotifier:
         if meta_bits:
             lines.append(" · ".join(meta_bits))
 
+        # ---- #89: which worker actually authored (spec runs only) -------- #
+        # FloodSpec sets architect_author/architect_demoted so the phone card
+        # mirrors the CLI finish line: a read-heavy lead SIGKILLed by the verbose
+        # watchdog is demoted to a fallback, and the operator should see WHO wrote
+        # the doc. The keys are absent for `do` runs, so this is a no-op there.
+        author = meta.get("architect_author")
+        if author:
+            if meta.get("architect_demoted"):
+                lines.append(
+                    f"🖋 authored by <b>{_e(str(author))}</b> · ⚠️ <i>lead demoted</i>"
+                )
+            else:
+                lines.append(f"🖋 authored by <b>{_e(str(author))}</b>")
+
         # ---- expandable detail: changed-files list + <pre> per-step recap -- #
         # The headline + key stats stay on the surface; the long lists collapse
         # into a single tap-to-expand block so a 40-file / 30-step run is a tidy

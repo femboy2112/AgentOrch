@@ -31,8 +31,19 @@ def _patch_agents(monkeypatch):
     replies = ["# DESIGN DOC\nbody", "APPROVED"]
     state = {"n": 0}
 
-    def fake_build(chain, *, prompt="", fallback=True, cycles=2,
-                   codex_config=None, post_construct_hook=None):
+    def fake_build(
+        chain,
+        *,
+        prompt="",
+        fallback=True,
+        cycles=2,
+        codex_config=None,
+        post_construct_hook=None,
+        overrides=None,
+        watchdog_scale=1.0,
+        watchdog_max_bytes=None,
+        **_kw,
+    ):
         agent = _Stub(replies[min(state["n"], len(replies) - 1)])
         state["n"] += 1
         if post_construct_hook is not None:

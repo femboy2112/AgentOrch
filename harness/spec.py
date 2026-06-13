@@ -57,6 +57,8 @@ class SpecResult:
     constraints: List[str] = field(default_factory=list)
     changed_files: List[str] = field(default_factory=list)
     quality: Optional[dict] = None
+    architect_author: Optional[str] = None
+    architect_demoted: bool = False
 
 
 async def generate_spec_async(
@@ -70,6 +72,12 @@ async def generate_spec_async(
     cycles: int = 2,
     max_iterations: int = 3,
     output_path: Optional[str] = None,
+    architect_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    critic_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    watchdog_scale: float = 1.0,
+    watchdog_max_bytes: Optional[int] = None,
+    telegram: Optional[bool] = None,
+    telegram_verbosity: Optional[str] = None,
 ) -> SpecResult:
     """Author a design doc for ``goal`` and capture the run.
 
@@ -104,6 +112,22 @@ async def generate_spec_async(
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     EVENT_BUS.add_sink(run_id, _sink)
+    telegram_notifier = None
+    try:
+        from harness.dispatch import _build_telegram_notifier
+
+        telegram_notifier = _build_telegram_notifier(
+            run_id=run_id,
+            mode="spec",
+            enabled=telegram,
+            verbosity=telegram_verbosity,
+            instruction=goal,
+        )
+        if telegram_notifier is not None:
+            EVENT_BUS.add_sink(run_id, telegram_notifier)
+    except Exception as exc:
+        logger.debug("spec telegram notifier setup failed: %s", exc)
+        telegram_notifier = None
 
     def _post_construct_hook(agent: AgentInstance, worker: str, cfg: Dict[str, object]) -> None:
         model = str(cfg.get("model") or getattr(agent, "model", None) or "n/a")
@@ -115,10 +139,16 @@ async def generate_spec_async(
 
     architect: AgentInstance = roles.build_role_agent(
         architect_chain, prompt="", fallback=fallback, cycles=cycles,
+        overrides=architect_overrides,
+        watchdog_scale=watchdog_scale,
+        watchdog_max_bytes=watchdog_max_bytes,
         post_construct_hook=_post_construct_hook,
     )
     critic: AgentInstance = roles.build_role_agent(
         critic_chain, prompt="", fallback=fallback, cycles=cycles,
+        overrides=critic_overrides,
+        watchdog_scale=watchdog_scale,
+        watchdog_max_bytes=watchdog_max_bytes,
         post_construct_hook=_post_construct_hook,
     )
 
@@ -168,8 +198,33 @@ async def generate_spec_async(
     success = True
     error: Optional[str] = None
     doc = ""
+    architect_author = architect_chain[0]
+    architect_demoted = False
+
+    def _author_token(agent: AgentInstance, chain: List[str]) -> str:
+        lp = getattr(agent, "last_provider", None)
+        if not lp:
+            return chain[0]
+        for tok in chain:
+            try:
+                if roles._class_for(tok).__name__ == lp:
+                    return tok
+            except Exception:
+                continue
+        return lp
+
     try:
         doc = await wf.execute(goal, constraints)
+        architect_author = _author_token(architect, architect_chain)
+        architect_demoted = bool(success and architect_author != architect_chain[0])
+        if architect_demoted:
+            logger.warning(
+                "FloodSpec %s: lead architect '%s' did NOT author the doc — it was written by '%s'. "
+                "The lead was likely SIGKILLed by the verbose byte-budget watchdog or hit a usage wall; "
+                "raise --watchdog-scale / --watchdog-max-bytes to keep your primary architect. "
+                "See runs/%s/events.jsonl.",
+                run_id, architect_chain[0], architect_author, run_id,
+            )
     except Exception as exc:  # graceful: capture, never crash the operator shell
         success = False
         error = f"{type(exc).__name__}: {exc}"
@@ -231,10 +286,17 @@ async def generate_spec_async(
                       else "max iterations reached without approval")
             ),
         },
+        architect_author=architect_author,
+        architect_demoted=architect_demoted,
     )
     (run_dir / "meta.json").write_text(
         json.dumps(asdict(result), indent=2), encoding="utf-8"
     )
+    if telegram_notifier is not None:
+        try:
+            telegram_notifier.finished(asdict(result))
+        except Exception as exc:
+            logger.debug("spec telegram finish summary failed: %s", exc)
     return result
 
 

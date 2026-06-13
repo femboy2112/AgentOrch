@@ -950,18 +950,54 @@ def _cmd_do(args) -> int:
 
 def _cmd_spec(args) -> int:
     from harness.spec import generate_spec
+    from harness.effort_overrides import OverrideError, resolve_overrides
+    _arch_chain = args.architect.split(",") if args.architect else None
+    _crit_chain = args.critic.split(",") if args.critic else None
+    _arch = _arch_chain or list(roles.GENERATOR_CHAIN)
+    _crit = _crit_chain or list(roles.CRITIC_CHAIN)
+    # #89: fail fast on a non-positive absolute byte budget (it REPLACES, not scales).
+    if args.watchdog_max_bytes is not None and args.watchdog_max_bytes <= 0:
+        print(
+            f"{C_RED}--watchdog-max-bytes must be > 0, got {args.watchdog_max_bytes}{C_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        _resolved = resolve_overrides(
+            generator_chain=_arch,
+            critic_chain=_crit,
+            mode="",
+            profile=args.effort_profile,
+            gen_effort=args.architect_effort,
+            gen_model=args.architect_model,
+            critic_effort=args.critic_effort,
+            critic_model=args.critic_model,
+            codex_model=args.codex_model,
+            effort_map=args.effort_map,
+            model_map=args.model_map,
+            watchdog_scale=args.watchdog_scale,
+        )
+    except OverrideError as exc:
+        print(f"{C_RED}{exc}{C_RESET}", file=sys.stderr)
+        return 1
+    for _note in _resolved.notes:
+        print(f"{C_YELLOW}note: {_note}{C_RESET}", file=sys.stderr)
 
-    arch_chain = args.architect.split(",") if args.architect else None
-    crit_chain = args.critic.split(",") if args.critic else None
     result = generate_spec(
         args.goal,
         constraints=args.constraint,
-        architect_chain=arch_chain,
-        critic_chain=crit_chain,
+        architect_chain=_arch_chain,
+        critic_chain=_crit_chain,
         fallback=args.fallback,
         cycles=args.cycles,
         max_iterations=args.max_iterations,
         output_path=args.output,
+        architect_overrides=_resolved.generator,
+        critic_overrides=_resolved.critic,
+        watchdog_scale=_resolved.watchdog_scale,
+        watchdog_max_bytes=args.watchdog_max_bytes,
+        telegram=args.telegram_enabled,
+        telegram_verbosity=args.telegram_verbosity,
     )
     ok = f"{C_GREEN}OK{C_RESET}" if result.success else f"{C_RED}FAILED{C_RESET}"
     print(f"\n{C_BOLD}── floodspec {result.run_id} [{ok}] ──{C_RESET}")
@@ -971,6 +1007,15 @@ def _cmd_spec(args) -> int:
     conf = "approved" if result.approved else ("stalled" if result.stalled else "max-iter")
     col = C_GREEN if result.approved else C_YELLOW
     print(f"  outcome   : {col}{conf}{C_RESET} ({result.iterations_used} iter, {result.chars} chars)")
+    if result.architect_author:
+        if result.architect_demoted:
+            print(
+                f"  {C_YELLOW}authored  : {result.architect_author}  "
+                f"(⚠ lead demoted — see warning; raise --watchdog-scale / "
+                f"--watchdog-max-bytes){C_RESET}"
+            )
+        else:
+            print(f"  authored  : {result.architect_author}")
     if result.constraints:
         print(f"  {C_BOLD}constraints:{C_RESET} {len(result.constraints)}")
         for c in result.constraints:
@@ -1570,6 +1615,45 @@ def main(argv=None) -> int:
     spec.add_argument("-o", "--output", type=str, default=None, metavar="PATH",
                       help="Also write the doc here (e.g. a target repo's DESIGN.md). "
                            "The runs/<id>/spec.md artifact is always written regardless.")
+    eff = spec.add_argument_group("effort/model overrides (#42)")
+    eff.add_argument("--architect-effort", "--gen-effort", type=str, default=None,
+                     metavar="TIER",
+                     help="Effort tier (low|medium|high|max) for the architect chain; "
+                          "applies to every effort-capable provider (grok no-ops); "
+                      "'max' -> codex reasoning_effort=xhigh.")
+    eff.add_argument("--critic-effort", type=str, default=None, metavar="TIER",
+                     help="Effort tier for the critic chain; applies to every "
+                          "effort-capable provider.")
+    eff.add_argument("--architect-model", "--gen-model", type=str, default=None,
+                     metavar="NAME",
+                     help="Model for the architect chain LEAD; provider-specific.")
+    eff.add_argument("--critic-model", type=str, default=None, metavar="NAME",
+                     help="Model for the critic chain LEAD; provider-specific.")
+    eff.add_argument("--codex-model", type=str, default=None, metavar="NAME",
+                     help="Set the codex model anywhere it appears.")
+    eff.add_argument("--effort", dest="effort_map", type=str, default=None, metavar="MAP",
+                     help="Per-provider effort map, e.g. 'codex=max,agy=high'")
+    eff.add_argument("--model", dest="model_map", type=str, default=None, metavar="MAP",
+                     help="Per-provider model map, e.g. 'codex=gpt-5.5'.")
+    eff.add_argument("--effort-profile", choices=["low", "balanced", "max"], default=None,
+                     help="One-switch preset: 'max' cranks codex gpt-5.5/xhigh; "
+                          "explicit flags override.")
+    eff.add_argument("--watchdog-scale", type=float, default=None, metavar="FLOAT",
+                     help="Multiply the streaming-watchdog stall/byte budgets for "
+                          "heavy tiers (env AGY_WATCHDOG_SCALE).")
+    eff.add_argument("--watchdog-max-bytes", type=int, default=None, metavar="BYTES",
+                     help="Absolute verbose BYTE budget; must be > 0 (env "
+                          "AGY_WATCHDOG_MAX_BYTES).")
+    tg = spec.add_mutually_exclusive_group()
+    tg.add_argument("--telegram", dest="telegram_enabled", action="store_true", default=None,
+                    help="Force-enable Telegram build-progress notifications for this "
+                         "spec run.")
+    tg.add_argument("--no-telegram", dest="telegram_enabled", action="store_false",
+                    help="Disable Telegram build-progress notifications for this spec run.")
+    spec.add_argument("--telegram-verbosity", choices=["quiet", "normal", "verbose", "debug"],
+                      default=None,
+                      help="Telegram message verbosity (default env "
+                           "AGY_TELEGRAM_VERBOSITY else 'normal').")
     spec.set_defaults(func=_cmd_spec)
 
     runs = sub.add_parser("runs", help="List recent runs")

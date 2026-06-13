@@ -12,7 +12,7 @@ AgentOrch runs from your workstation and delegates implementation to existing wo
   - `ask "PROMPT" [--provider chain] [--session NAME]` — lightweight passthrough: one prompt to a worker model, reply printed (multi-turn sessions, fallback chain, optional Telegram delivery). No verifier/snapshot/reconcile.
   - `chat [--session NAME] [--provider chain]` — interactive passthrough REPL (one stdin line per turn; `/exit`, `/reset`).
   - `sessions list|show NAME|rm NAME` — manage passthrough chat sessions (stored under `runs/.sessions/`).
-  - `spec GOAL [-c CONSTRAINT ...]` — FloodSpec: goal+constraints -> design doc.
+  - `spec GOAL [-c CONSTRAINT ...]` — FloodSpec: goal+constraints -> design doc. Accepts the same effort/model overrides as `do` (`--effort-profile`, `--architect-effort`/`--gen-effort`, `--critic-effort`, `--architect-model`, `--watchdog-scale`, `--watchdog-max-bytes`), Telegram flags (`--telegram`/`--no-telegram`), and surfaces which worker authored (flags a watchdog-demoted lead).
   - `runs [--limit N]` — list recent runs (default 20).
   - `show RUN_ID` — print a run's diff + metadata.
   - `pr RUN_ID` — show a `--git-pr` run's branch/PR session + commits.
