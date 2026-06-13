@@ -132,7 +132,7 @@ resume only if the out-dir still matches the checkpointed tree, else start fresh
 
 | Flag | Type / metavar | Default | Meaning |
 |---|---|---|---|
-| `--plan-only` (alias `--dry-run`) | flag | off | Run only the planner, emit the step plan (stdout + events + `runs/<id>/plan.json`), and exit BEFORE any worker writes. Only applies to `master`/`pat` (warns otherwise). |
+| `--plan-only` (alias `--dry-run`) | flag | off | Run only the planner, emit the step plan (stdout + events + `runs/<id>/plan.json`), and exit BEFORE any worker writes. Only applies to `master`/`pat` (warns otherwise). The planner runs **read-only** — codex is invoked under its `--sandbox read-only` policy so its `apply_patch`/`write_file` tools physically cannot leak a partial build into the out-dir (#91); this read-only guarantee holds for the planner phase of every `master`/`pat` run, not just `--plan-only`. |
 | `--plan` | `FILE` | `None` | Execute the steps in this plan file VERBATIM, skipping the planner. Accepts a flat JSON list of step strings OR a graph `nodes` DAG. A graph DAG with non-linear deps runs the concurrent frontier scheduler. |
 | `--plan-graph` | `FILE` | `None` | Like `--plan` but STRICT — the file MUST be a graph `nodes` DAG (errors on a flat plan). `master`-only for v1. |
 | `--plan-expect-sha` | `SHA256` | `None` | With `--plan`/`--plan-graph`: REFUSE to run unless the plan file's sha256 matches this hash (a hard pin for unattended dispatch). Without it, provenance is recorded but not gated. |

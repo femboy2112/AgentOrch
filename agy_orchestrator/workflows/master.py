@@ -761,11 +761,21 @@ class MasterWorkflow:
         logger.info("Starting Master Workflow Planning Phase...")
         planner_prompt = (
             f"You are the Lead Architect. Break down the following complex project into a logical sequence of implementation steps.\n"
+            f"This is a PLANNING-ONLY task: do NOT create, write, edit, or apply changes to ANY files, and do NOT run build/install/test commands — read only what you need, then produce the plan. (File-writing tools are disabled for this call.)\n"
             f"Output ONLY a valid JSON list of strings, where each string is a detailed prompt for a single step.\n"
             f"Example: [\"Step 1: Setup project structure and core utilities...\", \"Step 2: Implement UI component X...\"]\n\n"
             f"Project Request:\n{initial_prompt}"
         )
-        planner = self.agent_class(prompt=planner_prompt, model=self.model, effort="high", role="plan")
+        # #91: the planner phase writes NOTHING to the out-dir (its documented
+        # contract, load-bearing for --plan-only). Construct it read-only so codex's
+        # apply_patch/write_file tools physically cannot leak a partial build to disk
+        # — the prompt instruction above is not enough (codex ignored the existing
+        # "output ONLY JSON" instruction and started implementing). read_only flows
+        # through the FallbackAgent wrapper to whichever provider actually runs.
+        planner = self.agent_class(
+            prompt=planner_prompt, model=self.model, effort="high", role="plan",
+            read_only=True,
+        )
         plan_output = await planner.run_async()
 
         # Capture session established by planner for reuse across all subsequent calls
@@ -819,7 +829,8 @@ class MasterWorkflow:
                 "Each array element is a detailed prompt for a single implementation "
                 f"step.\n\nProject Request:\n{initial_prompt}"
             )
-            reprompt_kwargs = dict(model=self.model, effort="high", role="plan")
+            reprompt_kwargs = dict(model=self.model, effort="high", role="plan",
+                                   read_only=True)  # #91: keep the re-prompt read-only too
             if workflow_session_id:
                 reprompt_kwargs["session_id"] = workflow_session_id
             try:

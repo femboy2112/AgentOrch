@@ -356,6 +356,11 @@ def make_fallback_agent(
                 sub.event_callback = self.event_callback
             if hasattr(sub, "dashboard_stream_json") and hasattr(self, "dashboard_stream_json"):
                 setattr(sub, "dashboard_stream_json", bool(getattr(self, "dashboard_stream_json")))
+            # #91: a read-only wrapper (e.g. the master planner) must hand read-only
+            # DOWN to whichever provider actually runs, so codex's sub gets the
+            # read-only sandbox instead of the write-enabled bypass.
+            if getattr(self, "read_only", False):
+                setattr(sub, "read_only", True)
             # Optional caller-supplied hook (e.g. harness watchdog arming) runs
             # AFTER construction so it sees the final sub with its config applied.
             hook = type(self)._post_construct_hook

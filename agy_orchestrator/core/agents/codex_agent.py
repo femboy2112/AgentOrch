@@ -536,8 +536,21 @@ class CodexAgent(AgentInstance):
             "--output-last-message",
             self._last_message_path(),
             "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
         ]
+        # #91: a plan-only / planner invocation MUST be provably read-only. Codex's
+        # built-in apply_patch/write_file tools would otherwise let the model write a
+        # partial implementation into the out-dir during what the operator was told is
+        # a no-write dry-run (the planner prompt embeds the raw "Implement X" request,
+        # and codex dutifully starts building). The read-only sandbox makes those tool
+        # writes PHYSICALLY impossible — a hard guarantee, not a prompt the model can
+        # ignore. The normal (execute) path keeps the externally-sandboxed bypass so
+        # accepted build steps can actually edit. --output-last-message still writes
+        # codex's own result file (harness-owned temp path), which the sandbox does
+        # not gate.
+        if getattr(self, "read_only", False):
+            cmd.extend(["--sandbox", "read-only"])
+        else:
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
 
         if self.model and self.model != "standard":
             cmd.extend(["--model", self.model])
