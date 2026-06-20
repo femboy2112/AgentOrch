@@ -23,7 +23,7 @@ remain unable to ever block, slow, or fail a dispatch.
 6. **Dynamic `/verbosity`** — the notifier keeps re-reading the persisted level per event
    (`_effective_verbosity` / `load_persisted_verbosity`). Don't regress this.
 7. **Security** — token from `TELEGRAM_BOT_KEY` env, NEVER hardcoded/persisted. Whitelist + state
-   live OUTSIDE the repo (`/home/leah/tgbot/data/{users,bot_state}.json`, env overridable). NEVER
+   live OUTSIDE the repo (`~/tgbot/data/{users,bot_state}.json`, env overridable). NEVER
    write a real chat id into code or tests. All new tests hermetic: fake token, fake ids
    (`FAKE_CHAT_ID = 444555666`), `_post` monkeypatched, state pinned to `tmp_path`.
 8. **Pure `render_event`** stays pure (no I/O, no global state). New `render_status_card(state)` is

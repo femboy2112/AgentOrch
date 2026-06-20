@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=78.1.1"]  # CVE-2025-47273 (path traversal/RCE in PackageIndex) fixed in 78.1.1
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,6 +10,9 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    # Direct pin to override fastapi's transitive resolution past CVE-2026-54283
+    # (urlencoded-form DoS, HIGH) and CVE-2026-54282 (URL authority confusion).
+    "starlette>=1.3.1",
 ]
 
 [project.optional-dependencies]

@@ -17,7 +17,7 @@ Conventions used in this document:
 
 > Secrets: never commit `TELEGRAM_BOT_KEY` or print its value. The Telegram
 > whitelist and state files (`AGY_TELEGRAM_USERS`, `AGY_TELEGRAM_STATE`) live
-> **outside the repository** by default (`/home/leah/tgbot/data/…`) and must stay
+> **outside the repository** by default (`~/tgbot/data/…`) and must stay
 > outside it — they hold user IDs and bot state, not repo data.
 
 ---
@@ -129,8 +129,8 @@ The bot token comes from the environment; the whitelist and persisted state live
 | Variable | Reads at | Controls | Default | Values |
 |---|---|---|---|---|
 | `TELEGRAM_BOT_KEY` | `harness/telegram.py:121` | Bot API token (secret — do not print or commit). | unset → bot disabled | Telegram bot token string. |
-| `AGY_TELEGRAM_USERS` | `harness/telegram.py:291` | Path to the whitelist of allowed user IDs. **Keep outside the repo.** | `/home/leah/tgbot/data/users.json` | Filesystem path. |
-| `AGY_TELEGRAM_STATE` | `harness/telegram.py:1526` | Path to persisted bot state (verbosity, etc.). **Keep outside the repo.** | `/home/leah/tgbot/data/bot_state.json` | Filesystem path. |
+| `AGY_TELEGRAM_USERS` | `harness/telegram.py:291` | Path to the whitelist of allowed user IDs. **Keep outside the repo.** | `~/tgbot/data/users.json` | Filesystem path. |
+| `AGY_TELEGRAM_STATE` | `harness/telegram.py:1526` | Path to persisted bot state (verbosity, etc.). **Keep outside the repo.** | `~/tgbot/data/bot_state.json` | Filesystem path. |
 | `AGY_TELEGRAM_STATE_TTL` | `harness/telegram.py:1017` | Seconds the persisted-state cache is trusted before re-reading from disk. | `1.0` | Float seconds. |
 | `AGY_TELEGRAM_VERBOSITY` | `harness/telegram.py:1516` | Default notification verbosity (a CLI/state setting overrides at runtime). | `normal` | One of `quiet`, `normal`, `verbose`, `debug` (normalized). |
 | `AGY_TELEGRAM_LIVE_STALE_S` | `harness/telegram_bot.py:215` | Age after which a run's `events.jsonl` is treated as stale (run no longer live). | `1800` (30 min) | Float seconds; `0` = off. |
