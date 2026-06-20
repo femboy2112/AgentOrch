@@ -18,7 +18,7 @@ ignoring anyone not listed), and answers a deliberately small command set:
 The loop is resilient: one bad update or a failed send never crashes the
 daemon, and SIGINT shuts down cleanly. Everything is stdlib only and the bot
 token is read from ``TELEGRAM_BOT_KEY`` (never hardcoded). The persisted state
-file lives OUTSIDE the repo (default ``/home/leah/tgbot/data/bot_state.json``;
+file lives OUTSIDE the repo (default ``~/tgbot/data/bot_state.json``;
 override via ``AGY_TELEGRAM_STATE``).
 
 TEMPORARY cross-process live-run tracking

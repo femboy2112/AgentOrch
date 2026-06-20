@@ -22,12 +22,12 @@ bot can do, including launching builds and the `--test-cmd` shell channel
 (below).
 
 State, whitelist, and the shared id-log live **outside the repo**, by default
-under `/home/leah/tgbot/data/`:
+under `~/tgbot/data/`:
 
 | File | Purpose | Default path | Override env |
 | --- | --- | --- | --- |
-| `users.json` | Whitelist (allowed user/chat ids) | `/home/leah/tgbot/data/users.json` | `AGY_TELEGRAM_USERS` |
-| `bot_state.json` | Persisted verbosity, per-chat mute/quiet prefs, `/track` cursors | `/home/leah/tgbot/data/bot_state.json` | `AGY_TELEGRAM_STATE` |
+| `users.json` | Whitelist (allowed user/chat ids) | `~/tgbot/data/users.json` | `AGY_TELEGRAM_USERS` |
+| `bot_state.json` | Persisted verbosity, per-chat mute/quiet prefs, `/track` cursors | `~/tgbot/data/bot_state.json` | `AGY_TELEGRAM_STATE` |
 | `sent_messages.jsonl` | Cross-process sent/seen message-id log used by `/clear` | next to the state file | (follows `AGY_TELEGRAM_STATE`) |
 | `telegram_poller.lock` | `flock` singleton guard so only one `getUpdates` poller runs | next to the state file | (follows `AGY_TELEGRAM_STATE`) |
 

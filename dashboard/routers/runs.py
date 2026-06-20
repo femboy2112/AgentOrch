@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
 router = APIRouter()
+
+
+# run_ids are timestamps like "20260613-044902-123"; reject anything that could
+# escape runs_dir (no '/', no leading dot, rejects '..'), then confirm containment
+# after resolving (defends against symlink escape too). See SEC pre-release audit.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _safe_run_dir(state, run_id: str) -> Path:
+    if run_id in {".", ".."} or not _RUN_ID_RE.match(run_id):
+        raise HTTPException(status_code=404, detail="run not found")
+    base = state.runs_dir.resolve()
+    run_dir = (base / run_id).resolve()
+    if run_dir != base and base not in run_dir.parents:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run_dir
 
 
 def _run_dirs(root: Path) -> list[Path]:
@@ -128,7 +145,7 @@ def list_runs(
 @router.get("/runs/{run_id}")
 def get_run(run_id: str, request: Request) -> dict:
     state = request.app.state.dashboard
-    run_dir = state.runs_dir / run_id
+    run_dir = _safe_run_dir(state, run_id)
     meta_path = run_dir / "meta.json"
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail="run not found")
@@ -190,7 +207,7 @@ def get_artifact(run_id: str, name: str, request: Request) -> Response:
     if file_name is None:
         raise HTTPException(status_code=404, detail="unknown artifact")
 
-    path = state.runs_dir / run_id / file_name
+    path = _safe_run_dir(state, run_id) / file_name
     if not path.exists():
         raise HTTPException(status_code=404, detail="artifact not found")
 
@@ -202,7 +219,7 @@ def get_artifact(run_id: str, name: str, request: Request) -> Response:
 @router.delete("/runs/{run_id}")
 def delete_run(run_id: str, request: Request) -> dict:
     state = request.app.state.dashboard
-    run_dir = state.runs_dir / run_id
+    run_dir = _safe_run_dir(state, run_id)
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail="run not found")
 

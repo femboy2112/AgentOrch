@@ -12,7 +12,7 @@ Design notes
 * The bot token is read from ``TELEGRAM_BOT_KEY`` in the environment; it is
   NEVER hardcoded and never persisted by this module.
 * The recipient whitelist lives OUTSIDE the repo (default
-  ``/home/leah/tgbot/data/users.json``; override via ``AGY_TELEGRAM_USERS``).
+  ``~/tgbot/data/users.json``; override via ``AGY_TELEGRAM_USERS``).
 * :func:`render_event` is a pure function: ``(event, verbosity, mode, run_id)``
   -> an HTML message string for events that should be sent at that verbosity,
   else ``None``. This makes the gating policy unit-testable without any I/O.
@@ -33,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
-DEFAULT_USERS_PATH = "/home/leah/tgbot/data/users.json"
+DEFAULT_USERS_PATH = os.path.expanduser("~/tgbot/data/users.json")
 # Persisted bot state (the /verbosity default, /track cursors) lives OUTSIDE the
 # repo. This module owns the path so both the dispatch-side notifier and the bot
 # daemon read the SAME file (telegram_bot re-imports these).
-DEFAULT_STATE_PATH = "/home/leah/tgbot/data/bot_state.json"
+DEFAULT_STATE_PATH = os.path.expanduser("~/tgbot/data/bot_state.json")
 
 # Verbosity ladder (low -> high). Each level is a strict superset of the prior.
 VERBOSITY_ORDER = ["quiet", "normal", "verbose", "debug"]
@@ -1633,7 +1633,7 @@ def resolve_verbosity(explicit: Optional[str] = None) -> str:
 def state_path(path: Optional[str] = None) -> str:
     """Path to the bot's persisted state file (verbosity, /track cursors).
 
-    Lives OUTSIDE the repo (default ``/home/leah/tgbot/data/bot_state.json``;
+    Lives OUTSIDE the repo (default ``~/tgbot/data/bot_state.json``;
     override via ``AGY_TELEGRAM_STATE``). Owned here so the dispatch-side notifier
     and the bot daemon agree on one file.
     """

@@ -17,9 +17,9 @@ block, slow, or fail a dispatch. No third-party dependencies (HTTP via
 | Var | Purpose | Default |
 | --- | --- | --- |
 | `TELEGRAM_BOT_KEY` | Bot token. **Read from env only — never hardcoded.** | (required) |
-| `AGY_TELEGRAM_USERS` | Path to the recipient whitelist JSON (a list of `{"id", "username", "last_chat_id"}`). Lives **outside** the repo. | `/home/leah/tgbot/data/users.json` |
+| `AGY_TELEGRAM_USERS` | Path to the recipient whitelist JSON (a list of `{"id", "username", "last_chat_id"}`). Lives **outside** the repo. | `~/tgbot/data/users.json` |
 | `AGY_TELEGRAM_VERBOSITY` | Default message verbosity. | `normal` |
-| `AGY_TELEGRAM_STATE` | Path to the bot's persisted state file (e.g. default verbosity). Lives **outside** the repo. | `/home/leah/tgbot/data/bot_state.json` |
+| `AGY_TELEGRAM_STATE` | Path to the bot's persisted state file (e.g. default verbosity). Lives **outside** the repo. | `~/tgbot/data/bot_state.json` |
 
 The whitelist tolerates a missing/garbage file (treated as empty). A chat id is
 taken from `last_chat_id` when present, else `id`.
